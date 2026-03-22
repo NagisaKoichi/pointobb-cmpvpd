@@ -1,5 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
+import os
+import re
+
 import torch
 import torch.nn as nn
 from mmcv.cnn import Scale
@@ -7,6 +10,7 @@ from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 
 from mmrotate.core import build_bbox_coder, multiclass_nms_rotated
+from mmrotate.utils import dump_vpd_heatmaps
 from ..builder import ROTATED_HEADS, build_loss
 from .cpm_head import CPMHead
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
@@ -38,6 +42,12 @@ class CPMVPDHead(CPMHead):
         self.use_point_supervised = use_point_supervised
         self.num_samples = num_samples  # Number of samples for inference refinement
         self.use_refinement = use_refinement  # Whether to use sampling-based refinement
+        self.save_vpd_intermediates = False
+        self.save_vpd_heatmaps = False
+        self.vpd_heatmap_cmap = 'turbo'
+        self.vpd_save_variance_channels = True
+        self.vpd_save_dir = None
+        self._vpd_case_counter = 0
         super().__init__(*args, **kwargs)
 
         train_cfg = kwargs.get('train_cfg', {})
@@ -51,6 +61,20 @@ class CPMVPDHead(CPMHead):
             self.num_samples = test_cfg['num_samples']
         if 'use_refinement' in test_cfg:
             self.use_refinement = test_cfg['use_refinement']
+        if 'save_vpd_intermediates' in test_cfg:
+            self.save_vpd_intermediates = test_cfg['save_vpd_intermediates']
+        if 'vpd_save_dir' in test_cfg:
+            self.vpd_save_dir = test_cfg['vpd_save_dir']
+        if 'dump_vpd_intermediates' in test_cfg:
+            self.save_vpd_intermediates = test_cfg['dump_vpd_intermediates']
+        if 'dump_vpd_dir' in test_cfg:
+            self.vpd_save_dir = test_cfg['dump_vpd_dir']
+        if 'save_vpd_heatmaps' in test_cfg:
+            self.save_vpd_heatmaps = test_cfg['save_vpd_heatmaps']
+        if 'vpd_heatmap_cmap' in test_cfg:
+            self.vpd_heatmap_cmap = test_cfg['vpd_heatmap_cmap']
+        if 'vpd_save_variance_channels' in test_cfg:
+            self.vpd_save_variance_channels = test_cfg['vpd_save_variance_channels']
 
         # Build loss based on supervision type
         if self.use_point_supervised:
@@ -168,8 +192,12 @@ class CPMVPDHead(CPMHead):
 
             if self.use_point_supervised:
                 # Point-supervised: only use GT center points
-                # Extract GT centers from bbox targets
-                gt_centers = torch.cat([gt_bbox[:2] for gt_bbox in gt_bboxes])  # (N, 2)
+                # Extract GT centers from bbox targets: each gt_bbox is (num_gt, 5)
+                gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes if gt_bbox.numel() > 0]
+                if gt_centers_list:
+                    gt_centers = torch.cat(gt_centers_list, dim=0)  # (num_all_gt, 2)
+                else:
+                    gt_centers = pos_points.new_zeros((0, 2))
 
                 loss_vpd = self.loss_vpd(pos_dist_full, pos_points, gt_centers)
             else:
@@ -318,6 +346,59 @@ class CPMVPDHead(CPMHead):
 
         return refined_bbox_delta
 
+    def _dump_vpd_intermediates(self, cls_scores, bbox_preds, centernesses,
+                                img_metas):
+        """Dump VPD intermediate predictions for each test sample.
+
+        For each image in the current test batch, this function creates one
+        dedicated directory and stores:
+        1. centerness tensors of all FPN levels
+        2. variance tensors of all bbox channels (computed from log_std)
+        3. class score tensors of all FPN levels
+        """
+        if not self.save_vpd_intermediates or not self.vpd_save_dir:
+            return
+
+        os.makedirs(self.vpd_save_dir, exist_ok=True)
+
+        num_imgs = len(img_metas)
+        for img_id in range(num_imgs):
+            filename = img_metas[img_id].get('filename', f'img_{img_id}')
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            base_name = re.sub(r'[^0-9a-zA-Z._-]+', '_', base_name)
+
+            case_dir_name = f'{self._vpd_case_counter:06d}_{base_name}'
+            case_dir = os.path.join(self.vpd_save_dir, case_dir_name)
+            os.makedirs(case_dir, exist_ok=True)
+            self._vpd_case_counter += 1
+
+            cls_scores_per_level = []
+            centerness_per_level = []
+            variance_per_level = []
+
+            for lvl_idx in range(len(cls_scores)):
+                cls_scores_per_level.append(
+                    cls_scores[lvl_idx][img_id].sigmoid().detach().cpu())
+                centerness_per_level.append(
+                    centernesses[lvl_idx][img_id].detach().cpu())
+
+                bbox_lstd = bbox_preds[lvl_idx][img_id, 4:, ...]
+                variance_per_level.append((2 * bbox_lstd).exp().detach().cpu())
+
+            torch.save(cls_scores_per_level, os.path.join(case_dir, 'cls_scores.pt'))
+            torch.save(centerness_per_level, os.path.join(case_dir, 'centerness.pt'))
+            torch.save(variance_per_level, os.path.join(case_dir, 'variance.pt'))
+            torch.save(img_metas[img_id], os.path.join(case_dir, 'img_meta.pt'))
+
+            if self.save_vpd_heatmaps:
+                dump_vpd_heatmaps(
+                    case_dir=case_dir,
+                    cls_scores_per_level=cls_scores_per_level,
+                    centerness_per_level=centerness_per_level,
+                    variance_per_level=variance_per_level,
+                    cmap=self.vpd_heatmap_cmap,
+                    save_variance_channels=self.vpd_save_variance_channels)
+
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def get_bboxes(self, cls_scores, bbox_preds, centernesses,
                    img_metas, cfg=None, rescale=None):
@@ -329,6 +410,8 @@ class CPMVPDHead(CPMHead):
         3. Standard NMS post-processing
         """
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
+
+        self._dump_vpd_intermediates(cls_scores, bbox_preds, centernesses, img_metas)
 
         num_levels = len(cls_scores)
 

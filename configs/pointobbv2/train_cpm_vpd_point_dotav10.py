@@ -3,9 +3,11 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-data_root = '/mnt/sdb/xuyun/datasets/DOTAv10/split_ss_dota/'
+# data_root = '/mnt/sdb/xuyun/datasets/DOTAv10/split_ss_dota/'
+data_root = 'E:/Programs/PointOBB-v2-master/DOTAv10_split_ss/'
 
-store_dir = '/mnt/sdb/xuyun/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+# store_dir = '/mnt/sdb/xuyun/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+store_dir = 'E:/Programs/PointOBB-v2-master/exps/cpm_vpd_point_dotav10/'
 
 angle_version = 'le90'
 

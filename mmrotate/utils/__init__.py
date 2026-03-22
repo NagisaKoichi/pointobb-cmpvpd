@@ -5,8 +5,12 @@ from .logger import get_root_logger
 from .misc import find_latest_checkpoint
 from .setup_env import setup_multi_processes
 from .util_distribution import build_ddp, build_dp, get_device
+from .vpd_heatmap import (dump_vpd_heatmaps, dump_vpd_heatmaps_from_case_dir,
+                          find_vpd_case_dirs)
 
 __all__ = [
     'get_root_logger', 'collect_env', 'find_latest_checkpoint', 'compat_cfg',
-    'setup_multi_processes', 'build_dp', 'build_ddp', 'get_device'
+    'setup_multi_processes', 'build_dp', 'build_ddp', 'get_device',
+    'dump_vpd_heatmaps', 'dump_vpd_heatmaps_from_case_dir',
+    'find_vpd_case_dirs'
 ]

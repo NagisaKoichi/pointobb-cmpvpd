@@ -9,8 +9,7 @@ import warnings
 import mmcv
 import torch
 import torch.distributed as dist
-# from mmcv import Config, DictAction
-from mmengine import Config, DictAction
+from mmcv import Config, DictAction
 from mmcv.runner import get_dist_info, init_dist
 from mmcv.utils import get_git_hash
 from mmdet import __version__
@@ -73,7 +72,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
         os.environ['LOCAL_RANK'] = str(args.local_rank)

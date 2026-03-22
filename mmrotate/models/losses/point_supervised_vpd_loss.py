@@ -54,11 +54,31 @@ class PointSupervisedVPDLoss(nn.Module):
         Returns:
             Tensor: Center regression loss.
         """
-        # Extract bbox mean prediction [left, top, right, bottom]
-        pred_bbox_center = pred_dist[:, :2]  # (N, 2)
+        # Decode predicted bbox center from [l, t, r, b] distances to point.
+        # Center offset from point is ((r - l) / 2, (b - t) / 2).
+        pred_ltrb = pred_dist[:, :4]
+        pred_bbox_center = torch.stack([
+            points[:, 0] + 0.5 * (pred_ltrb[:, 2] - pred_ltrb[:, 0]),
+            points[:, 1] + 0.5 * (pred_ltrb[:, 3] - pred_ltrb[:, 1])
+        ], dim=-1)
+
+        # Ensure gt centers use xy only.
+        if gt_centers.numel() == 0:
+            return pred_bbox_center.new_zeros(pred_bbox_center.size(0))
+        if gt_centers.size(-1) != 2:
+            gt_centers = gt_centers[:, :2]
+
+        # Match each positive sample to a GT center when counts differ.
+        # This keeps point-supervised training stable across images.
+        if gt_centers.size(0) != pred_bbox_center.size(0):
+            dists = torch.cdist(points, gt_centers, p=2)
+            nearest_gt_inds = dists.argmin(dim=1)
+            matched_gt_centers = gt_centers[nearest_gt_inds]
+        else:
+            matched_gt_centers = gt_centers
 
         # Compute L1 loss between predicted and GT centers
-        loss = F.smooth_l1_loss(pred_bbox_center, gt_centers, reduction='none', beta=1.0)
+        loss = F.smooth_l1_loss(pred_bbox_center, matched_gt_centers, reduction='none', beta=1.0)
         loss = loss.sum(dim=-1)
 
         return loss
