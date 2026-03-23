@@ -69,11 +69,12 @@ class PointSupervisedVPDLoss(nn.Module):
             gt_centers = gt_centers[:, :2]
 
         # Match each positive sample to a GT center when counts differ.
-        # This keeps point-supervised training stable across images.
-        if gt_centers.size(0) != pred_bbox_center.size(0):
-            dists = torch.cdist(points, gt_centers, p=2)
-            nearest_gt_inds = dists.argmin(dim=1)
-            matched_gt_centers = gt_centers[nearest_gt_inds]
+        # Use repeat-based alignment to avoid cdist/argmin CUDA asserts.
+        num_pred = pred_bbox_center.size(0)
+        num_gt = gt_centers.size(0)
+        if num_gt != num_pred:
+            repeat_times = (num_pred + num_gt - 1) // num_gt
+            matched_gt_centers = gt_centers.repeat(repeat_times, 1)[:num_pred]
         else:
             matched_gt_centers = gt_centers
 

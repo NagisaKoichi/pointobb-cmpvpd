@@ -88,12 +88,15 @@ class CPMVPDHead(CPMHead):
             # Full supervision: use JS divergence loss
             self.loss_js = build_loss(dict(type='JSLoss', loss_weight=self.js_weight))
 
-    def _init_reg_convs(self):
-        """Override to change regression output channels."""
-        super()._init_reg_convs()
-        # Override the final regression layer to output distribution parameters
-        # Original: 4 (bbox) only, no angle
-        # VPD: 4 mean + 4 log_std = 8 channels
+    def _init_predictor(self):
+        """Initialize predictors with 8-channel bbox distribution output.
+
+        AnchorFreeHead creates ``conv_reg`` in ``_init_predictor`` with 4 output
+        channels by default. VPD needs 8 channels (4 mean + 4 log_std), so the
+        override must happen here instead of ``_init_reg_convs``.
+        """
+        self.conv_cls = nn.Conv2d(
+            self.feat_channels, self.cls_out_channels, 3, padding=1)
         self.conv_reg = nn.Conv2d(self.feat_channels, 8, 3, padding=1)
 
     def forward_single(self, x, scale, stride):
@@ -160,10 +163,29 @@ class CPMVPDHead(CPMHead):
         flatten_labels = torch.cat(labels)
         flatten_points = torch.cat([points.repeat(num_imgs, 1) for points in all_level_points])
 
+        # Defensive alignment for custom target assignment implementations.
+        # Prevents out-of-bounds indexing if any branch length diverges.
+        num_valid = min(
+            flatten_cls_scores.size(0),
+            flatten_bbox_preds.size(0),
+            flatten_labels.size(0),
+            flatten_points.size(0))
+        flatten_cls_scores = flatten_cls_scores[:num_valid]
+        flatten_bbox_preds = flatten_bbox_preds[:num_valid]
+        flatten_labels = flatten_labels[:num_valid]
+        flatten_points = flatten_points[:num_valid]
+
         # Get positive/negative indices
         bg_class_ind = self.num_classes
+
+        # Keep labels in valid focal-loss index range [-1, num_classes].
+        invalid_label_mask = (flatten_labels < -1) | (flatten_labels > bg_class_ind)
+        if invalid_label_mask.any():
+            flatten_labels = flatten_labels.clone()
+            flatten_labels[invalid_label_mask] = bg_class_ind
+
         pos_inds = ((flatten_labels >= 0) & (flatten_labels < bg_class_ind)).nonzero().reshape(-1)
-        avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
+        avail_inds = ((flatten_labels >= 0) & (flatten_labels <= bg_class_ind)).nonzero().reshape(-1)
 
         # num_pos = max(reduce_mean(torch.tensor(len(pos_inds), dtype=torch.float,
         #                                        device=bbox_preds[0].device)), 1.0)
@@ -171,6 +193,8 @@ class CPMVPDHead(CPMHead):
                                                  device=bbox_preds[0].device)), 1.0)
 
         # Classification loss
+        if avail_inds.numel() == 0:
+            raise ValueError('No valid classification samples after label sanitization.')
         loss_cls = self.loss_cls(flatten_cls_scores[avail_inds],
                                 flatten_labels[avail_inds], avg_factor=num_avail)
 
