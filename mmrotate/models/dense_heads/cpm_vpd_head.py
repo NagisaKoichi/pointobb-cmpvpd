@@ -47,11 +47,13 @@ class CPMVPDHead(CPMHead):
         self.vpd_heatmap_cmap = 'turbo'
         self.vpd_save_variance_channels = True
         self.vpd_save_dir = None
+        self.log_std_min = -7.0
+        self.log_std_max = 5.0
         self._vpd_case_counter = 0
         super().__init__(*args, **kwargs)
 
-        train_cfg = kwargs.get('train_cfg', {})
-        test_cfg = kwargs.get('test_cfg', {})
+        train_cfg = kwargs.get('train_cfg') or {}
+        test_cfg = kwargs.get('test_cfg') or {}
 
         # if 'js_weight' in train_cfg:
         #     self.js_weight = train_cfg['js_weight']
@@ -75,6 +77,14 @@ class CPMVPDHead(CPMHead):
             self.vpd_heatmap_cmap = test_cfg['vpd_heatmap_cmap']
         if 'vpd_save_variance_channels' in test_cfg:
             self.vpd_save_variance_channels = test_cfg['vpd_save_variance_channels']
+        if 'log_std_min' in train_cfg:
+            self.log_std_min = train_cfg['log_std_min']
+        if 'log_std_max' in train_cfg:
+            self.log_std_max = train_cfg['log_std_max']
+        if 'log_std_min' in test_cfg:
+            self.log_std_min = test_cfg['log_std_min']
+        if 'log_std_max' in test_cfg:
+            self.log_std_max = test_cfg['log_std_max']
 
         # Build loss based on supervision type
         if self.use_point_supervised:
@@ -116,6 +126,7 @@ class CPMVPDHead(CPMHead):
         # Split mean and log_std
         bbox_mean = bbox_dist[:, :4]  # First 4: bbox mean
         bbox_lstd = bbox_dist[:, 4:]  # Last 4: bbox log_std
+        bbox_lstd = bbox_lstd.clamp(min=self.log_std_min, max=self.log_std_max)
 
         # Scale the mean
         bbox_mean = scale(bbox_mean).float()
@@ -128,6 +139,7 @@ class CPMVPDHead(CPMHead):
 
         # Concatenate mean and log_std for output
         bbox_pred_full = torch.cat([bbox_mean, bbox_lstd], dim=1)  # 8 channels
+        bbox_pred_full = torch.nan_to_num(bbox_pred_full, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return cls_score, bbox_pred_full, centerness
 
@@ -160,6 +172,8 @@ class CPMVPDHead(CPMHead):
         flatten_bbox_preds = torch.cat([
             bbox_pred.permute(0, 2, 3, 1).reshape(-1, 8)  # 4 mean + 4 log_std
             for bbox_pred in bbox_preds])
+        flatten_bbox_preds = torch.nan_to_num(
+            flatten_bbox_preds, nan=0.0, posinf=1e4, neginf=-1e4)
         flatten_labels = torch.cat(labels)
         flatten_points = torch.cat([points.repeat(num_imgs, 1) for points in all_level_points])
 
@@ -197,6 +211,7 @@ class CPMVPDHead(CPMHead):
             raise ValueError('No valid classification samples after label sanitization.')
         loss_cls = self.loss_cls(flatten_cls_scores[avail_inds],
                                 flatten_labels[avail_inds], avg_factor=num_avail)
+        loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # Regression losses (only for positive samples)
         if len(pos_inds) > 0:
@@ -278,7 +293,7 @@ class CPMVPDHead(CPMHead):
             bbox_pred = bbox_preds[lvl_idx][0]  # (8, H, W)
             centerness = centernesses[lvl_idx][0]  # (H, W) or (1, H, W)
             points = mlvl_points[lvl_idx]  # (H*W, 2)
-            stride = mlvl_strides[lvl_idx]
+            stride = self.strides[lvl_idx]
 
             # Flatten spatial dimensions
             num_classes = cls_score.shape[0]
@@ -311,6 +326,7 @@ class CPMVPDHead(CPMHead):
                 # Split mean and log_std
                 bbox_mean = selected_bbox_dist[:, :4]  # (K, 4)
                 bbox_lstd = selected_bbox_dist[:, 4:]  # (K, 4)
+                bbox_lstd = bbox_lstd.clamp(min=self.log_std_min, max=self.log_std_max)
 
                 # Sample multiple times and aggregate
                 refined_bbox = self._restore_bbox_with_sampling(
@@ -434,6 +450,7 @@ class CPMVPDHead(CPMHead):
         3. Standard NMS post-processing
         """
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
+        cfg = self.test_cfg if cfg is None else cfg
 
         self._dump_vpd_intermediates(cls_scores, bbox_preds, centernesses, img_metas)
 
@@ -472,19 +489,33 @@ class CPMVPDHead(CPMHead):
 
                     # Scale bbox predictions by stride if needed
                     if self.norm_on_bbox:
-                        bbox_pred_scaled = bbox_pred.clone()
-                        bbox_pred_scaled[:, :4] = bbox_pred[:, :4] * self.strides[lvl_idx]
+                        # Distances are already multiplied by stride in forward_single.
+                        bbox_pred_scaled = bbox_pred
                     else:
                         bbox_pred_scaled = bbox_pred
 
+                    # DistanceAnglePointCoder expects 5-dim deltas
+                    # [l, t, r, b, angle]. CPMVPD predicts bbox-only deltas,
+                    # so append a zero-angle channel during decoding.
+                    if bbox_pred_scaled.size(-1) == 4:
+                        zero_angle = bbox_pred_scaled.new_zeros(
+                            (bbox_pred_scaled.size(0), 1))
+                        bbox_pred_decode = torch.cat(
+                            [bbox_pred_scaled, zero_angle], dim=-1)
+                    else:
+                        bbox_pred_decode = bbox_pred_scaled
+
                     decoded_bboxes = self.bbox_coder.decode(
-                        points, bbox_pred_scaled)
+                        points, bbox_pred_decode)
+                    decoded_bboxes = torch.nan_to_num(
+                        decoded_bboxes, nan=0.0, posinf=1e4, neginf=-1e4)
 
                     scores = refined_scores[lvl_idx].sigmoid()
                     centernesses = refined_centernesses[lvl_idx]
 
                     # Combine classification score with centerness
                     scores = scores * centernesses[:, None]
+                    scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0)
 
                     cls_score_list.append(scores)
                     bbox_pred_list.append(decoded_bboxes)

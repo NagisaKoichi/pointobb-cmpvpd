@@ -40,6 +40,13 @@ class PointSupervisedVPDLoss(nn.Module):
         self.kl_weight = kl_weight
         self.prior_mean = prior_mean
         self.prior_std = prior_std
+        self.log_std_min = -7.0
+        self.log_std_max = 5.0
+
+    def _sanitize_log_std(self, pred_lstd):
+        pred_lstd = pred_lstd.clamp(min=self.log_std_min, max=self.log_std_max)
+        pred_lstd = torch.nan_to_num(pred_lstd, nan=0.0, posinf=self.log_std_max, neginf=self.log_std_min)
+        return pred_lstd
 
     def center_regression_loss(self, pred_dist, points, gt_centers):
         """Compute center regression loss.
@@ -99,10 +106,12 @@ class PointSupervisedVPDLoss(nn.Module):
         """
         # Extract log_std: bbox only (4 channels)
         pred_lstd = pred_dist[:, 4:]
+        pred_lstd = self._sanitize_log_std(pred_lstd)
 
         # Convert to std and compute mean
         pred_std = pred_lstd.exp()
         loss = pred_std.mean(dim=-1)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
 
         return loss
 
@@ -122,14 +131,17 @@ class PointSupervisedVPDLoss(nn.Module):
         # Extract mean and log_std
         pred_mean = pred_dist[:, :4]  # bbox only (4 channels)
         pred_lstd = pred_dist[:, 4:]
+        pred_lstd = self._sanitize_log_std(pred_lstd)
         pred_std = pred_lstd.exp()
 
         # KL(N(μ, σ²) || N(μ0, σ0²))
         # = log(σ0/σ) + (σ² + (μ-μ0)²)/(2σ0²) - 0.5
-        kl = torch.log(self.prior_std / (pred_std + 1e-6)) + \
-             (pred_std.pow(2) + (pred_mean - self.prior_mean).pow(2)) / (2 * self.prior_std ** 2) - 0.5
+        kl = torch.log(self.prior_std / (pred_std + 1e-6)) + (
+            pred_std.pow(2) + (pred_mean - self.prior_mean).pow(2)
+        ) / (2 * self.prior_std ** 2) - 0.5
 
         loss = kl.sum(dim=-1)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
 
         return loss
 
@@ -157,11 +169,13 @@ class PointSupervisedVPDLoss(nn.Module):
         loss_center = self.center_regression_loss(pred_dist, points, gt_centers)
         loss_uncertainty = self.uncertainty_regularization_loss(pred_dist)
         loss_kl = self.kl_divergence_loss(pred_dist)
+        loss_center = torch.nan_to_num(loss_center, nan=0.0, posinf=1e4, neginf=0.0)
 
         # Combine losses
         loss_sum = self.center_weight * loss_center + \
                    self.uncertainty_weight * loss_uncertainty + \
                    self.kl_weight * loss_kl
+        loss_sum = torch.nan_to_num(loss_sum, nan=0.0, posinf=1e4, neginf=0.0)
         loss = {
             'center': loss_center,
             'uncertainty': loss_uncertainty,

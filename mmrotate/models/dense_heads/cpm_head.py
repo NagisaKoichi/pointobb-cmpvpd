@@ -75,8 +75,8 @@ class CPMHead(RotatedFCOSHead):
         self.thresh1 = 8
         self.alpha = 1
 
-        train_cfg = kwargs.get('train_cfg', {})
-        test_cfg = kwargs.get('test_cfg', {})
+        train_cfg = kwargs.get('train_cfg') or {}
+        test_cfg = kwargs.get('test_cfg') or {}
 
         if 'store_dir' in train_cfg:
             self.store_dir = train_cfg['store_dir']
