@@ -82,6 +82,19 @@ class PointSupervisedVPDLoss(nn.Module):
         self.prior_delta_min = prior_delta_min
         self.prior_delta_max = prior_delta_max
         self.kl_clip = kl_clip
+        self.log_sigma_min = -7.0
+        self.log_sigma_max = 5.0
+        self.sigma_max = 1e2
+
+    def _sanitize_log_sigma(self, bbox_log_sigma):
+        bbox_log_sigma = bbox_log_sigma.clamp(
+            min=self.log_sigma_min, max=self.log_sigma_max)
+        bbox_log_sigma = torch.nan_to_num(
+            bbox_log_sigma,
+            nan=0.0,
+            posinf=self.log_sigma_max,
+            neginf=self.log_sigma_min)
+        return bbox_log_sigma
 
     def _curriculum(self, cur_iter):
         """Return (eff_lambda_kl, sigma_s) for current iteration."""
@@ -144,6 +157,9 @@ class PointSupervisedVPDLoss(nn.Module):
             zero = bbox_mu.sum() * 0.0
             return dict(loss_center=zero, loss_kl=zero, loss_var=zero, loss_total=zero)
 
+        bbox_mu = torch.nan_to_num(bbox_mu, nan=0.0, posinf=1e4, neginf=-1e4)
+        bbox_log_sigma = self._sanitize_log_sigma(bbox_log_sigma)
+
         stride_2d = pos_strides.unsqueeze(1)  # (N, 1)
 
         # --- Center loss in normalized space ---
@@ -152,6 +168,7 @@ class PointSupervisedVPDLoss(nn.Module):
         pred_delta_norm = bbox_mu[:, :2]                        # (N, 2)
         l_center = F.smooth_l1_loss(pred_delta_norm, gt_delta_norm,
                                     reduction='mean', beta=1.0)
+        l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
 
         # --- Build point-conditioned prior in normalized space ---
         eff_lambda_kl, sigma_s = self._curriculum(cur_iter)
@@ -188,25 +205,34 @@ class PointSupervisedVPDLoss(nn.Module):
 
         prior_mu = torch.cat([mu_c, mu_s], dim=1)              # (N, 4)
         prior_sigma = torch.cat([sigma_c, sigma_s_2d], dim=1)  # (N, 4)
+        prior_mu = torch.nan_to_num(prior_mu, nan=0.0, posinf=1e4, neginf=-1e4)
+        prior_sigma = torch.nan_to_num(prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
 
         # --- KL loss with per-sample clipping to prevent spikes ---
-        sigma_q = bbox_log_sigma.exp().clamp(min=1e-6)
-        sigma_p = prior_sigma.clamp(min=1e-6)
+        sigma_q = bbox_log_sigma.exp().clamp(min=1e-6, max=self.sigma_max)
+        sigma_q = torch.nan_to_num(sigma_q, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
+        sigma_p = prior_sigma.clamp(min=1e-6, max=self.sigma_max)
+        sigma_p = torch.nan_to_num(sigma_p, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
         kl_per_dim = (torch.log(sigma_p / sigma_q)
                       + (sigma_q.pow(2) + (bbox_mu - prior_mu).pow(2))
                       / (2.0 * sigma_p.pow(2))
                       - 0.5)
+        kl_per_dim = torch.nan_to_num(kl_per_dim, nan=0.0, posinf=1e4, neginf=0.0)
         kl_per_sample = kl_per_dim.sum(dim=-1)  # (N,)
         # Clip per-sample KL to prevent a few outlier samples from causing divergence
         kl_per_sample = kl_per_sample.clamp(max=self.kl_clip)
+        kl_per_sample = torch.nan_to_num(kl_per_sample, nan=0.0, posinf=self.kl_clip, neginf=0.0)
         l_kl = kl_per_sample.mean()
+        l_kl = torch.nan_to_num(l_kl, nan=0.0, posinf=self.kl_clip, neginf=0.0)
 
         # --- Variance regularization on center dims ---
-        l_var = bbox_log_sigma[:, :2].exp().mean()
+        l_var = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean()
+        l_var = torch.nan_to_num(l_var, nan=0.0, posinf=self.sigma_max, neginf=0.0)
 
         loss_total = (self.lambda_center * l_center
                       + eff_lambda_kl * l_kl
                       + self.lambda_var * l_var)
+        loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=0.0)
 
         return dict(
             loss_center=l_center,

@@ -275,12 +275,17 @@ class CPMVPDHead(CPMHead):
             flatten_cls_scores[avail_inds],
             flatten_labels[avail_inds],
             avg_factor=num_avail)
+        loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
 
         # VPD loss on positive samples
         if len(pos_inds) == 0:
             zero = flatten_bbox_preds.sum() * 0.0
-            return dict(loss_cls=loss_cls,
-                        loss_center=zero, loss_kl=zero, loss_var=zero)
+            return dict(
+                loss_cls=loss_cls,
+                loss_vpd=zero,
+                vpd_center=zero.detach(),
+                vpd_kl=zero.detach(),
+                vpd_var=zero.detach())
 
         pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 8)
         pos_points = flatten_points[pos_inds]           # (Np, 2)
@@ -315,11 +320,15 @@ class CPMVPDHead(CPMHead):
             cur_iter=self.iter,
         )
 
+        loss_vpd = torch.nan_to_num(
+            vpd_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
+
         return dict(
             loss_cls=loss_cls,
-            loss_center=vpd_losses['loss_center'],
-            loss_kl=vpd_losses['loss_kl'],
-            loss_var=vpd_losses['loss_var'],
+            loss_vpd=loss_vpd,
+            vpd_center=vpd_losses['loss_center'].detach(),
+            vpd_kl=vpd_losses['loss_kl'].detach(),
+            vpd_var=vpd_losses['loss_var'].detach(),
         )
 
     # ------------------------------------------------------------------
