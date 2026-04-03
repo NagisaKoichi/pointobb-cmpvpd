@@ -15,6 +15,9 @@ Inference: center = anchor + (delta_x, delta_y),
 
 import torch
 import torch.nn as nn
+import numpy as np
+import os
+from PIL import Image
 from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 
@@ -50,14 +53,19 @@ class CPMVPDHead(CPMHead):
         self.use_refinement = use_refinement
         super().__init__(*args, **kwargs)
 
-        train_cfg = kwargs.get('train_cfg', {})
-        test_cfg = kwargs.get('test_cfg', {})
+        train_cfg = kwargs.get('train_cfg') or {}
+        test_cfg = kwargs.get('test_cfg') or {}
         if 'warmup_iters' in train_cfg:
             self.warmup_iters = train_cfg['warmup_iters']
         if 'num_samples' in test_cfg:
             self.num_samples = test_cfg['num_samples']
         if 'use_refinement' in test_cfg:
             self.use_refinement = test_cfg['use_refinement']
+
+        self.visualize_variance_map = bool(
+            train_cfg.get('visualize_variance_map', False))
+        if self.visualize_variance_map and self.store_dir:
+            os.makedirs(os.path.join(self.store_dir, 'variance_map'), exist_ok=True)
 
         self.loss_vpd = build_loss(dict(
             type='PointSupervisedVPDLoss',
@@ -103,6 +111,61 @@ class CPMVPDHead(CPMHead):
 
         bbox_pred_full = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (N, 8, H, W)
         return cls_score, bbox_pred_full, centerness
+
+    def _save_variance_map(self, img_path, flip_direction, bbox_pred_lvl):
+        """Visualize and save center/scale lstd maps from predicted log-std."""
+        if bbox_pred_lvl.dim() != 3 or bbox_pred_lvl.shape[0] < 6:
+            return
+
+        # Channels map to lstd of (x, y, w, h) directly.
+        log_sigma = bbox_pred_lvl[4:8]
+        lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        center_lstd = lstd[0:2].mean(dim=0)
+        scale_lstd = lstd[2:4].mean(dim=0)
+
+        def to_heatmap(var_tensor):
+            var_np = var_tensor.detach().cpu().numpy().astype(np.float32)
+            var_min = float(var_np.min())
+            var_max = float(var_np.max())
+            if var_max - var_min < 1e-8:
+                norm = np.zeros_like(var_np, dtype=np.float32)
+            else:
+                norm = (var_np - var_min) / (var_max - var_min)
+
+            # Lightweight blue->cyan->yellow->red colormap without extra deps.
+            heatmap = np.zeros((norm.shape[0], norm.shape[1], 3), dtype=np.uint8)
+            heatmap[..., 0] = np.clip(255.0 * norm, 0, 255).astype(np.uint8)
+            heatmap[..., 1] = np.clip(255.0 * (1.0 - np.abs(2.0 * norm - 1.0)), 0, 255).astype(np.uint8)
+            heatmap[..., 2] = np.clip(255.0 * (1.0 - norm), 0, 255).astype(np.uint8)
+
+            var_img = Image.fromarray(heatmap, mode='RGB')
+            if flip_direction == 'horizontal':
+                var_img = var_img.transpose(Image.FLIP_LEFT_RIGHT)
+            elif flip_direction == 'vertical':
+                var_img = var_img.transpose(Image.FLIP_TOP_BOTTOM)
+            elif flip_direction == 'diagonal':
+                var_img = var_img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
+            return var_img
+
+        center_img = to_heatmap(center_lstd)
+        scale_img = to_heatmap(scale_lstd)
+
+        base_img = Image.open(img_path).convert('RGB')
+        base_img = base_img.resize((center_img.width, center_img.height))
+
+        center_merged = Image.new('RGB', (base_img.width + center_img.width, base_img.height))
+        center_merged.paste(base_img, (0, 0))
+        center_merged.paste(center_img, (base_img.width, 0))
+
+        scale_merged = Image.new('RGB', (base_img.width + scale_img.width, base_img.height))
+        scale_merged.paste(base_img, (0, 0))
+        scale_merged.paste(scale_img, (base_img.width, 0))
+
+        out_dir = os.path.join(self.store_dir, 'variance_map', str(self.iter))
+        os.makedirs(out_dir, exist_ok=True)
+        center_merged.save(os.path.join(out_dir, 'center_lstd.jpg'))
+        scale_merged.save(os.path.join(out_dir, 'scale_lstd.jpg'))
 
     # ------------------------------------------------------------------
     # Label assignment: override _get_target_single to also return gt_ids
@@ -231,6 +294,11 @@ class CPMVPDHead(CPMHead):
             self.draw_image(img_metas[0]['filename'],
                             img_metas[0].get('flip_direction'),
                             cls_scores[0][0].sigmoid())
+        if self.visualize_variance_map and self.store_dir and self.iter % self.train_duration == 0:
+            self._save_variance_map(
+                img_metas[0]['filename'],
+                img_metas[0].get('flip_direction'),
+                bbox_preds[0][0])
         self.iter += 1
 
         num_imgs = cls_scores[0].size(0)
@@ -367,6 +435,10 @@ class CPMVPDHead(CPMHead):
     def get_bboxes(self, cls_scores, bbox_preds, centernesses,
                    img_metas, cfg=None, rescale=None):
         """Inference: decode posterior mean, apply NMS."""
+        cfg = self.test_cfg if cfg is None else cfg
+        if cfg is None:
+            raise ValueError('Test config is missing. Please set model.test_cfg or pass cfg to get_bboxes.')
+
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         num_levels = len(cls_scores)
 

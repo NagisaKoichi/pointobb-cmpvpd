@@ -10,6 +10,7 @@ set -euo pipefail
 # Usage examples:
 #   GPU_NUM=1 GPU_IDS=0 ./tools/run_vpd_full_pipeline.sh
 #   GPU_NUM=4 GPU_IDS=0,1,2,3 START_STAGE=2 END_STAGE=4 ./tools/run_vpd_full_pipeline.sh
+#   SAVE_VARIANCE_MAP=True START_STAGE=1 END_STAGE=2 ./tools/run_vpd_full_pipeline.sh
 #   SAVE_SUBMISSION=True SUBMISSION_DIR=/abs/path/submission ./tools/run_vpd_full_pipeline.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -63,6 +64,7 @@ PRETRAINED_BACKBONE="${PRETRAINED_BACKBONE:-auto}"
 CALC_METRICS="${CALC_METRICS:-True}"
 SAVE_SUBMISSION="${SAVE_SUBMISSION:-False}"
 CREATE_SYMLINK="${CREATE_SYMLINK:-False}"
+SAVE_VARIANCE_MAP="${SAVE_VARIANCE_MAP:-False}"
 
 resolve_latest_epoch_ckpt() {
   local work_dir="$1"
@@ -213,6 +215,7 @@ print_output_layout
 
 echo "Using PRETRAINED_BACKBONE=${PRETRAINED_BACKBONE}"
 echo "CALC_METRICS=${CALC_METRICS}, SAVE_SUBMISSION=${SAVE_SUBMISSION}"
+echo "SAVE_VARIANCE_MAP=${SAVE_VARIANCE_MAP}"
 
 if [[ "$START_STAGE" -le 1 && "$END_STAGE" -ge 1 ]]; then
   echo "[1/4] Train VPD-CPM"
@@ -232,6 +235,7 @@ if [[ "$START_STAGE" -le 1 && "$END_STAGE" -ge 1 ]]; then
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.test_cfg.store_dir="${WORK_DIR_STAGE1}" \
+      model.train_cfg.visualize_variance_map=${SAVE_VARIANCE_MAP} \
       checkpoint_config.create_symlink=${CREATE_SYMLINK}
   else
     run_dist "$CFG_STAGE1" "$WORK_DIR_STAGE1" \
@@ -240,6 +244,7 @@ if [[ "$START_STAGE" -le 1 && "$END_STAGE" -ge 1 ]]; then
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.test_cfg.store_dir="${WORK_DIR_STAGE1}" \
+      model.train_cfg.visualize_variance_map=${SAVE_VARIANCE_MAP} \
       checkpoint_config.create_symlink=${CREATE_SYMLINK}
   fi
 else
@@ -264,6 +269,7 @@ if [[ "$START_STAGE" -le 2 && "$END_STAGE" -ge 2 ]]; then
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.train_cfg.store_ann_dir="${PSEUDO_DIR_WRITE}" \
+      model.train_cfg.visualize_variance_map=${SAVE_VARIANCE_MAP} \
       checkpoint_config.create_symlink=${CREATE_SYMLINK}
   else
     run_dist_resume "$CFG_STAGE2" "$STAGE1_CKPT" "$WORK_DIR_STAGE1" \
@@ -271,6 +277,7 @@ if [[ "$START_STAGE" -le 2 && "$END_STAGE" -ge 2 ]]; then
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.train_cfg.store_ann_dir="${PSEUDO_DIR_WRITE}" \
+      model.train_cfg.visualize_variance_map=${SAVE_VARIANCE_MAP} \
       checkpoint_config.create_symlink=${CREATE_SYMLINK}
   fi
 else

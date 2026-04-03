@@ -3,9 +3,9 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-data_root = '/mnt/tmp/datasets/DOTAv10/split_ss_dota/'
+data_root = '/media/passport2/zlk/datasets/DOTAv10_split_ss/'
 
-store_dir = '/mnt/tmp/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+store_dir = '/media/passport2/zlk/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
 
 angle_version = 'le90'
 
@@ -126,4 +126,5 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
-optimizer = dict(lr=0.05)
+checkpoint_config = dict(interval=1, create_symlink=False)
+optimizer = dict(lr=0.1)
