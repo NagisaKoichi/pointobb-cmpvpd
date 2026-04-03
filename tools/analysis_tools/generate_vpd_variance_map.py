@@ -86,7 +86,13 @@ def _save_maps_for_image(img_path,
                          bbox_pred_lvl,
                          cls_score_lvl,
                          centerness_lvl,
-                         out_path):
+                         out_path,
+                         out_mean_path):
+    # Channels 0:4 are posterior mean for (x, y, w, h).
+    mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
+    center_mu = mu[0:2].mean(dim=0)
+    scale_mu = mu[2:4].mean(dim=0)
+
     # Channels 4:8 are log_sigma for (x, y, w, h).
     log_sigma = bbox_pred_lvl[4:8]
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -101,6 +107,8 @@ def _save_maps_for_image(img_path,
     centerness_prob = centerness_lvl.sigmoid().squeeze(0)
     combined_score = max_class_prob * centerness_prob
 
+    center_mu_img = _to_heatmap(center_mu, flip_direction)
+    scale_mu_img = _to_heatmap(scale_mu, flip_direction)
     center_img = _to_heatmap(center_lstd, flip_direction)
     scale_img = _to_heatmap(scale_lstd, flip_direction)
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
@@ -122,6 +130,12 @@ def _save_maps_for_image(img_path,
     merged.paste(combined_img, (cell_w * 2, cell_h))
 
     merged.save(out_path)
+
+    mean_merged = Image.new('RGB', (cell_w * 3, cell_h))
+    mean_merged.paste(base_img, (0, 0))
+    mean_merged.paste(center_mu_img, (cell_w, 0))
+    mean_merged.paste(scale_mu_img, (cell_w * 2, 0))
+    mean_merged.save(out_mean_path)
 
 
 def _prepare_dataset_cfg(cfg, args):
@@ -245,13 +259,16 @@ def main():
             stem = osp.splitext(osp.basename(img_path))[0]
             out_name = f'{processed:06d}_{stem}_lstd.jpg'
             out_path = osp.join(args.out_dir, out_name)
+            out_mean_name = f'{processed:06d}_{stem}_mean.jpg'
+            out_mean_path = osp.join(args.out_dir, out_mean_name)
             _save_maps_for_image(
                 img_path,
                 flip_direction,
                 bbox_pred_lvl,
                 cls_score_lvl,
                 centerness_lvl,
-                out_path)
+                out_path,
+                out_mean_path)
 
             processed += 1
             progress.update()
