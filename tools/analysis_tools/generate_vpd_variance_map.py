@@ -87,7 +87,8 @@ def _save_maps_for_image(img_path,
                          cls_score_lvl,
                          centerness_lvl,
                          out_path,
-                         out_mean_path):
+                         out_mean_path,
+                         out_remap_path):
     # Channels 0:4 are posterior mean for (x, y, w, h).
     mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
     center_mu = mu[0:2].mean(dim=0)
@@ -107,6 +108,19 @@ def _save_maps_for_image(img_path,
     centerness_prob = centerness_lvl.sigmoid().squeeze(0)
     combined_score = max_class_prob * centerness_prob
 
+    # Remap max-class probability by center mean offsets:
+    # p'(y, x) = p(y + mu_cy(y, x), x + mu_cx(y, x)) with nearest-neighbor sampling.
+    cx_mu = mu[0]
+    cy_mu = mu[1]
+    h, w = max_class_prob.shape
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=max_class_prob.device, dtype=torch.float32),
+        torch.arange(w, device=max_class_prob.device, dtype=torch.float32),
+        indexing='ij')
+    new_x = torch.round(xx + cx_mu).long().clamp(0, w - 1)
+    new_y = torch.round(yy + cy_mu).long().clamp(0, h - 1)
+    remapped_max_prob = max_class_prob[new_y, new_x]
+
     center_mu_img = _to_heatmap(center_mu, flip_direction)
     scale_mu_img = _to_heatmap(scale_mu, flip_direction)
     center_img = _to_heatmap(center_lstd, flip_direction)
@@ -114,6 +128,7 @@ def _save_maps_for_image(img_path,
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
     max_cls_img = _to_heatmap(max_class_prob, flip_direction)
     combined_img = _to_heatmap(combined_score, flip_direction)
+    remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
 
     base_img = Image.open(img_path).convert('RGB')
     base_img = base_img.resize((center_img.width, center_img.height))
@@ -136,6 +151,8 @@ def _save_maps_for_image(img_path,
     mean_merged.paste(center_mu_img, (cell_w, 0))
     mean_merged.paste(scale_mu_img, (cell_w * 2, 0))
     mean_merged.save(out_mean_path)
+
+    remapped_img.save(out_remap_path)
 
 
 def _prepare_dataset_cfg(cfg, args):
@@ -261,6 +278,8 @@ def main():
             out_path = osp.join(args.out_dir, out_name)
             out_mean_name = f'{processed:06d}_{stem}_mean.jpg'
             out_mean_path = osp.join(args.out_dir, out_mean_name)
+            out_remap_name = f'{processed:06d}_{stem}_remap.jpg'
+            out_remap_path = osp.join(args.out_dir, out_remap_name)
             _save_maps_for_image(
                 img_path,
                 flip_direction,
@@ -268,7 +287,8 @@ def main():
                 cls_score_lvl,
                 centerness_lvl,
                 out_path,
-                out_mean_path)
+                out_mean_path,
+                out_remap_path)
 
             processed += 1
             progress.update()

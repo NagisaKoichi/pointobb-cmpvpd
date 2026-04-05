@@ -61,6 +61,7 @@ class CPMVPDHead(CPMHead):
             self.num_samples = test_cfg['num_samples']
         if 'use_refinement' in test_cfg:
             self.use_refinement = test_cfg['use_refinement']
+        self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
 
         self.visualize_variance_map = bool(
             train_cfg.get('visualize_variance_map', False))
@@ -460,12 +461,33 @@ class CPMVPDHead(CPMHead):
                 points = mlvl_points[lvl_idx]              # (H*W, 2)
 
                 # Flatten
-                cls_score = cls_score.permute(1, 2, 0).reshape(-1, self.cls_out_channels)
                 bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 8)
-                centerness = centerness.reshape(-1).sigmoid()
+                if self.use_remap_score:
+                    # Remap max class probability by center mean offsets (dx, dy).
+                    # Score at (y, x) reads max prob from (y + dy, x + dx).
+                    cls_prob_map = cls_score.sigmoid()  # (C, H, W)
+                    max_prob_map, _ = cls_prob_map.max(dim=0)  # (H, W)
 
-                scores = cls_score.sigmoid()
-                scores = scores * centerness[:, None]
+                    dx_map = bbox_preds[lvl_idx][img_id][0]
+                    dy_map = bbox_preds[lvl_idx][img_id][1]
+                    h, w = max_prob_map.shape
+                    yy, xx = torch.meshgrid(
+                        torch.arange(h, device=max_prob_map.device, dtype=dx_map.dtype),
+                        torch.arange(w, device=max_prob_map.device, dtype=dx_map.dtype),
+                        indexing='ij')
+                    new_x = torch.round(xx + dx_map).long().clamp(0, w - 1)
+                    new_y = torch.round(yy + dy_map).long().clamp(0, h - 1)
+                    remapped_max_prob = max_prob_map[new_y, new_x]
+
+                    remap_scale = remapped_max_prob / (max_prob_map + 1e-6)
+                    remap_scale = torch.nan_to_num(remap_scale, nan=0.0, posinf=1e4, neginf=0.0)
+                    score_map = cls_prob_map * remap_scale.unsqueeze(0)
+                    scores = score_map.permute(1, 2, 0).reshape(-1, self.cls_out_channels)
+                else:
+                    cls_score = cls_score.permute(1, 2, 0).reshape(-1, self.cls_out_channels)
+                    centerness = centerness.reshape(-1).sigmoid()
+                    scores = cls_score.sigmoid()
+                    scores = scores * centerness[:, None]
 
                 # Top-k selection
                 nms_pre = cfg.get('nms_pre', 2000) if cfg else 2000
