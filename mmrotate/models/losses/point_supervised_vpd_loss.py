@@ -12,11 +12,14 @@ This ensures center loss, KL prior, and posterior are all in the same units.
 ELBO objective:
   L = lambda_center * L_center
     + lambda_kl(t) * KL(q_phi || p_psi)
-    + lambda_var * L_var
+        + lambda_var(t) * L_var
 
 Curriculum:
-  Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup, sigma_s = sigma_s_init
+    Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup,
+                                                                    lambda_var = lambda_var_warmup,
+                                                                    sigma_s = sigma_s_init
   Stage B (iter >= warmup_iters): lambda_kl linearly increases to lambda_kl,
+                                                                     lambda_var linearly increases to lambda_var,
                                    sigma_s linearly anneals to sigma_s_final
 """
 import torch
@@ -34,7 +37,11 @@ class PointSupervisedVPDLoss(nn.Module):
         lambda_center (float): Weight for center regression loss. Default: 1.0.
         lambda_kl (float): Final KL weight (stage B). Default: 0.1.
         lambda_kl_warmup (float): Initial KL weight (stage A). Default: 0.02.
-        lambda_var (float): Variance regularization weight. Default: 0.01.
+        lambda_var (float): Final variance regularization weight (stage B).
+            Default: 0.01.
+        lambda_var_warmup (float | None): Initial variance regularization
+            weight (stage A). If None, uses lambda_var (no schedule).
+            Default: None.
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
         sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
             Default: 0.5.
@@ -59,6 +66,7 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_kl=0.1,
                  lambda_kl_warmup=0.02,
                  lambda_var=0.01,
+                 lambda_var_warmup=None,
                  knn_k=5,
                  sigma_c_coeff=0.5,
                  scale_alpha_w=1.0,
@@ -77,6 +85,8 @@ class PointSupervisedVPDLoss(nn.Module):
         self.lambda_kl = lambda_kl
         self.lambda_kl_warmup = lambda_kl_warmup
         self.lambda_var = lambda_var
+        self.lambda_var_warmup = (
+            lambda_var if lambda_var_warmup is None else lambda_var_warmup)
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
         self.scale_alpha_w = scale_alpha_w
@@ -105,13 +115,14 @@ class PointSupervisedVPDLoss(nn.Module):
         return bbox_log_sigma
 
     def _curriculum(self, cur_iter):
-        """Return (eff_lambda_kl, sigma_s) for current iteration."""
+        """Return (eff_lambda_kl, eff_lambda_var, sigma_s) for current iteration."""
         if cur_iter < self.warmup_iters:
-            return self.lambda_kl_warmup, self.sigma_s_init
+            return self.lambda_kl_warmup, self.lambda_var_warmup, self.sigma_s_init
         ratio = min(1.0, (cur_iter - self.warmup_iters) / max(self.anneal_iters, 1))
         eff_lambda_kl = self.lambda_kl_warmup + ratio * (self.lambda_kl - self.lambda_kl_warmup)
+        eff_lambda_var = self.lambda_var_warmup + ratio * (self.lambda_var - self.lambda_var_warmup)
         sigma_s = self.sigma_s_init - ratio * (self.sigma_s_init - self.sigma_s_final)
-        return eff_lambda_kl, sigma_s
+        return eff_lambda_kl, eff_lambda_var, sigma_s
 
     def _compute_di_norm(self, gt_centers_norm, all_gt_centers_norm):
         """Compute mean kNN distance in normalized space for each positive sample.
@@ -179,7 +190,7 @@ class PointSupervisedVPDLoss(nn.Module):
         l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
 
         # --- Build point-conditioned prior in normalized space ---
-        eff_lambda_kl, sigma_s = self._curriculum(cur_iter)
+        eff_lambda_kl, eff_lambda_var, sigma_s = self._curriculum(cur_iter)
 
         # For kNN, normalize all GT centers relative to each sample's anchor/stride.
         # Simpler: use pixel-space kNN distances, then divide by mean stride.
@@ -249,7 +260,7 @@ class PointSupervisedVPDLoss(nn.Module):
 
         loss_total = (self.lambda_center * l_center
                       + eff_lambda_kl * l_kl
-                      + self.lambda_var * l_var)
+                      + eff_lambda_var * l_var)
         loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=0.0)
 
         return dict(

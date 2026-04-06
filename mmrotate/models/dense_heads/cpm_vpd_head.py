@@ -74,6 +74,7 @@ class CPMVPDHead(CPMHead):
             lambda_kl=0.1,
             lambda_kl_warmup=0.02,
             lambda_var=0.01,
+            lambda_var_warmup=0.002,
             warmup_iters=self.warmup_iters,
         ))
 
