@@ -1,7 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import copy
-import os
 import os.path as osp
 
 import mmcv
@@ -19,13 +18,11 @@ from mmrotate.utils import compat_cfg, get_device, setup_multi_processes
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Inference VPD checkpoint and dump variance maps')
+        description='Inference VPD checkpoint and dump size-Gaussian maps')
     parser.add_argument('config', help='config file path')
     parser.add_argument('checkpoint', help='checkpoint file path')
     parser.add_argument(
-        '--out-dir',
-        required=True,
-        help='directory to save generated variance maps')
+        '--out-dir', required=True, help='directory to save generated maps')
     parser.add_argument(
         '--split',
         default='train',
@@ -37,17 +34,34 @@ def parse_args():
         '--feat-level',
         type=int,
         default=0,
-        help='FPN level index used for variance map visualization')
+        help='FPN level index used for map generation')
+    parser.add_argument(
+        '--prob-thr',
+        type=float,
+        default=0.3,
+        help='keep pixels with max_class_probability > prob_thr')
+    parser.add_argument(
+        '--max-sigma',
+        type=float,
+        default=20.0,
+        help='upper bound for generated Gaussian sigma on feature map')
+    parser.add_argument(
+        '--min-sigma',
+        type=float,
+        default=0.5,
+        help='lower bound for generated Gaussian sigma on feature map')
+    parser.add_argument(
+        '--window-scale',
+        type=float,
+        default=3.0,
+        help='local accumulation window radius = window_scale * sigma')
     parser.add_argument(
         '--max-images',
         type=int,
         default=0,
         help='max number of images to process, 0 means all')
     parser.add_argument(
-        '--gpu-id',
-        type=int,
-        default=0,
-        help='single gpu id for inference')
+        '--gpu-id', type=int, default=0, help='single gpu id for inference')
     parser.add_argument(
         '--cfg-options',
         nargs='+',
@@ -56,14 +70,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def _to_heatmap(var_tensor, flip_direction):
-    var_np = var_tensor.detach().cpu().numpy().astype(np.float32)
-    var_min = float(var_np.min())
-    var_max = float(var_np.max())
-    if var_max - var_min < 1e-8:
-        norm = np.zeros_like(var_np, dtype=np.float32)
+def _to_heatmap(map_tensor, flip_direction):
+    map_np = map_tensor.detach().cpu().numpy().astype(np.float32)
+    map_min = float(map_np.min())
+    map_max = float(map_np.max())
+    if map_max - map_min < 1e-8:
+        norm = np.zeros_like(map_np, dtype=np.float32)
     else:
-        norm = (var_np - var_min) / (var_max - var_min)
+        norm = (map_np - map_min) / (map_max - map_min)
 
     heatmap = np.zeros((norm.shape[0], norm.shape[1], 3), dtype=np.uint8)
     heatmap[..., 0] = np.clip(255.0 * norm, 0, 255).astype(np.uint8)
@@ -81,80 +95,103 @@ def _to_heatmap(var_tensor, flip_direction):
     return img
 
 
-def _save_maps_for_image(img_path,
-                         flip_direction,
-                         bbox_pred_lvl,
-                         cls_score_lvl,
-                         centerness_lvl,
-                         out_path,
-                         out_mean_path,
-                         out_remap_path):
+def _accumulate_size_gaussians(max_class_prob,
+                               size_mu,
+                               size_log_sigma,
+                               prob_thr,
+                               min_sigma,
+                               max_sigma,
+                               window_scale):
+    # max_class_prob: [H, W]
+    # size_mu: [2, H, W], corresponds to (w_mu, h_mu)
+    # size_log_sigma: [2, H, W], corresponds to (w_log_sigma, h_log_sigma)
+    h, w = max_class_prob.shape
+    out_map = torch.zeros((h, w), dtype=max_class_prob.dtype, device=max_class_prob.device)
+
+    keep_mask = max_class_prob > prob_thr
+    keep_idx = torch.nonzero(keep_mask, as_tuple=False)
+    if keep_idx.numel() == 0:
+        return out_map
+
+    std = torch.exp(torch.clamp(size_log_sigma, min=-100.0, max=100.0))
+    # std = torch.exp(torch.clamp(size_log_sigma, min=-10.0, max=10.0))
+
+    for i in range(keep_idx.shape[0]):
+        y = int(keep_idx[i, 0].item())
+        x = int(keep_idx[i, 1].item())
+
+        mu_w = torch.abs(size_mu[0, y, x]).item()
+        mu_h = torch.abs(size_mu[1, y, x]).item()
+        std_w = std[0, y, x].item()
+        std_h = std[1, y, x].item()
+
+        # Use both mean and std from size posterior to determine Gaussian spread.
+        sigma_x = float(np.clip(mu_w + std_w, min_sigma, max_sigma))
+        sigma_y = float(np.clip(mu_h + std_h, min_sigma, max_sigma))
+
+        rx = max(1, int(np.ceil(window_scale * sigma_x)))
+        ry = max(1, int(np.ceil(window_scale * sigma_y)))
+
+        x0 = max(0, x - rx)
+        x1 = min(w - 1, x + rx)
+        y0 = max(0, y - ry)
+        y1 = min(h - 1, y + ry)
+
+        xx = torch.arange(x0, x1 + 1, device=out_map.device, dtype=out_map.dtype) - float(x)
+        yy = torch.arange(y0, y1 + 1, device=out_map.device, dtype=out_map.dtype) - float(y)
+
+        gx = torch.exp(-0.5 * (xx / sigma_x)**2)
+        gy = torch.exp(-0.5 * (yy / sigma_y)**2)
+        kernel = gy[:, None] * gx[None, :]
+
+        # Normalize each local kernel so each pixel contributes by its class confidence.
+        kernel = kernel / (kernel.sum() + 1e-6)
+        weight = max_class_prob[y, x]
+        out_map[y0:y1 + 1, x0:x1 + 1] += weight * kernel
+
+    return out_map
+
+
+def _save_map_for_image(img_path,
+                        flip_direction,
+                        bbox_pred_lvl,
+                        cls_score_lvl,
+                        out_path,
+                        prob_thr,
+                        min_sigma,
+                        max_sigma,
+                        window_scale):
     # Channels 0:4 are posterior mean for (x, y, w, h).
     mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
-    center_mu = mu[0:2].mean(dim=0)
-    scale_mu = mu[2:4].mean(dim=0)
-
     # Channels 4:8 are log_sigma for (x, y, w, h).
-    log_sigma = bbox_pred_lvl[4:8]
-    lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+    log_sigma = torch.nan_to_num(
+        bbox_pred_lvl[4:8], nan=0.0, posinf=10.0, neginf=-10.0)
 
-    center_lstd = lstd[0:2].mean(dim=0)
-    scale_lstd = lstd[2:4].mean(dim=0)
-
-    cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
-    centerness_lvl = torch.nan_to_num(centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
-
+    cls_score_lvl = torch.nan_to_num(
+        cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
-    centerness_prob = centerness_lvl.sigmoid().squeeze(0)
-    combined_score = max_class_prob * centerness_prob
 
-    # Remap max-class probability by center mean offsets:
-    # p'(y, x) = p(y + mu_cy(y, x), x + mu_cx(y, x)) with nearest-neighbor sampling.
-    cx_mu = mu[0]
-    cy_mu = mu[1]
-    h, w = max_class_prob.shape
-    yy, xx = torch.meshgrid(
-        torch.arange(h, device=max_class_prob.device, dtype=torch.float32),
-        torch.arange(w, device=max_class_prob.device, dtype=torch.float32),
-        indexing='ij')
-    new_x = torch.round(xx + cx_mu).long().clamp(0, w - 1)
-    new_y = torch.round(yy + cy_mu).long().clamp(0, h - 1)
-    remapped_max_prob = max_class_prob[new_y, new_x]
-    remapped_max_prob = torch.log1p(remapped_max_prob)
-    # remapped_max_prob = -0.1/(remapped_max_prob + 0.1) + 1
+    size_mu = mu[2:4]
+    size_log_sigma = log_sigma[2:4]
 
-    center_mu_img = _to_heatmap(center_mu, flip_direction)
-    scale_mu_img = _to_heatmap(scale_mu, flip_direction)
-    center_img = _to_heatmap(center_lstd, flip_direction)
-    scale_img = _to_heatmap(scale_lstd, flip_direction)
-    centerness_img = _to_heatmap(centerness_prob, flip_direction)
-    max_cls_img = _to_heatmap(max_class_prob, flip_direction)
-    combined_img = _to_heatmap(combined_score, flip_direction)
-    remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
+    gaussian_map = _accumulate_size_gaussians(
+        max_class_prob=max_class_prob,
+        size_mu=size_mu,
+        size_log_sigma=size_log_sigma,
+        prob_thr=prob_thr,
+        min_sigma=min_sigma,
+        max_sigma=max_sigma,
+        window_scale=window_scale)
+
+    map_img = _to_heatmap(gaussian_map, flip_direction)
 
     base_img = Image.open(img_path).convert('RGB')
-    base_img = base_img.resize((center_img.width, center_img.height))
+    base_img = base_img.resize((map_img.width, map_img.height))
 
-    cell_w, cell_h = base_img.width, base_img.height
-    merged = Image.new('RGB', (cell_w * 3, cell_h * 2))
-
+    merged = Image.new('RGB', (base_img.width * 2, base_img.height))
     merged.paste(base_img, (0, 0))
-    merged.paste(center_img, (cell_w, 0))
-    merged.paste(scale_img, (cell_w * 2, 0))
-
-    merged.paste(centerness_img, (0, cell_h))
-    merged.paste(max_cls_img, (cell_w, cell_h))
-    merged.paste(combined_img, (cell_w * 2, cell_h))
-
+    merged.paste(map_img, (base_img.width, 0))
     merged.save(out_path)
-
-    mean_merged = Image.new('RGB', (cell_w * 3, cell_h))
-    mean_merged.paste(base_img, (0, 0))
-    mean_merged.paste(center_mu_img, (cell_w, 0))
-    mean_merged.paste(scale_mu_img, (cell_w * 2, 0))
-    mean_merged.save(out_mean_path)
-
-    remapped_img.save(out_remap_path)
 
 
 def _prepare_dataset_cfg(cfg, args):
@@ -213,7 +250,8 @@ def main():
     else:
         model.CLASSES = dataset.CLASSES
 
-    device = torch.device('cuda', args.gpu_id) if torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device(
+        'cuda', args.gpu_id) if torch.cuda.is_available() else torch.device('cpu')
     model = model.to(device)
     model.eval()
 
@@ -223,14 +261,14 @@ def main():
         if not isinstance(outputs, (list, tuple)):
             raise RuntimeError('Unexpected bbox_head output type.')
         if len(outputs) == 3:
-            cls_scores, bbox_preds, centernesses = outputs
+            cls_scores, bbox_preds, _ = outputs
         elif len(outputs) == 4:
-            cls_scores, bbox_preds, _, centernesses = outputs
+            cls_scores, bbox_preds, _, _ = outputs
         else:
-            raise RuntimeError(f'Unexpected bbox_head output length: {len(outputs)}')
+            raise RuntimeError(
+                f'Unexpected bbox_head output length: {len(outputs)}')
         captured['cls_scores'] = cls_scores
         captured['bbox_preds'] = bbox_preds
-        captured['centernesses'] = centernesses
 
     hook_handle = model.bbox_head.register_forward_hook(_hook_fn)
 
@@ -253,16 +291,16 @@ def main():
         img_metas = data['img_metas'].data[0]
         batch_size = len(img_metas)
 
-        if ('bbox_preds' not in captured or 'cls_scores' not in captured
-                or 'centernesses' not in captured):
-            raise RuntimeError('Failed to capture cls_scores/bbox_preds/centernesses from bbox_head forward hook.')
+        if 'bbox_preds' not in captured or 'cls_scores' not in captured:
+            raise RuntimeError(
+                'Failed to capture cls_scores/bbox_preds from bbox_head hook.')
 
         bbox_preds = captured['bbox_preds']
         cls_scores = captured['cls_scores']
-        centernesses = captured['centernesses']
         if args.feat_level < 0 or args.feat_level >= len(bbox_preds):
             raise ValueError(
-                f'feat_level={args.feat_level} is out of range [0, {len(bbox_preds) - 1}]')
+                f'feat_level={args.feat_level} is out of range '
+                f'[0, {len(bbox_preds) - 1}]')
 
         for b in range(batch_size):
             if processed >= max_images:
@@ -273,24 +311,20 @@ def main():
             flip_direction = meta.get('flip_direction')
             bbox_pred_lvl = bbox_preds[args.feat_level][b]
             cls_score_lvl = cls_scores[args.feat_level][b]
-            centerness_lvl = centernesses[args.feat_level][b]
 
             stem = osp.splitext(osp.basename(img_path))[0]
-            out_name = f'{processed:06d}_{stem}_lstd.jpg'
+            out_name = f'{processed:06d}_{stem}_size_gauss.jpg'
             out_path = osp.join(args.out_dir, out_name)
-            out_mean_name = f'{processed:06d}_{stem}_mean.jpg'
-            out_mean_path = osp.join(args.out_dir, out_mean_name)
-            out_remap_name = f'{processed:06d}_{stem}_remap.jpg'
-            out_remap_path = osp.join(args.out_dir, out_remap_name)
-            _save_maps_for_image(
-                img_path,
-                flip_direction,
-                bbox_pred_lvl,
-                cls_score_lvl,
-                centerness_lvl,
-                out_path,
-                out_mean_path,
-                out_remap_path)
+            _save_map_for_image(
+                img_path=img_path,
+                flip_direction=flip_direction,
+                bbox_pred_lvl=bbox_pred_lvl,
+                cls_score_lvl=cls_score_lvl,
+                out_path=out_path,
+                prob_thr=args.prob_thr,
+                min_sigma=args.min_sigma,
+                max_sigma=args.max_sigma,
+                window_scale=args.window_scale)
 
             processed += 1
             progress.update()
