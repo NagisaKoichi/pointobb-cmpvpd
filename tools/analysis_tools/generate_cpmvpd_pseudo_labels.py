@@ -68,6 +68,11 @@ def parse_args():
         type=int,
         default=0,
         help='max number of images to process, 0 means all')
+    parser.add_argument(
+        '--point-supervised-pseudo',
+        action='store_true',
+        help='use point-supervised pseudo generation path from '
+        'CPMVPDPseudoHead.get_pseudo_bboxes (requires gt annotations)')
     parser.add_argument('--gpu-id', type=int, default=0, help='single gpu id')
     parser.add_argument(
         '--cfg-options',
@@ -80,6 +85,19 @@ def parse_args():
 def _prepare_dataset_cfg(cfg, args):
     split_cfg = copy.deepcopy(cfg.data[args.split])
     split_cfg.test_mode = (args.split != 'train')
+
+    # Point-supervised pseudo generation should align with original image
+    # coordinates. Random flip in train pipeline causes apparent offset/flip
+    # mismatch when writing labels to original image names.
+    if args.point_supervised_pseudo and 'pipeline' in split_cfg:
+        for p in split_cfg.pipeline:
+            t = p.get('type')
+            if t in ('RRandomFlip', 'RandomFlip'):
+                # Keep transform to preserve meta keys like `flip`, but disable
+                # actual flipping to keep pseudo boxes aligned to original images.
+                p['flip_ratio'] = 0.0
+                if 'direction' not in p:
+                    p['direction'] = 'horizontal'
 
     if args.ann_file is not None:
         split_cfg.ann_file = args.ann_file
@@ -127,6 +145,35 @@ def _unwrap_imgs_for_forward(data, device):
     if not imgs:
         raise RuntimeError('No image tensor found in batch `data["img"]`.')
     return [img.to(device) for img in imgs]
+
+
+def _unwrap_tensor_list(data, key, device):
+    """Extract per-image tensor list from a dataloader batch field."""
+    payload = data.get(key, None)
+    if payload is None:
+        return None
+
+    if isinstance(payload, DataContainer):
+        payload = payload.data[0]
+
+    if torch.is_tensor(payload):
+        return [payload.to(device)]
+
+    if isinstance(payload, (list, tuple)):
+        out = []
+        for item in payload:
+            if isinstance(item, DataContainer):
+                item = item.data[0]
+            if torch.is_tensor(item):
+                out.append(item.to(device))
+            elif isinstance(item, (list, tuple)) and len(item) == 1 and torch.is_tensor(item[0]):
+                out.append(item[0].to(device))
+            else:
+                raise TypeError(
+                    f'Unsupported payload element in `{key}`: {type(item)}')
+        return out
+
+    raise TypeError(f'Unsupported payload type in `{key}`: {type(payload)}')
 
 
 def _to_axis_aligned_poly(cx, cy, w, h):
@@ -218,6 +265,14 @@ def _write_one_txt(txt_path, det_result, class_names, score_thr,
 def main():
     args = parse_args()
 
+    if args.point_supervised_pseudo and args.split != 'train':
+        raise ValueError('--point-supervised-pseudo requires --split train')
+    if args.point_supervised_pseudo and not args.disable_heatmap_size:
+        args.disable_heatmap_size = True
+        print('Enable --disable-heatmap-size automatically for point-supervised pseudo mode.')
+    if args.point_supervised_pseudo:
+        print('Point-supervised pseudo mode: random flip transforms will be disabled.')
+
     cfg = Config.fromfile(args.config)
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
@@ -286,7 +341,23 @@ def main():
             # Run bbox head directly so we can reuse cls heatmap for size estimation.
             feats = model.extract_feat(imgs[0])
             outs = model.bbox_head(feats)
-            bbox_list = model.bbox_head.get_bboxes(*outs, img_metas, rescale=True)
+            if args.point_supervised_pseudo:
+                gt_bboxes = _unwrap_tensor_list(data, 'gt_bboxes', device)
+                gt_labels = _unwrap_tensor_list(data, 'gt_labels', device)
+                if gt_bboxes is None or gt_labels is None:
+                    raise RuntimeError(
+                        'point-supervised pseudo generation needs gt_bboxes/gt_labels in batch')
+                if not hasattr(model.bbox_head, 'get_pseudo_bboxes'):
+                    raise AttributeError(
+                        'bbox_head has no `get_pseudo_bboxes`; use CPMVPDPseudoHead')
+                bbox_list = model.bbox_head.get_pseudo_bboxes(
+                    *outs,
+                    gt_bboxes=gt_bboxes,
+                    gt_labels=gt_labels,
+                    img_metas=img_metas,
+                    rescale=True)
+            else:
+                bbox_list = model.bbox_head.get_bboxes(*outs, img_metas, rescale=True)
             results = [
                 rbbox2result(det_bboxes, det_labels, model.bbox_head.num_classes)
                 for det_bboxes, det_labels in bbox_list
