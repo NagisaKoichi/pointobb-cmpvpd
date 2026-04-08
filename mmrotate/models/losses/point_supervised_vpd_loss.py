@@ -12,7 +12,8 @@ This ensures center loss, KL prior, and posterior are all in the same units.
 ELBO objective:
   L = lambda_center * L_center
     + lambda_kl(t) * KL(q_phi || p_psi)
-        + lambda_var(t) * L_var
+                + lambda_var(t) * L_var
+                + lambda_size * L_size
 
 Curriculum:
     Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup,
@@ -42,6 +43,10 @@ class PointSupervisedVPDLoss(nn.Module):
         lambda_var_warmup (float | None): Initial variance regularization
             weight (stage A). If None, uses lambda_var (no schedule).
             Default: None.
+        lambda_size (float): Weight for direct size mean supervision on
+            (log_w, log_h). Default: 0.5.
+        size_beta (float): Beta in smooth L1 for size mean supervision.
+            Default: 1.0.
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
         sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
             Default: 0.5.
@@ -67,6 +72,8 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_kl_warmup=0.02,
                  lambda_var=0.04,
                  lambda_var_warmup=0.001,
+                 lambda_size=0.5,
+                 size_beta=1.0,
                  knn_k=5,
                  sigma_c_coeff=0.5,
                  scale_alpha_w=1.0,
@@ -87,6 +94,8 @@ class PointSupervisedVPDLoss(nn.Module):
         self.lambda_var = lambda_var
         self.lambda_var_warmup = (
             lambda_var if lambda_var_warmup is None else lambda_var_warmup)
+        self.lambda_size = lambda_size
+        self.size_beta = size_beta
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
         self.scale_alpha_w = scale_alpha_w
@@ -153,6 +162,7 @@ class PointSupervisedVPDLoss(nn.Module):
                 pos_points,
                 pos_strides,
                 gt_centers,
+                gt_wh,
                 gt_centers_list,
                 cur_iter=0):
         """Compute point-supervised VPD loss in stride-normalized space.
@@ -165,16 +175,18 @@ class PointSupervisedVPDLoss(nn.Module):
             pos_points (Tensor): Anchor points in image coords (N, 2).
             pos_strides (Tensor): Stride per positive sample (N,).
             gt_centers (Tensor): Matched GT center in image coords (N, 2).
+            gt_wh (Tensor): Matched GT width/height in image coords (N, 2).
             gt_centers_list (list[Tensor]): All GT centers per image in image coords.
             cur_iter (int): Current training iteration.
 
         Returns:
-            dict[str, Tensor]: loss_center, loss_kl, loss_var, loss_total.
+            dict[str, Tensor]: loss_center, loss_kl, loss_var, loss_size, loss_total.
         """
         N = bbox_mu.shape[0]
         if N == 0:
             zero = bbox_mu.sum() * 0.0
-            return dict(loss_center=zero, loss_kl=zero, loss_var=zero, loss_total=zero)
+            return dict(loss_center=zero, loss_kl=zero, loss_var=zero,
+                        loss_size=zero, loss_total=zero)
 
         bbox_mu = torch.nan_to_num(bbox_mu, nan=0.0, posinf=1e4, neginf=-1e4)
         bbox_log_sigma = self._sanitize_log_sigma(bbox_log_sigma)
@@ -188,6 +200,14 @@ class PointSupervisedVPDLoss(nn.Module):
         l_center = F.smooth_l1_loss(pred_delta_norm, gt_delta_norm,
                                     reduction='mean', beta=1.0)
         l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
+
+        # --- Size mean supervision in normalized log-size space ---
+        gt_wh_norm = (gt_wh / stride_2d).clamp(min=1e-6)
+        gt_log_wh = torch.log(gt_wh_norm)
+        pred_log_wh = bbox_mu[:, 2:4]
+        l_size = F.smooth_l1_loss(
+            pred_log_wh, gt_log_wh, reduction='mean', beta=self.size_beta)
+        l_size = torch.nan_to_num(l_size, nan=0.0, posinf=1e4, neginf=0.0)
 
         # --- Build point-conditioned prior in normalized space ---
         eff_lambda_kl, eff_lambda_var, sigma_s = self._curriculum(cur_iter)
@@ -260,12 +280,14 @@ class PointSupervisedVPDLoss(nn.Module):
 
         loss_total = (self.lambda_center * l_center
                       + eff_lambda_kl * l_kl
-                      + eff_lambda_var * l_var)
+                      + eff_lambda_var * l_var
+                      + self.lambda_size * l_size)
         loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=0.0)
 
         return dict(
             loss_center=l_center,
             loss_kl=l_kl,
             loss_var=l_var,
+            loss_size=l_size,
             loss_total=loss_total,
         )

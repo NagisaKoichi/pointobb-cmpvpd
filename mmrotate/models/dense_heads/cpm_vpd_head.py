@@ -75,6 +75,7 @@ class CPMVPDHead(CPMHead):
             lambda_kl_warmup=0.02,
             lambda_var=0.01,
             lambda_var_warmup=0.002,
+            lambda_size=0.5,
             warmup_iters=self.warmup_iters,
         ))
 
@@ -355,7 +356,8 @@ class CPMVPDHead(CPMHead):
                 loss_vpd=zero,
                 vpd_center=zero.detach(),
                 vpd_kl=zero.detach(),
-                vpd_var=zero.detach())
+                vpd_var=zero.detach(),
+                vpd_size=zero.detach())
 
         pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 8)
         pos_points = flatten_points[pos_inds]           # (Np, 2)
@@ -369,13 +371,17 @@ class CPMVPDHead(CPMHead):
         # Build matched gt_centers per positive sample (image coords)
         gt_centers_per_pos = torch.zeros(
             len(pos_inds), 2, device=bbox_preds[0].device)
+        gt_wh_per_pos = torch.zeros(
+            len(pos_inds), 2, device=bbox_preds[0].device)
         for img_id in range(num_imgs):
             mask = (pos_img_ids == img_id)
             if not mask.any():
                 continue
             gt_center_this = gt_bboxes[img_id][:, :2]  # (num_gt_i, 2)
+            gt_wh_this = gt_bboxes[img_id][:, 2:4].clamp(min=1e-6)  # (num_gt_i, 2)
             ids_this = pos_gt_ids[mask]
             gt_centers_per_pos[mask] = gt_center_this[ids_this]
+            gt_wh_per_pos[mask] = gt_wh_this[ids_this]
 
         # GT centers list for kNN prior (image coords, one entry per image)
         gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes]
@@ -386,6 +392,7 @@ class CPMVPDHead(CPMHead):
             pos_points=pos_points,
             pos_strides=pos_strides,
             gt_centers=gt_centers_per_pos,
+            gt_wh=gt_wh_per_pos,
             gt_centers_list=gt_centers_list,
             cur_iter=self.iter,
         )
@@ -399,6 +406,7 @@ class CPMVPDHead(CPMHead):
             vpd_center=vpd_losses['loss_center'].detach(),
             vpd_kl=vpd_losses['loss_kl'].detach(),
             vpd_var=vpd_losses['loss_var'].detach(),
+            vpd_size=vpd_losses['loss_size'].detach(),
         )
 
     # ------------------------------------------------------------------
