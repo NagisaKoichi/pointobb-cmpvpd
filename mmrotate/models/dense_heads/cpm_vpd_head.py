@@ -1,16 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """CPMVPDHead: CPM Head with Point-Supervised Variational Inference.
 
-Latent variable z = (delta_x, delta_y, log_w, log_h) per anchor point.
+Latent variable z = (delta_x, delta_y) per anchor point.
 Posterior: q_phi(z|f,p) = N(mu_phi, diag(sigma_phi^2))
 Prior:     p_psi(z|p_i, N_i) = N(mu_psi, diag(sigma_psi^2))  [point-conditioned]
 
-Network output (conv_reg, 8 channels):
-    [0:4] = (delta_x, delta_y, log_w, log_h)  -- posterior mean mu_phi
-    [4:8] = (log_sx, log_sy, log_sw, log_sh)  -- posterior log-std
-
-Inference: center = anchor + (delta_x, delta_y),
-           box = (center_x, center_y, exp(log_w), exp(log_h))
+Network output (conv_reg, 4 channels):
+    [0:2] = (delta_x, delta_y)  -- posterior mean mu_phi
+    [2:4] = (log_sx, log_sy)    -- posterior log-std
 """
 
 import torch
@@ -79,22 +76,22 @@ class CPMVPDHead(CPMHead):
         ))
 
     def _init_predictor(self):
-        """Override predictor: conv_reg outputs 8 channels (4 mu + 4 log_sigma).
+        """Override predictor: conv_reg outputs 4 channels (2 mu + 2 log_sigma).
 
         _init_predictor is called last in _init_layers, after _init_reg_convs,
         so overriding here prevents the base class from re-creating a 4-ch conv_reg.
         """
         super()._init_predictor()
-        # Replace conv_reg with 8-channel version:
-        # (delta_x, delta_y, log_w, log_h, log_sx, log_sy, log_sw, log_sh)
-        self.conv_reg = nn.Conv2d(self.feat_channels, 8, 3, padding=1)
+        # Replace conv_reg with 4-channel version:
+        # (delta_x, delta_y, log_sx, log_sy)
+        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)
 
     def forward_single(self, x, scale, stride):
         """Forward for a single FPN level. Returns (cls_score, bbox_pred, centerness).
 
-        bbox_pred: (N, 8, H, W)
-            [:, 0:4] = posterior mean (delta_x, delta_y, log_w, log_h)
-            [:, 4:8] = posterior log-std
+        bbox_pred: (N, 4, H, W)
+            [:, 0:2] = posterior mean (delta_x, delta_y)
+            [:, 2:4] = posterior log-std
         """
         cls_score, _, cls_feat, reg_feat = \
             super(RotatedAnchorFreeHead, self).forward_single(x)
@@ -104,27 +101,25 @@ class CPMVPDHead(CPMHead):
         else:
             centerness = self.conv_centerness(cls_feat)
 
-        bbox_dist = self.conv_reg(reg_feat).float()  # (N, 8, H, W)
+        bbox_dist = self.conv_reg(reg_feat).float()  # (N, 4, H, W)
 
-        # Mean: scale delta_x, delta_y; keep log_w, log_h as-is from network
-        # (Scale layer applied to all 4 channels, then we split semantics)
-        bbox_mu = scale(bbox_dist[:, :4])   # (N, 4, H, W)
-        bbox_log_sigma = bbox_dist[:, 4:]   # (N, 4, H, W)
+        # Mean: scale center offsets only.
+        bbox_mu = scale(bbox_dist[:, :2])   # (N, 2, H, W)
+        bbox_log_sigma = bbox_dist[:, 2:]   # (N, 2, H, W)
 
-        bbox_pred_full = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (N, 8, H, W)
+        bbox_pred_full = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (N, 4, H, W)
         return cls_score, bbox_pred_full, centerness
 
     def _save_variance_map(self, img_path, flip_direction, bbox_pred_lvl):
         """Visualize and save center/scale lstd maps from predicted log-std."""
-        if bbox_pred_lvl.dim() != 3 or bbox_pred_lvl.shape[0] < 6:
+        if bbox_pred_lvl.dim() != 3 or bbox_pred_lvl.shape[0] < 4:
             return
 
-        # Channels map to lstd of (x, y, w, h) directly.
-        log_sigma = bbox_pred_lvl[4:8]
+        # Channels map to lstd of (x, y).
+        log_sigma = bbox_pred_lvl[2:4]
         lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        center_lstd = lstd[0:2].mean(dim=0)
-        scale_lstd = lstd[2:4].mean(dim=0)
+        center_lstd = lstd.mean(dim=0)
 
         def to_heatmap(var_tensor):
             var_np = var_tensor.detach().cpu().numpy().astype(np.float32)
@@ -151,8 +146,6 @@ class CPMVPDHead(CPMHead):
             return var_img
 
         center_img = to_heatmap(center_lstd)
-        scale_img = to_heatmap(scale_lstd)
-
         base_img = Image.open(img_path).convert('RGB')
         base_img = base_img.resize((center_img.width, center_img.height))
 
@@ -160,14 +153,9 @@ class CPMVPDHead(CPMHead):
         center_merged.paste(base_img, (0, 0))
         center_merged.paste(center_img, (base_img.width, 0))
 
-        scale_merged = Image.new('RGB', (base_img.width + scale_img.width, base_img.height))
-        scale_merged.paste(base_img, (0, 0))
-        scale_merged.paste(scale_img, (base_img.width, 0))
-
         out_dir = os.path.join(self.store_dir, 'variance_map', str(self.iter))
         os.makedirs(out_dir, exist_ok=True)
         center_merged.save(os.path.join(out_dir, 'center_lstd.jpg'))
-        scale_merged.save(os.path.join(out_dir, 'scale_lstd.jpg'))
 
     # ------------------------------------------------------------------
     # Label assignment: override _get_target_single to also return gt_ids
@@ -310,7 +298,7 @@ class CPMVPDHead(CPMHead):
             cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
             for cs in cls_scores])
         flatten_bbox_preds = torch.cat([
-            bp.permute(0, 2, 3, 1).reshape(-1, 8)
+            bp.permute(0, 2, 3, 1).reshape(-1, 4)
             for bp in bbox_preds])
         flatten_labels = torch.cat(labels)
         flatten_gt_ids = torch.cat(gt_ids)
@@ -357,14 +345,14 @@ class CPMVPDHead(CPMHead):
                 vpd_kl=zero.detach(),
                 vpd_var=zero.detach())
 
-        pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 8)
+        pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 4)
         pos_points = flatten_points[pos_inds]           # (Np, 2)
         pos_img_ids = img_ids[pos_inds]                 # (Np,)
         pos_gt_ids = flatten_gt_ids[pos_inds]           # (Np,) -- index into per-img gt
         pos_strides = flatten_strides[pos_inds]         # (Np,)
 
-        bbox_mu = pos_bbox_preds[:, :4]        # (Np, 4)
-        bbox_log_sigma = pos_bbox_preds[:, 4:] # (Np, 4)
+        bbox_mu = pos_bbox_preds[:, :2]        # (Np, 2)
+        bbox_log_sigma = pos_bbox_preds[:, 2:] # (Np, 2)
 
         # Build matched gt_centers per positive sample (image coords)
         gt_centers_per_pos = torch.zeros(
@@ -408,27 +396,24 @@ class CPMVPDHead(CPMHead):
     def _decode_bbox_from_mu(self, points, bbox_mu, stride):
         """Decode posterior mean to absolute box (cx, cy, w, h, angle=0).
 
-        bbox_mu = (delta_x, delta_y, log_w, log_h) in feature-map units.
-        With norm_on_bbox=True the network learns delta/stride, so we multiply.
+        bbox_mu = (delta_x, delta_y) in feature-map units.
+        Width/height are set to one stride as a fallback for xy-only heads.
 
         Returns:
             Tensor: (N, 5) rotated box (cx, cy, w, h, angle) with angle=0.
         """
         dx = bbox_mu[:, 0]
         dy = bbox_mu[:, 1]
-        log_w = bbox_mu[:, 2]
-        log_h = bbox_mu[:, 3]
 
         if self.norm_on_bbox:
             cx = points[:, 0] + dx * stride
             cy = points[:, 1] + dy * stride
-            w = log_w.exp() * stride
-            h = log_h.exp() * stride
         else:
             cx = points[:, 0] + dx
             cy = points[:, 1] + dy
-            w = log_w.exp()
-            h = log_h.exp()
+
+        w = torch.full_like(cx, float(stride))
+        h = torch.full_like(cy, float(stride))
 
         angle = torch.zeros_like(cx)
         return torch.stack([cx, cy, w, h, angle], dim=1)  # (N, 5)
@@ -457,12 +442,12 @@ class CPMVPDHead(CPMHead):
             for lvl_idx in range(num_levels):
                 stride = self.strides[lvl_idx]
                 cls_score = cls_scores[lvl_idx][img_id]  # (C, H, W)
-                bbox_pred = bbox_preds[lvl_idx][img_id]  # (8, H, W)
+                bbox_pred = bbox_preds[lvl_idx][img_id]  # (4, H, W)
                 centerness = centernesses[lvl_idx][img_id]  # (1, H, W)
                 points = mlvl_points[lvl_idx]              # (H*W, 2)
 
                 # Flatten
-                bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 8)
+                bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
                 if self.use_remap_score:
                     # Remap max class probability by center mean offsets (dx, dy).
                     # Score at (y, x) reads max prob from (y + dy, x + dx).
@@ -497,12 +482,12 @@ class CPMVPDHead(CPMHead):
                 _, topk_inds = max_scores.topk(nms_pre)
 
                 points = points[topk_inds]
-                bbox_mu = bbox_pred[topk_inds, :4]  # use mean only
+                bbox_mu = bbox_pred[topk_inds, :2]  # use center mean only
                 scores = scores[topk_inds]
 
                 # Optionally sample multiple times for refinement
                 if self.use_refinement:
-                    bbox_log_sigma = bbox_pred[topk_inds, 4:]
+                    bbox_log_sigma = bbox_pred[topk_inds, 2:]
                     bbox_std = bbox_log_sigma.exp()
                     samples = [bbox_mu + bbox_std * torch.randn_like(bbox_mu)
                                for _ in range(self.num_samples)]

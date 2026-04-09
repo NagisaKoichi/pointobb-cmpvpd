@@ -1,9 +1,9 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""CPMVPD pseudo-label head based on 8-channel regression outputs.
+"""CPMVPD pseudo-label head based on 4-channel regression outputs.
 
 This head reuses CPMVPD inference outputs:
-    [0:4] posterior mean  (dx, dy, log_w, log_h)
-    [4:8] posterior lstd  (log_sx, log_sy, log_sw, log_sh)
+    [0:2] posterior mean  (dx, dy)
+    [2:4] posterior lstd  (log_sx, log_sy)
 
 Pseudo generation pipeline:
 1) Build remap score map from cls-score map using mean offsets (dx, dy).
@@ -24,7 +24,7 @@ from .cpm_vpd_head import CPMVPDHead
 
 @ROTATED_HEADS.register_module()
 class CPMVPDPseudoHead(CPMVPDHead):
-    """Point-supervised pseudo-box generator using CPMVPD 8-channel output.
+    """Point-supervised pseudo-box generator using CPMVPD 4-channel output.
 
     Args:
         point_search_radius (int): Local search radius (feature pixels)
@@ -88,21 +88,21 @@ class CPMVPDPseudoHead(CPMVPDHead):
 
     def _decode_from_stats(self, point, stride, mu, lstd):
         """Decode one rotated box from a selected pixel stats."""
-        dx, dy, log_w, log_h = mu
-        if self.use_lstd_for_size:
-            log_w = log_w + self.lstd_size_factor * lstd[2]
-            log_h = log_h + self.lstd_size_factor * lstd[3]
+        dx, dy = mu
 
         if self.norm_on_bbox:
             cx = point[0] + dx * stride
             cy = point[1] + dy * stride
-            w = torch.exp(log_w) * stride
-            h = torch.exp(log_h) * stride
         else:
             cx = point[0] + dx
             cy = point[1] + dy
-            w = torch.exp(log_w)
-            h = torch.exp(log_h)
+
+        # xy-only head has no direct size logits; start from stride-sized box.
+        wh_scale = 1.0
+        if self.use_lstd_for_size:
+            wh_scale = torch.exp(self.lstd_size_factor * lstd.mean())
+        w = point.new_tensor(float(stride)) * wh_scale
+        h = point.new_tensor(float(stride)) * wh_scale
 
         angle = cx.new_zeros(())
         return torch.stack([cx, cy, w, h, angle], dim=0)
@@ -173,7 +173,7 @@ class CPMVPDPseudoHead(CPMVPDHead):
 
         Args:
             cls_scores (list[Tensor]): Per-level cls logits, shape [B, C, H, W].
-            bbox_preds (list[Tensor]): Per-level 8-ch regression, shape [B, 8, H, W].
+            bbox_preds (list[Tensor]): Per-level 4-ch regression, shape [B, 4, H, W].
             centernesses (list[Tensor]): Per-level centerness logits, shape [B, 1, H, W].
             gt_bboxes (list[Tensor]): Point-supervised GT boxes (center in first 2 dims).
             gt_labels (list[Tensor]): GT labels aligned with gt_bboxes.
@@ -240,8 +240,8 @@ class CPMVPDPseudoHead(CPMVPDHead):
                     anchor_point = mlvl_points[lvl_idx][pt_idx]
 
                     stats = bbox_pred_lvl[:, py, px]
-                    mu = torch.nan_to_num(stats[:4], nan=0.0, posinf=1e4, neginf=-1e4)
-                    lstd = torch.nan_to_num(stats[4:8], nan=0.0, posinf=1e4, neginf=-1e4)
+                    mu = torch.nan_to_num(stats[:2], nan=0.0, posinf=1e4, neginf=-1e4)
+                    lstd = torch.nan_to_num(stats[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
 
                     box = self._decode_from_stats(anchor_point, stride, mu, lstd)
                     if self.use_remap_size:

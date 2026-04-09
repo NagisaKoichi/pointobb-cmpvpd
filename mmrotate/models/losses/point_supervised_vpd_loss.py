@@ -2,12 +2,11 @@
 """Point-Supervised VPD Loss with Point-Conditioned Prior.
 
 All computations are done in **stride-normalized space**:
-  - bbox_mu[:, :2] = (delta_x / stride, delta_y / stride)  [network output]
-  - bbox_mu[:, 2:] = (log_w, log_h)  [log of size, no stride factor]
-  - gt_center_delta = (gt_center - anchor) / stride  [target in same space]
-  - d_i_norm = d_i_pixels / stride  [kNN distance normalized]
+    - bbox_mu[:, :2] = (delta_x / stride, delta_y / stride)  [network output]
+    - gt_center_delta = (gt_center - anchor) / stride  [target in same space]
+    - d_i_norm = d_i_pixels / stride  [kNN distance normalized]
 
-This ensures center loss, KL prior, and posterior are all in the same units.
+This ensures center loss and KL prior/posterior are all in the same units.
 
 ELBO objective:
   L = lambda_center * L_center
@@ -16,11 +15,9 @@ ELBO objective:
 
 Curriculum:
     Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup,
-                                                                    lambda_var = lambda_var_warmup,
-                                                                    sigma_s = sigma_s_init
+                                                                    lambda_var = lambda_var_warmup
   Stage B (iter >= warmup_iters): lambda_kl linearly increases to lambda_kl,
-                                                                     lambda_var linearly increases to lambda_var,
-                                   sigma_s linearly anneals to sigma_s_final
+                                                                     lambda_var linearly increases to lambda_var
 """
 import torch
 import torch.nn as nn
@@ -45,10 +42,6 @@ class PointSupervisedVPDLoss(nn.Module):
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
         sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
             Default: 0.5.
-        scale_alpha_w (float): Scale prior mu_w = log(alpha_w * d_i_norm). Default: 1.0.
-        scale_alpha_h (float): Scale prior mu_h = log(alpha_h * d_i_norm). Default: 1.0.
-        sigma_s_init (float): Initial scale prior sigma. Default: 1.0.
-        sigma_s_final (float): Final scale prior sigma (after annealing). Default: 0.4.
         var_quality_tau (float): Temperature for quality weighting in l_var.
             Smaller values focus more on near-center positives. Default: 2.0.
         var_quality_floor (float): Minimum quality weight for numerical stability.
@@ -69,10 +62,6 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_var_warmup=0.001,
                  knn_k=5,
                  sigma_c_coeff=0.5,
-                 scale_alpha_w=1.0,
-                 scale_alpha_h=1.0,
-                 sigma_s_init=1.0,
-                 sigma_s_final=0.4,
                  var_quality_tau=1.0,
                  var_quality_floor=0.01,
                  warmup_iters=2000,
@@ -89,10 +78,6 @@ class PointSupervisedVPDLoss(nn.Module):
             lambda_var if lambda_var_warmup is None else lambda_var_warmup)
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
-        self.scale_alpha_w = scale_alpha_w
-        self.scale_alpha_h = scale_alpha_h
-        self.sigma_s_init = sigma_s_init
-        self.sigma_s_final = sigma_s_final
         self.var_quality_tau = var_quality_tau
         self.var_quality_floor = var_quality_floor
         self.warmup_iters = warmup_iters
@@ -115,14 +100,13 @@ class PointSupervisedVPDLoss(nn.Module):
         return bbox_log_sigma
 
     def _curriculum(self, cur_iter):
-        """Return (eff_lambda_kl, eff_lambda_var, sigma_s) for current iteration."""
+        """Return (eff_lambda_kl, eff_lambda_var) for current iteration."""
         if cur_iter < self.warmup_iters:
-            return self.lambda_kl_warmup, self.lambda_var_warmup, self.sigma_s_init
+            return self.lambda_kl_warmup, self.lambda_var_warmup
         ratio = min(1.0, (cur_iter - self.warmup_iters) / max(self.anneal_iters, 1))
         eff_lambda_kl = self.lambda_kl_warmup + ratio * (self.lambda_kl - self.lambda_kl_warmup)
         eff_lambda_var = self.lambda_var_warmup + ratio * (self.lambda_var - self.lambda_var_warmup)
-        sigma_s = self.sigma_s_init - ratio * (self.sigma_s_init - self.sigma_s_final)
-        return eff_lambda_kl, eff_lambda_var, sigma_s
+        return eff_lambda_kl, eff_lambda_var
 
     def _compute_di_norm(self, gt_centers_norm, all_gt_centers_norm):
         """Compute mean kNN distance in normalized space for each positive sample.
@@ -158,10 +142,9 @@ class PointSupervisedVPDLoss(nn.Module):
         """Compute point-supervised VPD loss in stride-normalized space.
 
         Args:
-            bbox_mu (Tensor): Posterior mean (N, 4).
+            bbox_mu (Tensor): Posterior mean (N, 2).
                 [:, :2] = (delta_x/stride, delta_y/stride)  -- normalized center offset
-                [:, 2:] = (log_w, log_h)  -- log size (no stride)
-            bbox_log_sigma (Tensor): Posterior log-std (N, 4).
+            bbox_log_sigma (Tensor): Posterior log-std (N, 2).
             pos_points (Tensor): Anchor points in image coords (N, 2).
             pos_strides (Tensor): Stride per positive sample (N,).
             gt_centers (Tensor): Matched GT center in image coords (N, 2).
@@ -190,7 +173,7 @@ class PointSupervisedVPDLoss(nn.Module):
         l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
 
         # --- Build point-conditioned prior in normalized space ---
-        eff_lambda_kl, eff_lambda_var, sigma_s = self._curriculum(cur_iter)
+        eff_lambda_kl, eff_lambda_var = self._curriculum(cur_iter)
 
         # For kNN, normalize all GT centers relative to each sample's anchor/stride.
         # Simpler: use pixel-space kNN distances, then divide by mean stride.
@@ -213,17 +196,8 @@ class PointSupervisedVPDLoss(nn.Module):
             min=self.prior_delta_min, max=self.prior_delta_max)  # (N,)
 
         # Center prior: mu=0, sigma = sigma_c_coeff * d_i_norm  (in normalized units)
-        sigma_c = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)  # (N, 2)
-        mu_c = torch.zeros(N, 2, device=bbox_mu.device)
-
-        # Scale prior: mu = log(alpha * d_i_norm), sigma = sigma_s
-        mu_s = torch.stack([
-            torch.log(self.scale_alpha_w * d_i_norm),
-            torch.log(self.scale_alpha_h * d_i_norm)], dim=1)   # (N, 2)
-        sigma_s_2d = bbox_mu.new_full((N, 2), sigma_s)
-
-        prior_mu = torch.cat([mu_c, mu_s], dim=1)              # (N, 4)
-        prior_sigma = torch.cat([sigma_c, sigma_s_2d], dim=1)  # (N, 4)
+        prior_sigma = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)  # (N, 2)
+        prior_mu = torch.zeros(N, 2, device=bbox_mu.device)
         prior_mu = torch.nan_to_num(prior_mu, nan=0.0, posinf=1e4, neginf=-1e4)
         prior_sigma = torch.nan_to_num(prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
 
@@ -247,7 +221,7 @@ class PointSupervisedVPDLoss(nn.Module):
         # --- Quality-weighted variance regularization on center dims ---
         # High-quality positives (closer to GT center in normalized space)
         # receive stronger variance shrinkage.
-        center_sigma = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean(dim=1)  # (N,)
+        center_sigma = bbox_log_sigma.exp().clamp(max=self.sigma_max).mean(dim=1)  # (N,)
         center_dist = torch.norm(gt_delta_norm, dim=1)  # (N,)
         tau2 = max(self.var_quality_tau, 1e-6) ** 2
         quality_w = torch.exp(-0.5 * center_dist.pow(2) / tau2)
