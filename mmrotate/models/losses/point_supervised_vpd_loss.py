@@ -13,7 +13,7 @@ ELBO objective:
   L = lambda_center * L_center
     + lambda_kl(t) * KL(q_phi || p_psi)
                 + lambda_var(t) * L_var
-                + lambda_size * L_size
+                                + lambda_size(t) * L_size
 
 Curriculum:
     Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup,
@@ -45,6 +45,8 @@ class PointSupervisedVPDLoss(nn.Module):
             Default: None.
         lambda_size (float): Weight for direct size mean supervision on
             (log_w, log_h). Default: 0.5.
+        lambda_size_warmup (float | None): Initial size-supervision weight
+            (stage A). If None, uses lambda_size (no schedule). Default: None.
         size_beta (float): Beta in smooth L1 for size mean supervision.
             Default: 1.0.
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
@@ -72,7 +74,8 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_kl_warmup=0.02,
                  lambda_var=0.04,
                  lambda_var_warmup=0.001,
-                 lambda_size=0.5,
+                 lambda_size=0.3,
+                 lambda_size_warmup=None,
                  size_beta=1.0,
                  knn_k=5,
                  sigma_c_coeff=0.5,
@@ -83,7 +86,7 @@ class PointSupervisedVPDLoss(nn.Module):
                  var_quality_tau=1.0,
                  var_quality_floor=0.01,
                  warmup_iters=2000,
-                 anneal_iters=800,
+                 anneal_iters=2000,
                  prior_delta_min=0.5,
                  prior_delta_max=16.0,
                  kl_clip=50.0):
@@ -95,6 +98,8 @@ class PointSupervisedVPDLoss(nn.Module):
         self.lambda_var_warmup = (
             lambda_var if lambda_var_warmup is None else lambda_var_warmup)
         self.lambda_size = lambda_size
+        self.lambda_size_warmup = (
+            lambda_size if lambda_size_warmup is None else lambda_size_warmup)
         self.size_beta = size_beta
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
@@ -124,14 +129,16 @@ class PointSupervisedVPDLoss(nn.Module):
         return bbox_log_sigma
 
     def _curriculum(self, cur_iter):
-        """Return (eff_lambda_kl, eff_lambda_var, sigma_s) for current iteration."""
+        """Return (eff_lambda_kl, eff_lambda_var, eff_lambda_size, sigma_s)."""
         if cur_iter < self.warmup_iters:
-            return self.lambda_kl_warmup, self.lambda_var_warmup, self.sigma_s_init
+            return (self.lambda_kl_warmup, self.lambda_var_warmup,
+                    self.lambda_size_warmup, self.sigma_s_init)
         ratio = min(1.0, (cur_iter - self.warmup_iters) / max(self.anneal_iters, 1))
         eff_lambda_kl = self.lambda_kl_warmup + ratio * (self.lambda_kl - self.lambda_kl_warmup)
         eff_lambda_var = self.lambda_var_warmup + ratio * (self.lambda_var - self.lambda_var_warmup)
+        eff_lambda_size = self.lambda_size_warmup + ratio * (self.lambda_size - self.lambda_size_warmup)
         sigma_s = self.sigma_s_init - ratio * (self.sigma_s_init - self.sigma_s_final)
-        return eff_lambda_kl, eff_lambda_var, sigma_s
+        return eff_lambda_kl, eff_lambda_var, eff_lambda_size, sigma_s
 
     def _compute_di_norm(self, gt_centers_norm, all_gt_centers_norm):
         """Compute mean kNN distance in normalized space for each positive sample.
@@ -201,16 +208,26 @@ class PointSupervisedVPDLoss(nn.Module):
                                     reduction='mean', beta=1.0)
         l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
 
+        # --- Build point-conditioned prior in normalized space ---
+        eff_lambda_kl, eff_lambda_var, eff_lambda_size, sigma_s = self._curriculum(cur_iter)
+
+        # Shared quality weights (higher near matched center) for robust weighting.
+        center_dist = torch.norm(gt_delta_norm, dim=1)  # (N,)
+        tau2 = max(self.var_quality_tau, 1e-6) ** 2
+        quality_w = torch.exp(-0.5 * center_dist.pow(2) / tau2)
+        quality_w = quality_w.clamp(min=self.var_quality_floor)
+        quality_w = torch.nan_to_num(
+            quality_w, nan=1.0, posinf=1.0, neginf=self.var_quality_floor)
+        w_sum = quality_w.sum().clamp(min=1e-6)
+
         # --- Size mean supervision in normalized log-size space ---
         gt_wh_norm = (gt_wh / stride_2d).clamp(min=1e-6)
         gt_log_wh = torch.log(gt_wh_norm)
         pred_log_wh = bbox_mu[:, 2:4]
-        l_size = F.smooth_l1_loss(
-            pred_log_wh, gt_log_wh, reduction='mean', beta=self.size_beta)
+        l_size_per = F.smooth_l1_loss(
+            pred_log_wh, gt_log_wh, reduction='none', beta=self.size_beta).mean(dim=1)
+        l_size = (l_size_per * quality_w).sum() / w_sum
         l_size = torch.nan_to_num(l_size, nan=0.0, posinf=1e4, neginf=0.0)
-
-        # --- Build point-conditioned prior in normalized space ---
-        eff_lambda_kl, eff_lambda_var, sigma_s = self._curriculum(cur_iter)
 
         # For kNN, normalize all GT centers relative to each sample's anchor/stride.
         # Simpler: use pixel-space kNN distances, then divide by mean stride.
@@ -268,20 +285,13 @@ class PointSupervisedVPDLoss(nn.Module):
         # High-quality positives (closer to GT center in normalized space)
         # receive stronger variance shrinkage.
         center_sigma = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean(dim=1)  # (N,)
-        center_dist = torch.norm(gt_delta_norm, dim=1)  # (N,)
-        tau2 = max(self.var_quality_tau, 1e-6) ** 2
-        quality_w = torch.exp(-0.5 * center_dist.pow(2) / tau2)
-        quality_w = quality_w.clamp(min=self.var_quality_floor)
-        quality_w = torch.nan_to_num(quality_w, nan=1.0, posinf=1.0, neginf=self.var_quality_floor)
-
-        w_sum = quality_w.sum().clamp(min=1e-6)
         l_var = (center_sigma * quality_w).sum() / w_sum
         l_var = torch.nan_to_num(l_var, nan=0.0, posinf=self.sigma_max, neginf=0.0)
 
         loss_total = (self.lambda_center * l_center
                       + eff_lambda_kl * l_kl
                       + eff_lambda_var * l_var
-                      + self.lambda_size * l_size)
+                      + eff_lambda_size * l_size)
         loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=0.0)
 
         return dict(

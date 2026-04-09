@@ -117,7 +117,7 @@ model = dict(
         max_per_img=2000))
 
 find_unused_parameters = True
-runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=6)
+runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=12)
 lr_config = dict(
     _delete_=True,
     policy='step',
@@ -127,4 +127,4 @@ lr_config = dict(
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
 checkpoint_config = dict(interval=1, create_symlink=False)
-optimizer = dict(lr=0.05)
+optimizer = dict(lr=0.005, weight_decay=0.0001)

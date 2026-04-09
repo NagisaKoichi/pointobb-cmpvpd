@@ -75,8 +75,10 @@ class CPMVPDHead(CPMHead):
             lambda_kl_warmup=0.02,
             lambda_var=0.01,
             lambda_var_warmup=0.002,
-            lambda_size=0.5,
+            lambda_size=0.3,
+            lambda_size_warmup=0.05,
             warmup_iters=self.warmup_iters,
+            anneal_iters=self.warmup_iters,
         ))
 
     def _init_predictor(self):
