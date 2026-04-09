@@ -89,17 +89,15 @@ def _save_maps_for_image(img_path,
                          out_path,
                          out_mean_path,
                          out_remap_path):
-    # Channels 0:4 are posterior mean for (x, y, w, h).
-    mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
+    # Channels 0:2 are posterior center mean for (x, y).
+    mu = torch.nan_to_num(bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
     center_mu = mu[0:2].mean(dim=0)
-    scale_mu = mu[2:4].mean(dim=0)
 
-    # Channels 4:8 are log_sigma for (x, y, w, h).
-    log_sigma = bbox_pred_lvl[4:8]
+    # Channels 2:4 are center log_sigma for (x, y).
+    log_sigma = bbox_pred_lvl[2:4]
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
 
-    center_lstd = lstd[0:2].mean(dim=0)
-    scale_lstd = lstd[2:4].mean(dim=0)
+    center_lstd = lstd.mean(dim=0)
 
     cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
     centerness_lvl = torch.nan_to_num(centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -124,9 +122,7 @@ def _save_maps_for_image(img_path,
     # remapped_max_prob = -0.1/(remapped_max_prob + 0.1) + 1
 
     center_mu_img = _to_heatmap(center_mu, flip_direction)
-    scale_mu_img = _to_heatmap(scale_mu, flip_direction)
     center_img = _to_heatmap(center_lstd, flip_direction)
-    scale_img = _to_heatmap(scale_lstd, flip_direction)
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
     max_cls_img = _to_heatmap(max_class_prob, flip_direction)
     combined_img = _to_heatmap(combined_score, flip_direction)
@@ -140,7 +136,7 @@ def _save_maps_for_image(img_path,
 
     merged.paste(base_img, (0, 0))
     merged.paste(center_img, (cell_w, 0))
-    merged.paste(scale_img, (cell_w * 2, 0))
+    merged.paste(center_mu_img, (cell_w * 2, 0))
 
     merged.paste(centerness_img, (0, cell_h))
     merged.paste(max_cls_img, (cell_w, cell_h))
@@ -148,10 +144,9 @@ def _save_maps_for_image(img_path,
 
     merged.save(out_path)
 
-    mean_merged = Image.new('RGB', (cell_w * 3, cell_h))
+    mean_merged = Image.new('RGB', (cell_w * 2, cell_h))
     mean_merged.paste(base_img, (0, 0))
     mean_merged.paste(center_mu_img, (cell_w, 0))
-    mean_merged.paste(scale_mu_img, (cell_w * 2, 0))
     mean_merged.save(out_mean_path)
 
     remapped_img.save(out_remap_path)

@@ -18,7 +18,7 @@ from mmrotate.utils import compat_cfg, get_device, setup_multi_processes
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description='Inference VPD checkpoint and dump size-Gaussian maps')
+        description='Inference VPD checkpoint and dump center-Gaussian maps')
     parser.add_argument('config', help='config file path')
     parser.add_argument('checkpoint', help='checkpoint file path')
     parser.add_argument(
@@ -96,15 +96,15 @@ def _to_heatmap(map_tensor, flip_direction):
 
 
 def _accumulate_size_gaussians(max_class_prob,
-                               size_mu,
-                               size_log_sigma,
+                               center_mu,
+                               center_log_sigma,
                                prob_thr,
                                min_sigma,
                                max_sigma,
                                window_scale):
     # max_class_prob: [H, W]
-    # size_mu: [2, H, W], corresponds to (w_mu, h_mu)
-    # size_log_sigma: [2, H, W], corresponds to (w_log_sigma, h_log_sigma)
+    # center_mu: [2, H, W], corresponds to (dx_mu, dy_mu)
+    # center_log_sigma: [2, H, W], corresponds to (log_sx, log_sy)
     h, w = max_class_prob.shape
     out_map = torch.zeros((h, w), dtype=max_class_prob.dtype, device=max_class_prob.device)
 
@@ -113,32 +113,30 @@ def _accumulate_size_gaussians(max_class_prob,
     if keep_idx.numel() == 0:
         return out_map
 
-    std = torch.exp(torch.clamp(size_log_sigma, min=-100.0, max=100.0))
-    # std = torch.exp(torch.clamp(size_log_sigma, min=-10.0, max=10.0))
+    std = torch.exp(torch.clamp(center_log_sigma, min=-100.0, max=100.0))
 
     for i in range(keep_idx.shape[0]):
         y = int(keep_idx[i, 0].item())
         x = int(keep_idx[i, 1].item())
 
-        mu_w = torch.abs(size_mu[0, y, x]).item()
-        mu_h = torch.abs(size_mu[1, y, x]).item()
-        std_w = std[0, y, x].item()
-        std_h = std[1, y, x].item()
+        dx = center_mu[0, y, x].item()
+        dy = center_mu[1, y, x].item()
+        cx = int(np.clip(np.round(x + dx), 0, w - 1))
+        cy = int(np.clip(np.round(y + dy), 0, h - 1))
 
-        # Use both mean and std from size posterior to determine Gaussian spread.
-        sigma_x = float(np.clip(mu_w + std_w, min_sigma, max_sigma))
-        sigma_y = float(np.clip(mu_h + std_h, min_sigma, max_sigma))
+        sigma_x = float(np.clip(std[0, y, x].item(), min_sigma, max_sigma))
+        sigma_y = float(np.clip(std[1, y, x].item(), min_sigma, max_sigma))
 
         rx = max(1, int(np.ceil(window_scale * sigma_x)))
         ry = max(1, int(np.ceil(window_scale * sigma_y)))
 
-        x0 = max(0, x - rx)
-        x1 = min(w - 1, x + rx)
-        y0 = max(0, y - ry)
-        y1 = min(h - 1, y + ry)
+        x0 = max(0, cx - rx)
+        x1 = min(w - 1, cx + rx)
+        y0 = max(0, cy - ry)
+        y1 = min(h - 1, cy + ry)
 
-        xx = torch.arange(x0, x1 + 1, device=out_map.device, dtype=out_map.dtype) - float(x)
-        yy = torch.arange(y0, y1 + 1, device=out_map.device, dtype=out_map.dtype) - float(y)
+        xx = torch.arange(x0, x1 + 1, device=out_map.device, dtype=out_map.dtype) - float(cx)
+        yy = torch.arange(y0, y1 + 1, device=out_map.device, dtype=out_map.dtype) - float(cy)
 
         gx = torch.exp(-0.5 * (xx / sigma_x)**2)
         gy = torch.exp(-0.5 * (yy / sigma_y)**2)
@@ -161,23 +159,20 @@ def _save_map_for_image(img_path,
                         min_sigma,
                         max_sigma,
                         window_scale):
-    # Channels 0:4 are posterior mean for (x, y, w, h).
-    mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
-    # Channels 4:8 are log_sigma for (x, y, w, h).
+    # Channels 0:2 are posterior center mean (dx, dy).
+    mu = torch.nan_to_num(bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
+    # Channels 2:4 are center log_sigma (log_sx, log_sy).
     log_sigma = torch.nan_to_num(
-        bbox_pred_lvl[4:8], nan=0.0, posinf=10.0, neginf=-10.0)
+        bbox_pred_lvl[2:4], nan=0.0, posinf=10.0, neginf=-10.0)
 
     cls_score_lvl = torch.nan_to_num(
         cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
 
-    size_mu = mu[2:4]
-    size_log_sigma = log_sigma[2:4]
-
     gaussian_map = _accumulate_size_gaussians(
         max_class_prob=max_class_prob,
-        size_mu=size_mu,
-        size_log_sigma=size_log_sigma,
+        center_mu=mu,
+        center_log_sigma=log_sigma,
         prob_thr=prob_thr,
         min_sigma=min_sigma,
         max_sigma=max_sigma,
@@ -313,7 +308,7 @@ def main():
             cls_score_lvl = cls_scores[args.feat_level][b]
 
             stem = osp.splitext(osp.basename(img_path))[0]
-            out_name = f'{processed:06d}_{stem}_size_gauss.jpg'
+            out_name = f'{processed:06d}_{stem}_center_gauss.jpg'
             out_path = osp.join(args.out_dir, out_name)
             _save_map_for_image(
                 img_path=img_path,
