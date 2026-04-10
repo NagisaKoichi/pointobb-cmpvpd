@@ -42,10 +42,6 @@ class PointSupervisedVPDLoss(nn.Module):
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
         sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
             Default: 0.5.
-        var_quality_tau (float): Temperature for quality weighting in l_var.
-            Smaller values focus more on near-center positives. Default: 2.0.
-        var_quality_floor (float): Minimum quality weight for numerical stability.
-            Default: 0.05.
         warmup_iters (int): Iterations for stage A. Default: 2000.
         anneal_iters (int): Iterations over which to anneal from stage A to B.
             Default: 2000.
@@ -62,8 +58,6 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_var_warmup=0.001,
                  knn_k=5,
                  sigma_c_coeff=0.5,
-                 var_quality_tau=1.0,
-                 var_quality_floor=0.01,
                  warmup_iters=2000,
                  anneal_iters=800,
                  prior_delta_min=0.5,
@@ -78,8 +72,6 @@ class PointSupervisedVPDLoss(nn.Module):
             lambda_var if lambda_var_warmup is None else lambda_var_warmup)
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
-        self.var_quality_tau = var_quality_tau
-        self.var_quality_floor = var_quality_floor
         self.warmup_iters = warmup_iters
         self.anneal_iters = anneal_iters
         self.prior_delta_min = prior_delta_min
@@ -218,18 +210,8 @@ class PointSupervisedVPDLoss(nn.Module):
         l_kl = kl_per_sample.mean()
         l_kl = torch.nan_to_num(l_kl, nan=0.0, posinf=self.kl_clip, neginf=0.0)
 
-        # --- Quality-weighted variance regularization on center dims ---
-        # High-quality positives (closer to GT center in normalized space)
-        # receive stronger variance shrinkage.
-        center_sigma = bbox_log_sigma.exp().clamp(max=self.sigma_max).mean(dim=1)  # (N,)
-        center_dist = torch.norm(gt_delta_norm, dim=1)  # (N,)
-        tau2 = max(self.var_quality_tau, 1e-6) ** 2
-        quality_w = torch.exp(-0.5 * center_dist.pow(2) / tau2)
-        quality_w = quality_w.clamp(min=self.var_quality_floor)
-        quality_w = torch.nan_to_num(quality_w, nan=1.0, posinf=1.0, neginf=self.var_quality_floor)
-
-        w_sum = quality_w.sum().clamp(min=1e-6)
-        l_var = (center_sigma * quality_w).sum() / w_sum
+        # --- Variance regularization on center dims ---
+        l_var = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean()
         l_var = torch.nan_to_num(l_var, nan=0.0, posinf=self.sigma_max, neginf=0.0)
 
         loss_total = (self.lambda_center * l_center
