@@ -8,9 +8,9 @@ All computations are done in **stride-normalized space**:
 
 This ensures center loss and KL prior/posterior are all in the same units.
 
-ELBO objective:
+Objective:
   L = lambda_center * L_center
-    + lambda_kl(t) * KL(q_phi || p_psi)
+        + lambda_kl(t) * SymKL(q_phi, p_psi)
         + lambda_var(t) * L_var
 
 Curriculum:
@@ -193,17 +193,25 @@ class PointSupervisedVPDLoss(nn.Module):
         prior_mu = torch.nan_to_num(prior_mu, nan=0.0, posinf=1e4, neginf=-1e4)
         prior_sigma = torch.nan_to_num(prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
 
-        # --- KL loss with per-sample clipping to prevent spikes ---
+        # --- Symmetric KL loss with per-sample clipping to prevent spikes ---
         sigma_q = bbox_log_sigma.exp().clamp(min=1e-6, max=self.sigma_max)
         sigma_q = torch.nan_to_num(sigma_q, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
         sigma_p = prior_sigma.clamp(min=1e-6, max=self.sigma_max)
         sigma_p = torch.nan_to_num(sigma_p, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
-        kl_per_dim = (torch.log(sigma_p / sigma_q)
-                      + (sigma_q.pow(2) + (bbox_mu - prior_mu).pow(2))
-                      / (2.0 * sigma_p.pow(2))
-                      - 0.5)
-        kl_per_dim = torch.nan_to_num(kl_per_dim, nan=0.0, posinf=1e4, neginf=0.0)
-        kl_per_sample = kl_per_dim.sum(dim=-1)  # (N,)
+
+        delta_sq = (bbox_mu - prior_mu).pow(2)
+        kl_qp_per_dim = (
+            torch.log(sigma_p / sigma_q)
+            + (sigma_q.pow(2) + delta_sq) / (2.0 * sigma_p.pow(2))
+            - 0.5)
+        kl_pq_per_dim = (
+            torch.log(sigma_q / sigma_p)
+            + (sigma_p.pow(2) + delta_sq) / (2.0 * sigma_q.pow(2))
+            - 0.5)
+        sym_kl_per_dim = 0.5 * (kl_qp_per_dim + kl_pq_per_dim)
+        sym_kl_per_dim = torch.nan_to_num(sym_kl_per_dim, nan=0.0, posinf=1e4, neginf=0.0)
+
+        kl_per_sample = sym_kl_per_dim.sum(dim=-1)  # (N,)
         # Clip per-sample KL to prevent a few outlier samples from causing divergence
         kl_per_sample = kl_per_sample.clamp(max=self.kl_clip)
         kl_per_sample = torch.nan_to_num(kl_per_sample, nan=0.0, posinf=self.kl_clip, neginf=0.0)
