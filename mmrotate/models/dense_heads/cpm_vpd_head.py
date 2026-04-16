@@ -12,6 +12,7 @@ Network output (conv_reg, 4 channels):
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import os
 from PIL import Image
@@ -19,7 +20,7 @@ from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 
 from mmrotate.core import multiclass_nms_rotated
-from ..builder import ROTATED_HEADS, build_loss
+from ..builder import ROTATED_HEADS
 from .cpm_head import CPMHead
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
 
@@ -41,39 +42,33 @@ class CPMVPDHead(CPMHead):
     """
 
     def __init__(self, *args,
-                 warmup_iters=2000,
                  num_samples=10,
                  use_refinement=False,
                  **kwargs):
-        self.warmup_iters = warmup_iters
         self.num_samples = num_samples
         self.use_refinement = use_refinement
         super().__init__(*args, **kwargs)
 
-        train_cfg = kwargs.get('train_cfg') or {}
+        train_cfg = kwargs.get('train_cfg', {})
         test_cfg = kwargs.get('test_cfg') or {}
-        if 'warmup_iters' in train_cfg:
-            self.warmup_iters = train_cfg['warmup_iters']
         if 'num_samples' in test_cfg:
             self.num_samples = test_cfg['num_samples']
         if 'use_refinement' in test_cfg:
             self.use_refinement = test_cfg['use_refinement']
         self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
 
+        # Dense xy supervision hyper-parameters.
+        self.dense_radius = train_cfg.get('dense_radius', 8) if train_cfg else 8
+        self.lambda_mu_dense = train_cfg.get('lambda_mu_dense', 1.0) if train_cfg else 1.0
+        self.lambda_sigma_dense = train_cfg.get('lambda_sigma_dense', 1.0) if train_cfg else 1.0
+        self.sigma_min_target = train_cfg.get('sigma_min_target', 1.0) if train_cfg else 1.0
+        self.sigma_max_target = train_cfg.get('sigma_max_target', 4.0) if train_cfg else 4.0
+        self.ambiguity_weight = train_cfg.get('ambiguity_weight', 2.0) if train_cfg else 2.0
+
         self.visualize_variance_map = bool(
             train_cfg.get('visualize_variance_map', False))
         if self.visualize_variance_map and self.store_dir:
             os.makedirs(os.path.join(self.store_dir, 'variance_map'), exist_ok=True)
-
-        self.loss_vpd = build_loss(dict(
-            type='PointSupervisedVPDLoss',
-            lambda_center=1.0,
-            lambda_kl=0.1,
-            lambda_kl_warmup=0.02,
-            lambda_var=0.01,
-            lambda_var_warmup=0.002,
-            warmup_iters=self.warmup_iters,
-        ))
 
     def _init_predictor(self):
         """Override predictor: conv_reg outputs 4 channels (2 mu + 2 log_sigma).
@@ -268,7 +263,7 @@ class CPMVPDHead(CPMHead):
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def loss(self, cls_scores, bbox_preds, centernesses,
              gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
-        """Compute ELBO loss for point-supervised VPD."""
+        """Compute classification + dense xy(mu/sigma) losses."""
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
 
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
@@ -276,9 +271,7 @@ class CPMVPDHead(CPMHead):
             featmap_sizes, dtype=bbox_preds[0].dtype,
             device=bbox_preds[0].device)
 
-        # Label assignment with GT instance IDs
-        labels, gt_ids = self.get_targets_vpd(
-            all_level_points, gt_bboxes, gt_labels)
+        labels, _ = self.get_targets_vpd(all_level_points, gt_bboxes, gt_labels)
 
         if self.visualize and self.store_dir and self.iter % self.train_duration == 0:
             self.draw_image(img_metas[0]['filename'],
@@ -293,7 +286,7 @@ class CPMVPDHead(CPMHead):
 
         num_imgs = cls_scores[0].size(0)
 
-        # Flatten predictions, also build per-point stride for coord conversion
+        # Flatten predictions, also build per-point stride for coord conversion.
         flatten_cls_scores = torch.cat([
             cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
             for cs in cls_scores])
@@ -301,7 +294,6 @@ class CPMVPDHead(CPMHead):
             bp.permute(0, 2, 3, 1).reshape(-1, 4)
             for bp in bbox_preds])
         flatten_labels = torch.cat(labels)
-        flatten_gt_ids = torch.cat(gt_ids)
         flatten_points = torch.cat(
             [pts.repeat(num_imgs, 1) for pts in all_level_points])
 
@@ -311,8 +303,7 @@ class CPMVPDHead(CPMHead):
             for pts, s in zip(all_level_points, self.strides)])
 
         # Which image does each flattened sample belong to?
-        # flatten order: for each level, all images are stacked
-        # i.e. [img0_lvl0..., img1_lvl0..., img0_lvl1..., img1_lvl1...]
+        # flatten order: for each level, all images are stacked.
         num_pts_per_lvl = [pts.shape[0] for pts in all_level_points]
         img_ids = torch.cat([
             torch.arange(num_imgs, dtype=torch.long,
@@ -335,58 +326,78 @@ class CPMVPDHead(CPMHead):
             avg_factor=num_avail)
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # VPD loss on positive samples
-        if len(pos_inds) == 0:
-            zero = flatten_bbox_preds.sum() * 0.0
-            return dict(
-                loss_cls=loss_cls,
-                loss_vpd=zero,
-                vpd_center=zero.detach(),
-                vpd_kl=zero.detach(),
-                vpd_var=zero.detach())
+        # Dense mu/sigma losses on xy dimensions.
+        P = flatten_points.shape[0]
+        all_mu = flatten_bbox_preds[:, :2]           # (P, 2)
+        all_log_sigma = flatten_bbox_preds[:, 2:]    # (P, 2)
 
-        pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 4)
-        pos_points = flatten_points[pos_inds]           # (Np, 2)
-        pos_img_ids = img_ids[pos_inds]                 # (Np,)
-        pos_gt_ids = flatten_gt_ids[pos_inds]           # (Np,) -- index into per-img gt
-        pos_strides = flatten_strides[pos_inds]         # (Np,)
+        d_nearest = torch.full((P,), float('inf'), device=flatten_points.device)
+        d_second = torch.full((P,), float('inf'), device=flatten_points.device)
+        gt_delta_dense = torch.zeros(P, 2, device=flatten_points.device)
 
-        bbox_mu = pos_bbox_preds[:, :2]        # (Np, 2)
-        bbox_log_sigma = pos_bbox_preds[:, 2:] # (Np, 2)
+        with torch.no_grad():
+            for img_id in range(num_imgs):
+                img_mask = (img_ids == img_id)
+                gt_c = gt_bboxes[img_id][:, :2]
+                if gt_c.shape[0] == 0:
+                    continue
+                pts = flatten_points[img_mask]
+                strides_i = flatten_strides[img_mask].unsqueeze(1)
 
-        # Build matched gt_centers per positive sample (image coords)
-        gt_centers_per_pos = torch.zeros(
-            len(pos_inds), 2, device=bbox_preds[0].device)
-        for img_id in range(num_imgs):
-            mask = (pos_img_ids == img_id)
-            if not mask.any():
-                continue
-            gt_center_this = gt_bboxes[img_id][:, :2]  # (num_gt_i, 2)
-            ids_this = pos_gt_ids[mask]
-            gt_centers_per_pos[mask] = gt_center_this[ids_this]
+                chunk_size = 4096
+                pts_chunks = pts.split(chunk_size, dim=0)
+                strides_chunks = strides_i.split(chunk_size, dim=0)
+                idx_start = 0
+                inds = img_mask.nonzero(as_tuple=False).squeeze(1)
 
-        # GT centers list for kNN prior (image coords, one entry per image)
-        gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes]
+                for pts_c, strides_c in zip(pts_chunks, strides_chunks):
+                    n = pts_c.shape[0]
+                    dists_c = torch.cdist(pts_c, gt_c)
+                    sl = inds[idx_start:idx_start + n]
 
-        vpd_losses = self.loss_vpd(
-            bbox_mu=bbox_mu,
-            bbox_log_sigma=bbox_log_sigma,
-            pos_points=pos_points,
-            pos_strides=pos_strides,
-            gt_centers=gt_centers_per_pos,
-            gt_centers_list=gt_centers_list,
-            cur_iter=self.iter,
-        )
+                    if gt_c.shape[0] >= 2:
+                        top2, _ = dists_c.topk(2, dim=1, largest=False)
+                        d_nearest[sl] = top2[:, 0]
+                        d_second[sl] = top2[:, 1]
+                    else:
+                        d_nearest[sl] = dists_c[:, 0]
 
-        loss_vpd = torch.nan_to_num(
-            vpd_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
+                    min_idx = dists_c.argmin(dim=1)
+                    nearest_gt = gt_c[min_idx]
+                    gt_delta_dense[sl] = (nearest_gt - pts_c) / strides_c
+
+                    idx_start += n
+                    del dists_c
+
+        d_norm = d_nearest / flatten_strides
+        mu_weight = (1.0 - d_norm / self.dense_radius).clamp(min=0)
+        mu_loss_per_pt = F.smooth_l1_loss(
+            all_mu, gt_delta_dense.detach(), reduction='none', beta=0.5)
+        mu_loss_weighted = (mu_loss_per_pt * mu_weight.unsqueeze(1)).sum() \
+            / max(mu_weight.sum(), 1.0)
+        loss_mu_dense = self.lambda_mu_dense * mu_loss_weighted
+
+        ambiguity = torch.where(
+            d_second.isinf(),
+            torch.zeros_like(d_nearest),
+            (d_nearest / d_second.clamp(min=1e-6)).clamp(max=1.0))
+        sigma_target = d_norm.clamp(min=self.sigma_min_target) * (
+            1.0 + self.ambiguity_weight * ambiguity)
+        sigma_target = sigma_target.clamp(max=self.sigma_max_target)
+        log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
+
+        sigma_radius = self.dense_radius * 1.5
+        sigma_weight = (1.0 - d_norm / sigma_radius).clamp(min=0)
+        sigma_loss_per_pt = F.smooth_l1_loss(
+            all_log_sigma, log_sigma_target.detach(), reduction='none', beta=1.0)
+        loss_sigma_dense = self.lambda_sigma_dense * (
+            sigma_loss_per_pt * sigma_weight.unsqueeze(1)).sum() \
+            / max(sigma_weight.sum(), 1.0)
 
         return dict(
             loss_cls=loss_cls,
-            loss_vpd=loss_vpd,
-            vpd_center=vpd_losses['loss_center'].detach(),
-            vpd_kl=vpd_losses['loss_kl'].detach(),
-            vpd_var=vpd_losses['loss_var'].detach(),
+            loss_mu_dense=loss_mu_dense,
+            loss_sigma_dense=loss_sigma_dense,
         )
 
     # ------------------------------------------------------------------
