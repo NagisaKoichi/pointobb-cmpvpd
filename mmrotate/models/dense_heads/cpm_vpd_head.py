@@ -52,6 +52,20 @@ class CPMVPDHead(CPMHead):
         self.sigma_max_target = train_cfg.get('sigma_max_target', 4.0) if train_cfg else 4.0
         self.ambiguity_weight = train_cfg.get('ambiguity_weight', 2.0) if train_cfg else 2.0
 
+        # Sigma supervision mode for ablation:
+        #  - legacy: distance-based target (existing behavior)
+        #  - feature_guided: geometry + feature foreground fusion target
+        self.sigma_supervision_mode = train_cfg.get(
+            'sigma_supervision_mode', 'legacy') if train_cfg else 'legacy'
+        self.fg_inner_radius = train_cfg.get('fg_inner_radius', 4.0) if train_cfg else 4.0
+        self.fg_transition = train_cfg.get('fg_transition', 1.5) if train_cfg else 1.5
+        self.fg_cls_thr = train_cfg.get('fg_cls_thr', 0.25) if train_cfg else 0.25
+        self.fg_logit_scale = train_cfg.get('fg_logit_scale', 12.0) if train_cfg else 12.0
+        self.fg_geo_weight = train_cfg.get('fg_geo_weight', 0.7) if train_cfg else 0.7
+        self.fg_detach = train_cfg.get('fg_detach', True) if train_cfg else True
+        self.sigma_fg_target = train_cfg.get('sigma_fg_target', 1.0) if train_cfg else 1.0
+        self.sigma_bg_target = train_cfg.get('sigma_bg_target', 4.0) if train_cfg else 4.0
+
         # Freeze base model (backbone/FPN/cls/reg_convs), only train mu+sigma
         self.freeze_base = train_cfg.get('freeze_base', False) if train_cfg else False
 
@@ -371,6 +385,9 @@ class CPMVPDHead(CPMHead):
         flatten_cls_scores = torch.cat([
             cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
             for cs in cls_scores])
+        flatten_centerness = torch.cat([
+            ct.permute(0, 2, 3, 1).reshape(-1)
+            for ct in centernesses]).sigmoid()
         flatten_bbox_preds = torch.cat([
             bp.permute(0, 2, 3, 1).reshape(-1, 4)
             for bp in bbox_preds])
@@ -459,24 +476,52 @@ class CPMVPDHead(CPMHead):
             / max(mu_weight.sum(), 1.0)
         loss_mu_dense = self.lambda_mu_dense * mu_loss_weighted
 
-        # Sigma: distance-based target with boundary ambiguity boost
-        # ambiguity = d_nearest / d_second ∈ [0, 1];  ≈1 at boundary, ≈0 near GT
-        # When d_second is inf (single GT), ambiguity = 0 (no boost)
-        ambiguity = torch.where(
-            d_second.isinf(),
-            torch.zeros_like(d_nearest),
-            (d_nearest / d_second.clamp(min=1e-6)).clamp(max=1.0))
-        sigma_target = d_norm.clamp(min=self.sigma_min_target) \
-            * (1.0 + self.ambiguity_weight * ambiguity)
-        sigma_target = sigma_target.clamp(max=self.sigma_max_target)
-        log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
+        if self.sigma_supervision_mode == 'legacy':
+            # Sigma: distance-based target with boundary ambiguity boost
+            # ambiguity = d_nearest / d_second ∈ [0, 1];  ≈1 at boundary, ≈0 near GT
+            # When d_second is inf (single GT), ambiguity = 0 (no boost)
+            ambiguity = torch.where(
+                d_second.isinf(),
+                torch.zeros_like(d_nearest),
+                (d_nearest / d_second.clamp(min=1e-6)).clamp(max=1.0))
+            sigma_target = d_norm.clamp(min=self.sigma_min_target) \
+                * (1.0 + self.ambiguity_weight * ambiguity)
+            sigma_target = sigma_target.clamp(max=self.sigma_max_target)
+            log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
 
-        # Weight sigma loss: linear decay like mu, but wider radius to cover
-        # the full transition from GT center (sigma_target=0.5) to background
-        # (sigma_target=10). This ensures both low and high sigma targets
-        # contribute proportionally, rather than extremes dominating.
-        sigma_radius = self.dense_radius * 1.5  # 12 stride units
-        sigma_weight = (1.0 - d_norm / sigma_radius).clamp(min=0)  # (P,)
+            # Weight sigma loss: linear decay like mu, but wider radius to cover
+            # the full transition from GT center to background.
+            sigma_radius = self.dense_radius * 1.5  # 12 stride units
+            sigma_weight = (1.0 - d_norm / sigma_radius).clamp(min=0)  # (P,)
+        elif self.sigma_supervision_mode == 'feature_guided':
+            # Geometric mask keeps point-centric prior, feature mask injects
+            # semantic extent from cls/centerness predictions.
+            transition = max(float(self.fg_transition), 1e-6)
+            fg_geo = torch.sigmoid((self.fg_inner_radius - d_norm) / transition)
+
+            cls_prob = flatten_cls_scores.sigmoid().max(dim=1).values
+            fg_feat_score = cls_prob * flatten_centerness
+            if self.fg_detach:
+                fg_feat_score = fg_feat_score.detach()
+            fg_feat = torch.sigmoid(
+                self.fg_logit_scale * (fg_feat_score - self.fg_cls_thr))
+
+            geo_w = float(self.fg_geo_weight)
+            geo_w = min(max(geo_w, 0.0), 1.0)
+            fg_mask = geo_w * fg_geo + (1.0 - geo_w) * fg_feat
+
+            sigma_target = fg_mask * self.sigma_fg_target + \
+                (1.0 - fg_mask) * self.sigma_bg_target
+            sigma_target = sigma_target.clamp(
+                min=self.sigma_min_target, max=self.sigma_max_target)
+            log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
+
+            # Keep mild global supervision while emphasizing confident foreground.
+            sigma_weight = 0.5 + 0.5 * fg_mask
+        else:
+            raise ValueError(
+                f'Unsupported sigma_supervision_mode: {self.sigma_supervision_mode}')
+
         sigma_loss_per_pt = F.smooth_l1_loss(
             all_log_sigma, log_sigma_target.detach(),
             reduction='none', beta=1.0)                        # (P, 2)

@@ -106,8 +106,19 @@ model = dict(
         thresh1=8,                  # Positive sample threshold
         alpha=1,                    # Negative sample coefficient
         use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=1.0               # VPD loss weight (center + uncertainty + KL)
+        js_weight=1.0,              # VPD loss weight (center + uncertainty + KL)
+
+        sigma_supervision_mode='feature_guided',
+        fg_inner_radius=4.0,
+        fg_transition=1.5,
+        fg_cls_thr=0.25,
+        fg_logit_scale=12.0,
+        fg_geo_weight=0.7,
+        fg_detach=True,
+        sigma_fg_target=1.0,
+        sigma_bg_target=4.0,        
         ),
+        
     test_cfg=dict(
         store_dir=store_dir,
         nms_pre=2000,
