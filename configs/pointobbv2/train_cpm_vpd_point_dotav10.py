@@ -127,4 +127,4 @@ lr_config = dict(
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
 checkpoint_config = dict(interval=1, create_symlink=False)
-optimizer = dict(lr=0.01, momentum=0.9, type='SGD', weight_decay=0.0001)
+optimizer = dict(lr=0.005, momentum=0.9, type='SGD', weight_decay=0.0001)
