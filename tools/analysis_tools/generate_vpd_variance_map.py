@@ -9,12 +9,15 @@ import numpy as np
 import torch
 from PIL import Image
 from mmcv import Config, DictAction
+from mmcv.parallel import DataContainer
 from mmcv.runner import load_checkpoint, wrap_fp16_model
 from mmdet.datasets import build_dataloader, replace_ImageToTensor
 
 from mmrotate.datasets import build_dataset
 from mmrotate.models import build_detector
 from mmrotate.utils import compat_cfg, get_device, setup_multi_processes
+from segment_variance_map import (build_gt_guided_remap_map,
+                                  build_gt_guided_segmentation_mask)
 
 
 def parse_args():
@@ -43,6 +46,41 @@ def parse_args():
         type=int,
         default=0,
         help='max number of images to process, 0 means all')
+    parser.add_argument(
+        '--seg-score-thr',
+        type=float,
+        default=0.02,
+        help='optional per-object score threshold for GT-guided segmentation')
+    parser.add_argument(
+        '--seg-topk',
+        type=int,
+        default=0,
+        help='optional top-k pixel keep for each object map, 0 disables')
+    parser.add_argument(
+        '--sigma-scale',
+        type=float,
+        default=0.35,
+        help='adaptive sigma scale: sigma_i = sigma_scale * sqrt(w_i * h_i)')
+    parser.add_argument(
+        '--min-sigma',
+        type=float,
+        default=1.0,
+        help='lower bound of adaptive sigma in feature-map coordinates')
+    parser.add_argument(
+        '--max-sigma',
+        type=float,
+        default=20.0,
+        help='upper bound of adaptive sigma in feature-map coordinates')
+    parser.add_argument(
+        '--bg-std-scale',
+        type=float,
+        default=2.0,
+        help='background suppression threshold: mean + bg_std_scale * std')
+    parser.add_argument(
+        '--remap-output-mode',
+        default='mask',
+        choices=['variance', 'mask'],
+        help='output processed variance map or GT-instance segmentation mask')
     parser.add_argument(
         '--gpu-id',
         type=int,
@@ -81,14 +119,51 @@ def _to_heatmap(var_tensor, flip_direction):
     return img
 
 
+def _label_to_color_mask(label_map, flip_direction):
+    labels = label_map.detach().cpu().numpy().astype(np.int64)
+    h, w = labels.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # Background keeps black; each GT instance gets deterministic color.
+    max_label = int(labels.max())
+    for idx in range(max_label + 1):
+        m = labels == idx
+        if not np.any(m):
+            continue
+        r = (37 * (idx + 1) + 17) % 256
+        g = (91 * (idx + 1) + 73) % 256
+        b = (53 * (idx + 1) + 149) % 256
+        out[m, 0] = r
+        out[m, 1] = g
+        out[m, 2] = b
+
+    img = Image.fromarray(out, mode='RGB')
+    if flip_direction == 'horizontal':
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    elif flip_direction == 'vertical':
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    elif flip_direction == 'diagonal':
+        img = img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
+    return img
+
+
 def _save_maps_for_image(img_path,
+                         img_meta,
                          flip_direction,
                          bbox_pred_lvl,
                          cls_score_lvl,
                          centerness_lvl,
+                         gt_bboxes,
                          out_path,
                          out_mean_path,
-                         out_remap_path):
+                         out_remap_path,
+                         seg_score_thr,
+                         seg_topk,
+                         sigma_scale,
+                         min_sigma,
+                         max_sigma,
+                         bg_std_scale,
+                         remap_output_mode):
     # Channels 0:2 are posterior center mean for (x, y).
     mu = torch.nan_to_num(bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
     center_mu = mu[0:2].mean(dim=0)
@@ -97,7 +172,9 @@ def _save_maps_for_image(img_path,
     log_sigma = bbox_pred_lvl[2:4]
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
 
-    center_lstd = lstd.mean(dim=0)
+    # center_lstd = lstd.mean(dim=0)
+    std = lstd.exp()
+    center_std = std.mean(dim=0)
 
     cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
     centerness_lvl = torch.nan_to_num(centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -105,37 +182,54 @@ def _save_maps_for_image(img_path,
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
     centerness_prob = centerness_lvl.sigmoid().squeeze(0)
     combined_score = max_class_prob * centerness_prob
+    std_sigmoid = std.sigmoid()
 
-    # Remap max-class probability by center mean offsets:
-    # p'(y, x) = p(y + mu_cy(y, x), x + mu_cx(y, x)) with nearest-neighbor sampling.
-    cx_mu = mu[0]
-    cy_mu = mu[1]
-    h, w = max_class_prob.shape
-    yy, xx = torch.meshgrid(
-        torch.arange(h, device=max_class_prob.device, dtype=torch.float32),
-        torch.arange(w, device=max_class_prob.device, dtype=torch.float32),
-        indexing='ij')
-    new_x = torch.round(xx + cx_mu).long().clamp(0, w - 1)
-    new_y = torch.round(yy + cy_mu).long().clamp(0, h - 1)
-    remapped_max_prob = max_class_prob[new_y, new_x]
-    remapped_max_prob = torch.log1p(remapped_max_prob)
-    # remapped_max_prob = -0.1/(remapped_max_prob + 0.1) + 1
+    probmap = (std_sigmoid.mean(dim=0) * combined_score).clamp(min=1e-6, max=1.0)
+
+    if remap_output_mode == 'mask':
+        remapped_label_map = build_gt_guided_segmentation_mask(
+            p_model=probmap,
+            gt_bboxes=gt_bboxes,
+            img_meta=img_meta,
+            sigma_scale=sigma_scale,
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            score_thr=seg_score_thr,
+            topk=seg_topk,
+            bg_std_scale=bg_std_scale)
+        remapped_img = _label_to_color_mask(remapped_label_map, flip_direction)
+        # half-transparent overlay of segmentation mask on original image
+        base_img = Image.open(img_path).convert('RGB')
+        base_img = base_img.resize(remapped_img.size)
+        remapped_img = Image.blend(base_img, remapped_img, alpha=0.8)
+
+    else:
+        remapped_max_prob = build_gt_guided_remap_map(
+            p_model=probmap,
+            gt_bboxes=gt_bboxes,
+            img_meta=img_meta,
+            sigma_scale=sigma_scale,
+            min_sigma=min_sigma,
+            max_sigma=max_sigma,
+            score_thr=seg_score_thr,
+            topk=seg_topk,
+            bg_std_scale=bg_std_scale)
+        remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
 
     center_mu_img = _to_heatmap(center_mu, flip_direction)
-    center_img = _to_heatmap(center_lstd, flip_direction)
+    center_std_img = _to_heatmap(center_std, flip_direction)
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
     max_cls_img = _to_heatmap(max_class_prob, flip_direction)
     combined_img = _to_heatmap(combined_score, flip_direction)
-    remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
 
     base_img = Image.open(img_path).convert('RGB')
-    base_img = base_img.resize((center_img.width, center_img.height))
+    base_img = base_img.resize((center_std_img.width, center_std_img.height))
 
     cell_w, cell_h = base_img.width, base_img.height
     merged = Image.new('RGB', (cell_w * 3, cell_h * 2))
 
     merged.paste(base_img, (0, 0))
-    merged.paste(center_img, (cell_w, 0))
+    merged.paste(center_std_img, (cell_w, 0))
     merged.paste(center_mu_img, (cell_w * 2, 0))
 
     merged.paste(centerness_img, (0, cell_h))
@@ -166,6 +260,34 @@ def _prepare_dataset_cfg(cfg, args):
         split_cfg.pipeline = replace_ImageToTensor(split_cfg.pipeline)
 
     return split_cfg, samples_per_gpu
+
+
+def _unwrap_tensor_list(data, key, device):
+    payload = data.get(key, None)
+    if payload is None:
+        return None
+
+    if isinstance(payload, DataContainer):
+        payload = payload.data[0]
+
+    if torch.is_tensor(payload):
+        return [payload.to(device)]
+
+    if isinstance(payload, (list, tuple)):
+        out = []
+        for item in payload:
+            if isinstance(item, DataContainer):
+                item = item.data[0]
+            if torch.is_tensor(item):
+                out.append(item.to(device))
+            elif isinstance(item, (list, tuple)) and len(item) == 1 and torch.is_tensor(item[0]):
+                out.append(item[0].to(device))
+            else:
+                raise TypeError(
+                    f'Unsupported payload element in `{key}`: {type(item)}')
+        return out
+
+    raise TypeError(f'Unsupported payload type in `{key}`: {type(payload)}')
 
 
 def main():
@@ -247,6 +369,7 @@ def main():
 
         img_metas = data['img_metas'].data[0]
         batch_size = len(img_metas)
+        gt_bboxes_list = _unwrap_tensor_list(data, 'gt_bboxes', device)
 
         if ('bbox_preds' not in captured or 'cls_scores' not in captured
                 or 'centernesses' not in captured):
@@ -269,6 +392,7 @@ def main():
             bbox_pred_lvl = bbox_preds[args.feat_level][b]
             cls_score_lvl = cls_scores[args.feat_level][b]
             centerness_lvl = centernesses[args.feat_level][b]
+            gt_bboxes = None if gt_bboxes_list is None else gt_bboxes_list[b]
 
             stem = osp.splitext(osp.basename(img_path))[0]
             out_name = f'{processed:06d}_{stem}_lstd.jpg'
@@ -279,13 +403,22 @@ def main():
             out_remap_path = osp.join(args.out_dir, out_remap_name)
             _save_maps_for_image(
                 img_path,
+                meta,
                 flip_direction,
                 bbox_pred_lvl,
                 cls_score_lvl,
                 centerness_lvl,
+                gt_bboxes,
                 out_path,
                 out_mean_path,
-                out_remap_path)
+                out_remap_path,
+                args.seg_score_thr,
+                args.seg_topk,
+                args.sigma_scale,
+                args.min_sigma,
+                args.max_sigma,
+                args.bg_std_scale,
+                args.remap_output_mode)
 
             processed += 1
             progress.update()

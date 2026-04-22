@@ -21,6 +21,7 @@ from .cpm_hbox_head import CPMHboxHead
 from .cpm_reg_head import CPMRegHead
 from .cpm_vpd_head import CPMVPDHead
 from .cpm_vpd_pseudo_head import CPMVPDPseudoHead
+from .cpm_vpd_seg_pseudo_head import CPMVPDSegPseudoHead
 from .pseudo_label_head import PseudoLabelHead
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     'RotatedRepPointsHead', 'SAMRepPointsHead', 'CSLRRetinaHead',
     'RotatedATSSHead', 'RotatedAnchorFreeHead', 'RotatedFCOSHead',
     'CSLRFCOSHead', 'OrientedRepPointsHead', 'CPMHead', 'CPMHboxHead',
-    'CPMRegHead', 'CPMVPDHead', 'CPMVPDPseudoHead', 'PseudoLabelHead'
+    'CPMRegHead', 'CPMVPDHead', 'CPMVPDPseudoHead', 'PseudoLabelHead',
+    'CPMVPDSegPseudoHead'
 ]

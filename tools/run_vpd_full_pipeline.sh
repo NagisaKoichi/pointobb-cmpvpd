@@ -262,18 +262,24 @@ if [[ "$START_STAGE" -le 2 && "$END_STAGE" -ge 2 ]]; then
     exit 1
   fi
 
+  # IMPORTANT:
+  # Stage-2 is pseudo-label export, not checkpoint-state resume training.
+  # If resume-from points to a checkpoint whose epoch already reaches
+  # runner.max_epochs, the loop exits immediately without error and no labels
+  # are generated. Force load_from + max_epochs=1 to always run one pass.
   if [[ "$GPU_NUM" -le 1 ]]; then
     run_single_gpu "$CFG_STAGE2" "$WORK_DIR_STAGE1" \
-      --resume-from "$STAGE1_CKPT" \
-      --cfg-options data.train.ann_file="${TRAIN_ANN}" data.train.img_prefix="${TRAIN_IMG}" \
+      --cfg-options load_from="${STAGE1_CKPT}" runner.max_epochs=1 \
+      data.train.ann_file="${TRAIN_ANN}" data.train.img_prefix="${TRAIN_IMG}" \
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.train_cfg.store_ann_dir="${PSEUDO_DIR_WRITE}" \
       model.train_cfg.visualize_variance_map=${SAVE_VARIANCE_MAP} \
       checkpoint_config.create_symlink=${CREATE_SYMLINK}
   else
-    run_dist_resume "$CFG_STAGE2" "$STAGE1_CKPT" "$WORK_DIR_STAGE1" \
-      --cfg-options data.train.ann_file="${TRAIN_ANN}" data.train.img_prefix="${TRAIN_IMG}" \
+    run_dist "$CFG_STAGE2" "$WORK_DIR_STAGE1" \
+      --cfg-options load_from="${STAGE1_CKPT}" runner.max_epochs=1 \
+      data.train.ann_file="${TRAIN_ANN}" data.train.img_prefix="${TRAIN_IMG}" \
       data.val.ann_file="${TRAIN_ANN}" data.val.img_prefix="${TRAIN_IMG}" \
       data.test.ann_file="${TEST_IMG}" data.test.img_prefix="${TEST_IMG}" \
       model.train_cfg.store_dir="${WORK_DIR_STAGE1}" model.train_cfg.store_ann_dir="${PSEUDO_DIR_WRITE}" \

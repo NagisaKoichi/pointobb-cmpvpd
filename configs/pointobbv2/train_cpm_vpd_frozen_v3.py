@@ -5,7 +5,7 @@ _base_ = [
 
 data_root = '/media/passport2/zlk/datasets/DOTAv10_split_ss/'
 
-store_dir = '/media/passport2/zlk/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+store_dir = '/media/passport2/zlk/PointOBB-v2/work_dirs/frozen_vpd_v3/'
 
 angle_version = 'le90'
 
@@ -50,7 +50,7 @@ data = dict(
         classes=classes,
         samples_per_gpu=4))
 
-# model settings - CPM with Point-Supervised VPD
+# model settings - CPM with Point-Supervised VPD (frozen backbone)
 model = dict(
     type='RotatedFCOS',
     backbone=dict(
@@ -69,11 +69,11 @@ model = dict(
         in_channels=[256, 512, 1024, 2048],
         out_channels=256,
         start_level=0,
-        add_extra_convs='on_output',  # use P5
+        add_extra_convs='on_output',
         num_outs=6,
         relu_before_extra_convs=True),
     bbox_head=dict(
-        type='CPMVPDHead',  # CPM with Point-Supervised VPD
+        type='CPMVPDHead',
         num_classes=len(classes),
         in_channels=256,
         stacked_convs=4,
@@ -100,29 +100,21 @@ model = dict(
             type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
     # training and testing settings
     train_cfg=dict(
-        visualize=False,
+        visualize=True,
         store_dir=store_dir,
-        cls_weight=20,              # Classification loss weight
-        thresh1=8,                  # Positive sample threshold
-        alpha=1,                    # Negative sample coefficient
-        use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=1.0,              # VPD loss weight (center + uncertainty + KL)
-
-        # Stage-1 variance-focused setting: mute mu supervision, amplify sigma.
-        lambda_mu_dense=0.0,
-        lambda_sigma_dense=2.0,
-
-        sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
-        fg_inner_radius=8.0,        # Inner radius for foreground samples
-        fg_transition=1.5,          # Transition parameter for foreground samples
-        fg_cls_thr=0.2,             # Classification score threshold for foreground samples
-        fg_logit_scale=12.0,        # Logit scaling factor for foreground samples in VPD loss
-        fg_geo_weight=0.2,          # Balance geometry and feature guidance
-        fg_detach=True,             # Keep cls branch stable while sigma learns
-        sigma_fg_target=1.0,        # Target sigma value for foreground samples in VPD loss
-        sigma_bg_target=4.0,        # Target sigma value for background samples in VPD loss
+        cls_weight=20,
+        thresh1=8,
+        alpha=1,
+        use_point_supervised=True,
+        js_weight=1.0,
+        freeze_base=True,
+        # Stronger sigma training:
+        dense_radius=14,          # was 8 → covers pca_length=28/stride=4=7 stride units
+        sigma_min_target=0.5,     # was 1.0 → finer resolution near center
+        sigma_max_target=6.0,     # was 4.0 → allow higher sigma far from center
+        lambda_sigma_dense=2.0,   # was 1.0 → emphasize sigma loss
+        ambiguity_weight=2.0,     # keep same
         ),
-
     test_cfg=dict(
         store_dir=store_dir,
         nms_pre=2000,
@@ -131,15 +123,43 @@ model = dict(
         nms=dict(iou_thr=0.1),
         max_per_img=2000))
 
+# Load baseline 6-epoch checkpoint
+load_from = 'work_dirs/cpm_dotav10/epoch_6.pth'
+
 find_unused_parameters = True
-runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=6)
+
+# 3 epochs for stronger sigma (was 1)
+runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=3)
 lr_config = dict(
     _delete_=True,
     policy='step',
     warmup='linear',
-    warmup_iters=500,
+    warmup_iters=200,
     warmup_ratio=1.0 / 3,
-    step=[4])
-evaluation = dict(interval=6, metric='mAP')
-checkpoint_config = dict(interval=1, create_symlink=False)
-optimizer = dict(lr=0.005, momentum=0.9, type='SGD', weight_decay=0.0001)
+    step=[2])
+evaluation = dict(interval=999, metric='mAP')  # skip eval, no meaningful result
+
+# Only optimize sigma parameters, freeze everything else
+optimizer = dict(
+    _delete_=True,
+    type='SGD',
+    lr=0.01,
+    momentum=0.9,
+    weight_decay=0.0001,
+    paramwise_cfg=dict(
+        custom_keys={
+            'backbone.conv1': dict(lr_mult=0, decay_mult=0),
+            'backbone.bn1': dict(lr_mult=0, decay_mult=0),
+            'backbone.layer1': dict(lr_mult=0, decay_mult=0),
+            'backbone.layer2': dict(lr_mult=0, decay_mult=0),
+            'backbone.layer3': dict(lr_mult=0, decay_mult=0),
+            'backbone.layer4': dict(lr_mult=0, decay_mult=0),
+            'neck': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.cls_convs': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.conv_cls': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.reg_convs': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.conv_centerness': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.conv_angle': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.scales': dict(lr_mult=0, decay_mult=0),
+            'bbox_head.scale_angle': dict(lr_mult=0, decay_mult=0),
+        }))
