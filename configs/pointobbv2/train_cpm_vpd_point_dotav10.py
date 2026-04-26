@@ -3,9 +3,9 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-data_root = '/media/passport2/zlk/datasets/DOTAv10_split_ss/'
+data_root = '/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/'
 
-store_dir = '/media/passport2/zlk/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+store_dir = '/media/ps/passport2/zlk/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
 
 angle_version = 'le90'
 
@@ -112,15 +112,15 @@ model = dict(
         lambda_mu_dense=0.0,
         lambda_sigma_dense=2.0,
 
-        sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
-        fg_inner_radius=8.0,        # Inner radius for foreground samples
-        fg_transition=1.5,          # Transition parameter for foreground samples
-        fg_cls_thr=0.2,             # Classification score threshold for foreground samples
-        fg_logit_scale=12.0,        # Logit scaling factor for foreground samples in VPD loss
-        fg_geo_weight=0.2,          # Balance geometry and feature guidance
-        fg_detach=True,             # Keep cls branch stable while sigma learns
-        sigma_fg_target=1.0,        # Target sigma value for foreground samples in VPD loss
-        sigma_bg_target=4.0,        # Target sigma value for background samples in VPD loss
+        # sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
+        # fg_inner_radius=8.0,        # Inner radius for foreground samples
+        # fg_transition=1.5,          # Transition parameter for foreground samples
+        # fg_cls_thr=0.2,             # Classification score threshold for foreground samples
+        # fg_logit_scale=12.0,        # Logit scaling factor for foreground samples in VPD loss
+        # fg_geo_weight=0.2,          # Balance geometry and feature guidance
+        # fg_detach=True,             # Keep cls branch stable while sigma learns
+        # sigma_fg_target=1.0,        # Target sigma value for foreground samples in VPD loss
+        # sigma_bg_target=4.0,        # Target sigma value for background samples in VPD loss
         ),
 
     test_cfg=dict(

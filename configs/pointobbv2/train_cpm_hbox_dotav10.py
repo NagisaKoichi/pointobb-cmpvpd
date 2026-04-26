@@ -3,9 +3,9 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-data_root = '/media/passport2/zlk/datasets/DOTAv10/split_ss_dota/'
+data_root = '/media/ps/passport2/zlk/datasets/DOTAv10/split_ss_dota/'
 
-store_dir = '/media/passport2/zlk/PointOBB-v2/exps/exp1/cpm_hbox_dotav10/'
+store_dir = '/media/ps/passport2/zlk/PointOBB-v2/exps/exp1/cpm_hbox_dotav10/'
 
 angle_version = 'le90'
 

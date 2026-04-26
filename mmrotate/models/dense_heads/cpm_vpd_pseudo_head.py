@@ -13,6 +13,7 @@ Pseudo generation pipeline:
 5) Apply multiclass rotated NMS to all pseudo boxes.
 """
 
+import os
 import torch
 from mmcv.runner import force_fp32
 from mmcv.ops import nms_rotated
@@ -57,6 +58,131 @@ class CPMVPDPseudoHead(CPMVPDHead):
         self.enable_final_nms = bool(enable_final_nms)
         self.class_agnostic_nms = bool(class_agnostic_nms)
         self.class_agnostic_iou_thr = float(class_agnostic_iou_thr)
+
+        train_cfg = kwargs.get('train_cfg', {}) or {}
+        self.store_ann_dir = train_cfg.get('store_ann_dir', None)
+        if self.store_ann_dir is not None:
+            os.makedirs(self.store_ann_dir, exist_ok=True)
+
+        self.default_classes = (
+            'plane', 'baseball-diamond', 'bridge', 'ground-track-field',
+            'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
+            'basketball-court', 'storage-tank', 'soccer-ball-field',
+            'roundabout', 'harbor', 'swimming-pool', 'helicopter')
+
+    @staticmethod
+    def _obb_to_poly8(obb):
+        cx, cy, w, h, angle = obb
+        c = torch.cos(angle)
+        s = torch.sin(angle)
+        hw = 0.5 * w
+        hh = 0.5 * h
+
+        corners = obb.new_tensor([
+            [-hw, -hh],
+            [hw, -hh],
+            [hw, hh],
+            [-hw, hh],
+        ])
+        rot = obb.new_tensor([[c, -s], [s, c]])
+        pts = corners.matmul(rot.t()) + obb.new_tensor([cx, cy])
+        return pts.reshape(-1)
+
+    @staticmethod
+    def _undo_flip_rbox(boxes5, img_meta):
+        if boxes5.numel() == 0:
+            return boxes5
+        if not img_meta.get('flip', False):
+            return boxes5
+
+        out = boxes5.clone()
+        direction = img_meta.get('flip_direction', 'horizontal')
+        h, w = img_meta['img_shape'][:2]
+
+        if direction == 'horizontal':
+            out[:, 0] = float(w) - out[:, 0]
+            out[:, 4] = -out[:, 4]
+        elif direction == 'vertical':
+            out[:, 1] = float(h) - out[:, 1]
+            out[:, 4] = -out[:, 4]
+        elif direction == 'diagonal':
+            out[:, 0] = float(w) - out[:, 0]
+            out[:, 1] = float(h) - out[:, 1]
+        return out
+
+    @staticmethod
+    def _rescale_rbox_to_ori(boxes5, img_meta):
+        if boxes5.numel() == 0:
+            return boxes5
+        scale = boxes5.new_tensor(img_meta['scale_factor'][:2]).repeat(2)
+        out = boxes5.clone()
+        out[:, :4] = out[:, :4] / scale
+        return out
+
+    def _export_pseudo_txt(self, bbox_list, img_metas):
+        classes = getattr(self, 'CLASSES', None)
+        if classes is None:
+            classes = self.default_classes
+
+        for img_idx, (det_bboxes, det_labels) in enumerate(bbox_list):
+            meta = img_metas[img_idx]
+            filename_raw = os.path.splitext(os.path.basename(meta['filename']))[0]
+            out_path = os.path.join(self.store_ann_dir, filename_raw + '.txt')
+
+            boxes5 = det_bboxes[:, :5] if det_bboxes.numel() > 0 else det_bboxes.new_zeros((0, 5))
+            boxes5 = self._undo_flip_rbox(boxes5, meta)
+            boxes5 = self._rescale_rbox_to_ori(boxes5, meta)
+
+            lines = []
+            for bi in range(boxes5.shape[0]):
+                cls_id = int(det_labels[bi].item())
+                if cls_id < 0 or cls_id >= len(classes):
+                    continue
+                poly8 = self._obb_to_poly8(boxes5[bi])
+                poly8 = [float(v.item()) for v in poly8]
+                lines.append(
+                    f'{poly8[0]:.1f} {poly8[1]:.1f} {poly8[2]:.1f} {poly8[3]:.1f} '
+                    f'{poly8[4]:.1f} {poly8[5]:.1f} {poly8[6]:.1f} {poly8[7]:.1f} '
+                    f'{classes[cls_id]} 0\n')
+
+            with open(out_path, 'w', encoding='utf-8') as f:
+                if lines:
+                    f.writelines(lines)
+                else:
+                    f.write('')
+
+    @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
+    def loss(self,
+             cls_scores,
+             bbox_preds,
+             centernesses,
+             gt_bboxes,
+             gt_labels,
+             img_metas,
+             gt_bboxes_ignore=None):
+        losses = super().loss(
+            cls_scores,
+            bbox_preds,
+            centernesses,
+            gt_bboxes,
+            gt_labels,
+            img_metas,
+            gt_bboxes_ignore=gt_bboxes_ignore)
+
+        if self.store_ann_dir is not None:
+            with torch.no_grad():
+                bbox_list = self.get_pseudo_bboxes(
+                    cls_scores,
+                    bbox_preds,
+                    centernesses,
+                    gt_bboxes=gt_bboxes,
+                    gt_labels=gt_labels,
+                    img_metas=img_metas,
+                    cfg=self.test_cfg,
+                    rescale=False)
+                self._export_pseudo_txt(bbox_list, img_metas)
+
+        return losses
 
     @staticmethod
     def _build_remap_map(cls_score_lvl, centerness_lvl, bbox_pred_lvl):

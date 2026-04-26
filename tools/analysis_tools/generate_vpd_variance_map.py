@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument(
         '--seg-score-thr',
         type=float,
-        default=0.02,
+        default=0.04,
         help='optional per-object score threshold for GT-guided segmentation')
     parser.add_argument(
         '--seg-topk',
@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument(
         '--sigma-scale',
         type=float,
-        default=0.35,
+        default=0.5,
         help='adaptive sigma scale: sigma_i = sigma_scale * sqrt(w_i * h_i)')
     parser.add_argument(
         '--min-sigma',
@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument(
         '--bg-std-scale',
         type=float,
-        default=2.0,
+        default=1.5,
         help='background suppression threshold: mean + bg_std_scale * std')
     parser.add_argument(
         '--remap-output-mode',
@@ -181,10 +181,13 @@ def _save_maps_for_image(img_path,
 
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
     centerness_prob = centerness_lvl.sigmoid().squeeze(0)
-    combined_score = max_class_prob * centerness_prob
-    std_sigmoid = std.sigmoid()
+    combined_score = max_class_prob
+    std_score = 1 - std.mean(dim=0).sigmoid()
+    print(f'std stats - min: {std_score.min().item():.6f}, max: {std_score.max().item():.6f}, mean: {std_score.mean().item():.6f}')
 
-    probmap = (std_sigmoid.mean(dim=0) * combined_score).clamp(min=1e-6, max=1.0)
+    # probmap = ((std_sigmoid.mean(dim=0) + combined_score) / 2).clamp(min=1e-6, max=1.0)
+    probmap = (combined_score * std_score * 50).clamp(min=1e-6, max=1.0)
+    print(f'probmap stats - min: {probmap.min().item():.6f}, max: {probmap.max().item():.6f}, mean: {probmap.mean().item():.6f}')
 
     if remap_output_mode == 'mask':
         remapped_label_map = build_gt_guided_segmentation_mask(
