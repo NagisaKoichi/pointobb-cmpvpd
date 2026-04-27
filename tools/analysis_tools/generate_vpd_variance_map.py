@@ -78,7 +78,7 @@ def parse_args():
         help='background suppression threshold: mean + bg_std_scale * std')
     parser.add_argument(
         '--remap-output-mode',
-        default='mask',
+        default='variance',
         choices=['variance', 'mask'],
         help='output processed variance map or GT-instance segmentation mask')
     parser.add_argument(

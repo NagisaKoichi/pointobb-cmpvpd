@@ -43,6 +43,27 @@ class CPMVPDPseudoHead(CPMVPDHead):
                  remap_edge_thr_ratio=0.35,
                  remap_edge_max_len=64,
                  remap_size_mix=1.0,
+                 use_pca_decode=True,
+                 pca_window_radius=6,
+                 pca_use_adaptive_radius=True,
+                 pca_radius_scale=0.30,
+                 pca_radius_min=3,
+                 pca_radius_max=14,
+                 pca_thr_ratio=0.45,
+                 pca_weight_gamma=2.0,
+                 pca_min_pixels=6,
+                 pca_size_factor=1.8,
+                 pca_center_mix=0.0,
+                 pca_size_mix=0.4,
+                 pca_angle_mix=0.7,
+                 pca_component_select='peak',
+                 pca_connectivity=4,
+                 pca_use_aniso_gate=True,
+                 pca_aniso_thr=0.35,
+                 pca_peak_dist_penalty=0.20,
+                 pca_enable_instance_gate=True,
+                 pca_max_center_offset=4.0,
+                 pca_min_fill_ratio=0.20,
                  enable_final_nms=False,
                  class_agnostic_nms=True,
                  class_agnostic_iou_thr=0.1,
@@ -55,6 +76,27 @@ class CPMVPDPseudoHead(CPMVPDHead):
         self.remap_edge_thr_ratio = float(remap_edge_thr_ratio)
         self.remap_edge_max_len = int(remap_edge_max_len)
         self.remap_size_mix = float(remap_size_mix)
+        self.use_pca_decode = bool(use_pca_decode)
+        self.pca_window_radius = int(pca_window_radius)
+        self.pca_use_adaptive_radius = bool(pca_use_adaptive_radius)
+        self.pca_radius_scale = float(pca_radius_scale)
+        self.pca_radius_min = int(pca_radius_min)
+        self.pca_radius_max = int(pca_radius_max)
+        self.pca_thr_ratio = float(pca_thr_ratio)
+        self.pca_weight_gamma = float(pca_weight_gamma)
+        self.pca_min_pixels = int(pca_min_pixels)
+        self.pca_size_factor = float(pca_size_factor)
+        self.pca_center_mix = float(pca_center_mix)
+        self.pca_size_mix = float(pca_size_mix)
+        self.pca_angle_mix = float(pca_angle_mix)
+        self.pca_component_select = str(pca_component_select)
+        self.pca_connectivity = int(pca_connectivity)
+        self.pca_use_aniso_gate = bool(pca_use_aniso_gate)
+        self.pca_aniso_thr = float(pca_aniso_thr)
+        self.pca_peak_dist_penalty = float(pca_peak_dist_penalty)
+        self.pca_enable_instance_gate = bool(pca_enable_instance_gate)
+        self.pca_max_center_offset = float(pca_max_center_offset)
+        self.pca_min_fill_ratio = float(pca_min_fill_ratio)
         self.enable_final_nms = bool(enable_final_nms)
         self.class_agnostic_nms = bool(class_agnostic_nms)
         self.class_agnostic_iou_thr = float(class_agnostic_iou_thr)
@@ -250,7 +292,16 @@ class CPMVPDPseudoHead(CPMVPDHead):
         if window.numel() == 0:
             return None
 
-        flat_idx = torch.argmax(window).item()
+        yy, xx = torch.meshgrid(
+            torch.arange(y0, y1 + 1, device=window.device, dtype=torch.float32),
+            torch.arange(x0, x1 + 1, device=window.device, dtype=torch.float32),
+            indexing='ij')
+        dx2 = (xx - float(target_xy_feat[0].item()))**2
+        dy2 = (yy - float(target_xy_feat[1].item()))**2
+        dist2_norm = (dx2 + dy2) / max(float(radius * radius), 1.0)
+        penalized = window - self.pca_peak_dist_penalty * dist2_norm
+
+        flat_idx = torch.argmax(penalized).item()
         win_w = window.shape[1]
         dy = flat_idx // win_w
         dx = flat_idx % win_w
@@ -284,6 +335,218 @@ class CPMVPDPseudoHead(CPMVPDHead):
         est_w = max(float((left + right + 1) * stride), float(stride))
         est_h = max(float((up + down + 1) * stride), float(stride))
         return remap_map.new_tensor([est_w, est_h])
+
+    @staticmethod
+    def _blend_angle(base_angle, pca_angle, mix):
+        mix = float(min(max(mix, 0.0), 1.0))
+        if mix <= 0.0:
+            return base_angle
+        if mix >= 1.0:
+            return pca_angle
+        sin_v = (1.0 - mix) * torch.sin(base_angle) + mix * torch.sin(pca_angle)
+        cos_v = (1.0 - mix) * torch.cos(base_angle) + mix * torch.cos(pca_angle)
+        return torch.atan2(sin_v, cos_v)
+
+    def _resolve_pca_radius(self, stride, base_wh):
+        if (not self.pca_use_adaptive_radius) or (base_wh is None):
+            return max(int(self.pca_window_radius), 0)
+        wf = float(base_wh[0].item()) / max(float(stride), 1e-6)
+        hf = float(base_wh[1].item()) / max(float(stride), 1e-6)
+        approx = self.pca_radius_scale * max((wf * hf)**0.5, 1.0)
+        radius = int(round(approx))
+        radius = max(self.pca_radius_min, radius)
+        radius = min(self.pca_radius_max, radius)
+        return max(radius, 0)
+
+    def _component_offsets(self):
+        if self.pca_connectivity == 8:
+            return [
+                (-1, -1), (-1, 0), (-1, 1),
+                (0, -1),           (0, 1),
+                (1, -1),  (1, 0),  (1, 1)
+            ]
+        return [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    def _flood_fill_component(self, mask_cpu, seed_y, seed_x):
+        h, w = mask_cpu.shape
+        if seed_y < 0 or seed_y >= h or seed_x < 0 or seed_x >= w:
+            return None
+        if not bool(mask_cpu[seed_y, seed_x].item()):
+            return None
+        visited = torch.zeros((h, w), dtype=torch.bool)
+        queue = [(seed_y, seed_x)]
+        visited[seed_y, seed_x] = True
+        comp = []
+        offsets = self._component_offsets()
+        while queue:
+            y, x = queue.pop()
+            comp.append((y, x))
+            for dy, dx in offsets:
+                ny = y + dy
+                nx = x + dx
+                if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                    continue
+                if visited[ny, nx] or (not bool(mask_cpu[ny, nx].item())):
+                    continue
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+        return comp
+
+    def _all_components(self, mask_cpu):
+        h, w = mask_cpu.shape
+        visited = torch.zeros((h, w), dtype=torch.bool)
+        offsets = self._component_offsets()
+        components = []
+        points = torch.nonzero(mask_cpu, as_tuple=False)
+        for p in points:
+            y0 = int(p[0].item())
+            x0 = int(p[1].item())
+            if visited[y0, x0]:
+                continue
+            queue = [(y0, x0)]
+            visited[y0, x0] = True
+            comp = []
+            while queue:
+                y, x = queue.pop()
+                comp.append((y, x))
+                for dy, dx in offsets:
+                    ny = y + dy
+                    nx = x + dx
+                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
+                        continue
+                    if visited[ny, nx] or (not bool(mask_cpu[ny, nx].item())):
+                        continue
+                    visited[ny, nx] = True
+                    queue.append((ny, nx))
+            components.append(comp)
+        return components
+
+    def _select_component_mask(self, mask, seed_y, seed_x, target_xy_window):
+        if int(mask.sum().item()) == 0:
+            return None
+        mask_cpu = mask.detach().to(device='cpu', dtype=torch.bool)
+        mode = self.pca_component_select.lower()
+
+        best_comp = None
+        if mode == 'peak':
+            best_comp = self._flood_fill_component(mask_cpu, seed_y, seed_x)
+        else:
+            comps = self._all_components(mask_cpu)
+            if len(comps) == 0:
+                return None
+            tx = float(target_xy_window[0].item())
+            ty = float(target_xy_window[1].item())
+            best_d2 = None
+            for comp in comps:
+                xs = torch.tensor([p[1] for p in comp], dtype=torch.float32)
+                ys = torch.tensor([p[0] for p in comp], dtype=torch.float32)
+                cx = float(xs.mean().item())
+                cy = float(ys.mean().item())
+                d2 = (cx - tx)**2 + (cy - ty)**2
+                if best_d2 is None or d2 < best_d2:
+                    best_d2 = d2
+                    best_comp = comp
+
+        if best_comp is None:
+            return None
+
+        out_cpu = torch.zeros_like(mask_cpu)
+        ys = [p[0] for p in best_comp]
+        xs = [p[1] for p in best_comp]
+        out_cpu[ys, xs] = True
+        return out_cpu.to(device=mask.device)
+
+    def _decode_from_local_weighted_pca(self,
+                                        remap_map,
+                                        py,
+                                        px,
+                                        stride,
+                                        target_xy_feat,
+                                        base_wh=None):
+        h, w = remap_map.shape
+        radius = self._resolve_pca_radius(stride=stride, base_wh=base_wh)
+        x0 = max(0, int(px) - radius)
+        x1 = min(w - 1, int(px) + radius)
+        y0 = max(0, int(py) - radius)
+        y1 = min(h - 1, int(py) + radius)
+        if x1 < x0 or y1 < y0:
+            return None
+
+        window = remap_map[y0:y1 + 1, x0:x1 + 1]
+        if window.numel() == 0:
+            return None
+
+        peak = float(remap_map[py, px].item())
+        thr = max(peak * self.pca_thr_ratio, 1e-6)
+        raw_mask = window >= thr
+
+        seed_y = int(py - y0)
+        seed_x = int(px - x0)
+        target_xy_window = target_xy_feat.new_tensor([
+            float(target_xy_feat[0].item()) - float(x0),
+            float(target_xy_feat[1].item()) - float(y0)
+        ])
+        mask = self._select_component_mask(raw_mask, seed_y, seed_x, target_xy_window)
+        if mask is None:
+            return None
+        if int(mask.sum().item()) < int(self.pca_min_pixels):
+            return None
+
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+        vals = window[ys, xs]
+        weights = torch.pow(torch.clamp(vals, min=1e-6), self.pca_weight_gamma)
+        weights = torch.clamp(weights, min=1e-6)
+
+        xs_abs = xs.float() + float(x0)
+        ys_abs = ys.float() + float(y0)
+        pts = torch.stack([xs_abs, ys_abs], dim=1)
+
+        wsum = torch.clamp(weights.sum(), min=1e-6)
+        mean = (pts * weights[:, None]).sum(dim=0) / wsum
+        centered = pts - mean
+
+        cov = centered.t().matmul(centered * weights[:, None]) / wsum
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        major = eigvecs[:, 1]
+        if float(eigvals[1].item()) < 1e-8:
+            major = pts.new_tensor([1.0, 0.0])
+        major = major / torch.clamp(torch.norm(major), min=1e-6)
+        minor = torch.stack([-major[1], major[0]])
+
+        proj_u = centered.matmul(major)
+        proj_v = centered.matmul(minor)
+        umin, umax = proj_u.min(), proj_u.max()
+        vmin, vmax = proj_v.min(), proj_v.max()
+
+        width_feat = torch.clamp((umax - umin + 1.0) * self.pca_size_factor, min=1.0)
+        height_feat = torch.clamp((vmax - vmin + 1.0) * self.pca_size_factor, min=1.0)
+
+        cx = mean[0] * float(stride)
+        cy = mean[1] * float(stride)
+        w_box = width_feat * float(stride)
+        h_box = height_feat * float(stride)
+        angle = torch.atan2(major[1], major[0])
+
+        l1 = torch.clamp(eigvals[1], min=0.0)
+        l2 = torch.clamp(eigvals[0], min=0.0)
+        aniso = (l1 - l2) / torch.clamp(l1 + l2, min=1e-6)
+
+        xmin = float(xs.min().item())
+        xmax = float(xs.max().item())
+        ymin = float(ys.min().item())
+        ymax = float(ys.max().item())
+        box_area = max((xmax - xmin + 1.0) * (ymax - ymin + 1.0), 1.0)
+        fill_ratio = float(mask.sum().item()) / box_area
+        center_offset = torch.sqrt(
+            (mean[0] - float(target_xy_feat[0].item()))**2 +
+            (mean[1] - float(target_xy_feat[1].item()))**2)
+        instance_ok = True
+        if self.pca_enable_instance_gate:
+            instance_ok = bool(
+                (float(center_offset.item()) <= self.pca_max_center_offset) and
+                (fill_ratio >= self.pca_min_fill_ratio))
+
+        return remap_map.new_tensor([cx, cy, w_box, h_box, angle]), aniso, instance_ok
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def get_pseudo_bboxes(self,
@@ -370,12 +633,38 @@ class CPMVPDPseudoHead(CPMVPDHead):
                     lstd = torch.nan_to_num(stats[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
 
                     box = self._decode_from_stats(anchor_point, stride, mu, lstd)
-                    if self.use_remap_size:
+                    wh_remap = None
+                    if self.use_remap_size or self.use_pca_decode:
                         wh_remap = self._estimate_wh_from_remap_peak(
                             remap_map, py, px, stride)
+
+                    if self.use_remap_size:
                         mix = min(max(self.remap_size_mix, 0.0), 1.0)
                         box[2] = box[2] * (1.0 - mix) + wh_remap[0] * mix
                         box[3] = box[3] * (1.0 - mix) + wh_remap[1] * mix
+
+                    if self.use_pca_decode:
+                        pca_out = self._decode_from_local_weighted_pca(
+                            remap_map=remap_map,
+                            py=py,
+                            px=px,
+                            stride=stride,
+                            target_xy_feat=target_xy_feat,
+                            base_wh=wh_remap)
+                        if pca_out is not None:
+                            pca_box, pca_aniso, instance_ok = pca_out
+                            if instance_ok:
+                                center_mix = min(max(self.pca_center_mix, 0.0), 1.0)
+                                size_mix = min(max(self.pca_size_mix, 0.0), 1.0)
+                                angle_mix = min(max(self.pca_angle_mix, 0.0), 1.0)
+
+                                box[0] = box[0] * (1.0 - center_mix) + pca_box[0] * center_mix
+                                box[1] = box[1] * (1.0 - center_mix) + pca_box[1] * center_mix
+                                box[2] = box[2] * (1.0 - size_mix) + pca_box[2] * size_mix
+                                box[3] = box[3] * (1.0 - size_mix) + pca_box[3] * size_mix
+
+                                if (not self.pca_use_aniso_gate) or (float(pca_aniso.item()) >= self.pca_aniso_thr):
+                                    box[4] = self._blend_angle(box[4], pca_box[4], angle_mix)
                     score = torch.nan_to_num(score, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
 
                     if best_score is None or score > best_score:
