@@ -15,6 +15,7 @@ Pseudo generation pipeline:
 
 import os
 import torch
+import torch.nn.functional as F
 from mmcv.runner import force_fp32
 from mmcv.ops import nms_rotated
 
@@ -43,6 +44,22 @@ class CPMVPDPseudoHead(CPMVPDHead):
                  remap_edge_thr_ratio=0.35,
                  remap_edge_max_len=64,
                  remap_size_mix=1.0,
+                 remap_use_gt_guided=True,
+                 remap_cls_floor=0.05,
+                 remap_cls_gamma=1.0,
+                 remap_uncert_q_lo=0.01,
+                 remap_uncert_q_hi=0.20,
+                 remap_uncert_gamma=1.0,
+                 remap_alpha_cls=0.9,
+                 remap_alpha_uncert=0.0,
+                 remap_prob_smooth_ksize=3,
+                 remap_prob_local_contrast=0.30,
+                 remap_sigma_scale=0.5,
+                 remap_min_sigma=1.0,
+                 remap_max_sigma=20.0,
+                 remap_score_thr=0.2,
+                 remap_topk=0,
+                 remap_bg_std_scale=1.5,
                  use_pca_decode=True,
                  pca_window_radius=6,
                  pca_use_adaptive_radius=True,
@@ -76,6 +93,22 @@ class CPMVPDPseudoHead(CPMVPDHead):
         self.remap_edge_thr_ratio = float(remap_edge_thr_ratio)
         self.remap_edge_max_len = int(remap_edge_max_len)
         self.remap_size_mix = float(remap_size_mix)
+        self.remap_use_gt_guided = bool(remap_use_gt_guided)
+        self.remap_cls_floor = float(remap_cls_floor)
+        self.remap_cls_gamma = float(remap_cls_gamma)
+        self.remap_uncert_q_lo = float(remap_uncert_q_lo)
+        self.remap_uncert_q_hi = float(remap_uncert_q_hi)
+        self.remap_uncert_gamma = float(remap_uncert_gamma)
+        self.remap_alpha_cls = float(remap_alpha_cls)
+        self.remap_alpha_uncert = float(remap_alpha_uncert)
+        self.remap_prob_smooth_ksize = int(remap_prob_smooth_ksize)
+        self.remap_prob_local_contrast = float(remap_prob_local_contrast)
+        self.remap_sigma_scale = float(remap_sigma_scale)
+        self.remap_min_sigma = float(remap_min_sigma)
+        self.remap_max_sigma = float(remap_max_sigma)
+        self.remap_score_thr = float(remap_score_thr)
+        self.remap_topk = int(remap_topk)
+        self.remap_bg_std_scale = float(remap_bg_std_scale)
         self.use_pca_decode = bool(use_pca_decode)
         self.pca_window_radius = int(pca_window_radius)
         self.pca_use_adaptive_radius = bool(pca_use_adaptive_radius)
@@ -227,32 +260,147 @@ class CPMVPDPseudoHead(CPMVPDHead):
         return losses
 
     @staticmethod
-    def _build_remap_map(cls_score_lvl, centerness_lvl, bbox_pred_lvl):
-        """Build remap map following visualize script logic.
+    def _infer_image_shape(img_meta):
+        for key in ('img_shape', 'pad_shape', 'ori_shape'):
+            shape = img_meta.get(key, None)
+            if shape is not None and len(shape) >= 2:
+                return float(shape[0]), float(shape[1])
+        raise KeyError('img_meta must contain one of img_shape/pad_shape/ori_shape.')
 
-        Remap formula:
-            p'(y, x) = log(1 + p(y + mu_y(y, x), x + mu_x(y, x)))
-        where p is max-class probability.
-        """
-        del centerness_lvl  # kept for signature consistency
+    @staticmethod
+    def _extract_center_and_size(gt_bboxes):
+        if gt_bboxes is None or gt_bboxes.numel() == 0:
+            return None, None, None, None
 
-        mu = torch.nan_to_num(bbox_pred_lvl[0:4], nan=0.0, posinf=1e4, neginf=-1e4)
+        boxes = gt_bboxes.float()
+        if boxes.dim() == 1:
+            boxes = boxes.unsqueeze(0)
+
+        if boxes.size(1) >= 8:
+            xs = boxes[:, 0:8:2]
+            ys = boxes[:, 1:8:2]
+            cx = xs.mean(dim=1)
+            cy = ys.mean(dim=1)
+            bw = (xs.max(dim=1)[0] - xs.min(dim=1)[0]).clamp(min=1e-3)
+            bh = (ys.max(dim=1)[0] - ys.min(dim=1)[0]).clamp(min=1e-3)
+        elif boxes.size(1) >= 5:
+            cx = boxes[:, 0]
+            cy = boxes[:, 1]
+            bw = boxes[:, 2].abs().clamp(min=1e-3)
+            bh = boxes[:, 3].abs().clamp(min=1e-3)
+        elif boxes.size(1) >= 4:
+            x1 = boxes[:, 0]
+            y1 = boxes[:, 1]
+            x2 = boxes[:, 2]
+            y2 = boxes[:, 3]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+            bw = (x2 - x1).abs().clamp(min=1e-3)
+            bh = (y2 - y1).abs().clamp(min=1e-3)
+        else:
+            raise ValueError(f'Unsupported gt bbox shape: {tuple(boxes.shape)}')
+
+        return cx, cy, bw, bh
+
+    @staticmethod
+    def _gaussian_priors(h, w, cx, cy, sigma):
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=cx.device, dtype=torch.float32),
+            torch.arange(w, device=cx.device, dtype=torch.float32),
+            indexing='ij')
+        dx2 = (xx.unsqueeze(0) - cx.view(-1, 1, 1))**2
+        dy2 = (yy.unsqueeze(0) - cy.view(-1, 1, 1))**2
+        denom = 2.0 * sigma.view(-1, 1, 1)**2 + 1e-6
+        return torch.exp(-(dx2 + dy2) / denom)
+
+    def _build_probmap(self, cls_score_lvl, bbox_pred_lvl):
         cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
+        lstd = torch.nan_to_num(bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
+        std = lstd.exp()
 
         max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
-        cx_mu = mu[0]
-        cy_mu = mu[1]
 
-        h, w = max_class_prob.shape
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=max_class_prob.device, dtype=torch.float32),
-            torch.arange(w, device=max_class_prob.device, dtype=torch.float32),
-            indexing='ij')
-        new_x = torch.round(xx + cx_mu).long().clamp(0, w - 1)
-        new_y = torch.round(yy + cy_mu).long().clamp(0, h - 1)
-        remapped_max_prob = max_class_prob[new_y, new_x]
-        remapped_max_prob = torch.log1p(remapped_max_prob)
-        return remapped_max_prob
+        std_geo = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
+        std_geo = torch.nan_to_num(std_geo, nan=0.0, posinf=1e6, neginf=0.0)
+        q_lo = torch.quantile(std_geo, self.remap_uncert_q_lo)
+        q_hi = torch.quantile(std_geo, self.remap_uncert_q_hi)
+        denom = torch.clamp(q_hi - q_lo, min=1e-6)
+        std_geo_norm = ((std_geo - q_lo) / denom).clamp(0.0, 1.0)
+        uncert_weight = torch.pow((1.0 - std_geo_norm).clamp(0.0, 1.0), self.remap_uncert_gamma)
+
+        cls_stretch = ((max_class_prob - self.remap_cls_floor) /
+                       max(1.0 - self.remap_cls_floor, 1e-6)).clamp(0.0, 1.0)
+        cls_weight = torch.pow(torch.clamp(cls_stretch, min=1e-6), self.remap_cls_gamma)
+
+        probmap = (
+            torch.pow(torch.clamp(cls_weight, min=1e-6), self.remap_alpha_cls) *
+            torch.pow(torch.clamp(uncert_weight, min=1e-6), self.remap_alpha_uncert))
+
+        if self.remap_prob_smooth_ksize > 1:
+            k = int(self.remap_prob_smooth_ksize)
+            if k % 2 == 0:
+                k += 1
+            pad = k // 2
+            probmap = F.avg_pool2d(probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
+
+        beta = float(self.remap_prob_local_contrast)
+        if beta > 0.0:
+            local_avg = F.avg_pool2d(probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+            probmap = (probmap - beta * local_avg).clamp(min=0.0)
+
+        pmax = torch.clamp(probmap.max(), min=1e-6)
+        return (probmap / pmax).clamp(min=1e-6, max=1.0)
+
+    def _build_gt_guided_remap_map(self, probmap, gt_bboxes, img_meta):
+        if gt_bboxes is None or gt_bboxes.numel() == 0:
+            return probmap
+
+        h, w = probmap.shape
+        cx, cy, bw, bh = self._extract_center_and_size(gt_bboxes)
+        if cx is None:
+            return probmap
+
+        img_h, img_w = self._infer_image_shape(img_meta)
+        sx = float(w) / max(float(img_w), 1.0)
+        sy = float(h) / max(float(img_h), 1.0)
+        cx_f = cx * sx
+        cy_f = cy * sy
+        bw_f = bw * sx
+        bh_f = bh * sy
+
+        sigma = self.remap_sigma_scale * torch.sqrt((bw_f * bh_f).clamp(min=1e-6))
+        sigma = torch.clamp(sigma, min=self.remap_min_sigma, max=self.remap_max_sigma)
+
+        priors = self._gaussian_priors(h=h, w=w, cx=cx_f, cy=cy_f, sigma=sigma)
+        ownership = priors / torch.clamp(priors.sum(dim=0, keepdim=True), min=1e-8)
+        per_obj = probmap.unsqueeze(0) * ownership
+
+        if self.remap_score_thr > 0.0:
+            per_obj = per_obj * (per_obj >= self.remap_score_thr).to(per_obj.dtype)
+
+        if self.remap_topk > 0:
+            n_obj = per_obj.shape[0]
+            flat = per_obj.view(n_obj, -1)
+            k = min(int(self.remap_topk), flat.shape[1])
+            if k > 0:
+                kth = torch.topk(flat, k, dim=1)[0][:, -1].view(n_obj, 1, 1)
+                per_obj = per_obj * (per_obj >= kth).to(per_obj.dtype)
+
+        fused = per_obj.sum(dim=0)
+        if self.remap_bg_std_scale is not None:
+            mu = fused.mean()
+            std = fused.std(unbiased=False)
+            fg_mask = fused >= (mu + self.remap_bg_std_scale * std)
+            fused = fused * fg_mask.to(fused.dtype)
+
+        return fused.clamp(min=0.0, max=1.0)
+
+    def _build_remap_map(self, cls_score_lvl, centerness_lvl, bbox_pred_lvl, gt_bboxes, img_meta):
+        del centerness_lvl
+        probmap = self._build_probmap(cls_score_lvl=cls_score_lvl, bbox_pred_lvl=bbox_pred_lvl)
+        if self.remap_use_gt_guided:
+            return self._build_gt_guided_remap_map(probmap=probmap, gt_bboxes=gt_bboxes, img_meta=img_meta)
+        return probmap
 
     def _decode_from_stats(self, point, stride, mu, lstd):
         """Decode one rotated box from a selected pixel stats."""
@@ -589,6 +737,7 @@ class CPMVPDPseudoHead(CPMVPDHead):
         result_list = []
 
         for img_id in range(num_imgs):
+            gt_boxes_this = gt_bboxes[img_id] if len(gt_bboxes[img_id]) > 0 else None
             points_this = gt_bboxes[img_id][:, :2] if len(gt_bboxes[img_id]) > 0 else None
             labels_this = gt_labels[img_id] if len(gt_labels[img_id]) > 0 else None
 
@@ -602,6 +751,15 @@ class CPMVPDPseudoHead(CPMVPDHead):
             per_gt_scores = []
             per_gt_labels = []
 
+            per_lvl_remap_maps = []
+            for lvl_idx in range(num_levels):
+                per_lvl_remap_maps.append(self._build_remap_map(
+                    cls_score_lvl=cls_scores[lvl_idx][img_id],
+                    centerness_lvl=centernesses[lvl_idx][img_id],
+                    bbox_pred_lvl=bbox_preds[lvl_idx][img_id],
+                    gt_bboxes=gt_boxes_this,
+                    img_meta=img_metas[img_id]))
+
             for gt_idx in range(points_this.shape[0]):
                 center_xy = points_this[gt_idx]
                 cls_id = labels_this[gt_idx].long()
@@ -612,10 +770,7 @@ class CPMVPDPseudoHead(CPMVPDHead):
                 for lvl_idx in range(num_levels):
                     stride = self.strides[lvl_idx]
                     bbox_pred_lvl = bbox_preds[lvl_idx][img_id]
-                    cls_score_lvl = cls_scores[lvl_idx][img_id]
-                    centerness_lvl = centernesses[lvl_idx][img_id]
-                    remap_map = self._build_remap_map(
-                        cls_score_lvl, centerness_lvl, bbox_pred_lvl)
+                    remap_map = per_lvl_remap_maps[lvl_idx]
 
                     target_xy_feat = center_xy / float(stride)
                     peak = self._pick_peak_from_remap(

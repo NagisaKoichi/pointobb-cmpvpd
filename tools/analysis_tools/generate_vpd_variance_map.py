@@ -7,6 +7,7 @@ import os.path as osp
 import mmcv
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from mmcv import Config, DictAction
 from mmcv.parallel import DataContainer
@@ -76,6 +77,51 @@ def parse_args():
         type=float,
         default=1.5,
         help='background suppression threshold: mean + bg_std_scale * std')
+    parser.add_argument(
+        '--cls-floor',
+        type=float,
+        default=0.05,
+        help='classification floor before contrast stretching')
+    parser.add_argument(
+        '--cls-gamma',
+        type=float,
+        default=0.5,
+        help='power applied to stretched classification score')
+    parser.add_argument(
+        '--uncert-q-lo',
+        type=float,
+        default=0.01,
+        help='lower quantile for uncertainty normalization')
+    parser.add_argument(
+        '--uncert-q-hi',
+        type=float,
+        default=0.20,
+        help='upper quantile for uncertainty normalization')
+    parser.add_argument(
+        '--uncert-gamma',
+        type=float,
+        default=0.7,
+        help='power applied to uncertainty confidence weight')
+    parser.add_argument(
+        '--alpha-cls',
+        type=float,
+        default=0.5,
+        help='fusion exponent for classification branch')
+    parser.add_argument(
+        '--alpha-uncert',
+        type=float,
+        default=0.5,
+        help='fusion exponent for uncertainty branch')
+    parser.add_argument(
+        '--prob-smooth-ksize',
+        type=int,
+        default=3,
+        help='avg-pool kernel size for optional probmap smoothing (odd, <=1 disables)')
+    parser.add_argument(
+        '--prob-local-contrast',
+        type=float,
+        default=0.30,
+        help='local contrast factor beta in p <- max(p - beta*avgpool(p), 0)')
     parser.add_argument(
         '--remap-output-mode',
         default='variance',
@@ -163,7 +209,16 @@ def _save_maps_for_image(img_path,
                          min_sigma,
                          max_sigma,
                          bg_std_scale,
-                         remap_output_mode):
+                         remap_output_mode,
+                         cls_floor,
+                         cls_gamma,
+                         uncert_q_lo,
+                         uncert_q_hi,
+                         uncert_gamma,
+                         alpha_cls,
+                         alpha_uncert,
+                         prob_smooth_ksize,
+                         prob_local_contrast):
     # Channels 0:2 are posterior center mean for (x, y).
     mu = torch.nan_to_num(bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
     center_mu = mu[0:2].mean(dim=0)
@@ -172,7 +227,6 @@ def _save_maps_for_image(img_path,
     log_sigma = bbox_pred_lvl[2:4]
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
 
-    # center_lstd = lstd.mean(dim=0)
     std = lstd.exp()
     center_std = std.mean(dim=0)
 
@@ -182,11 +236,45 @@ def _save_maps_for_image(img_path,
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
     centerness_prob = centerness_lvl.sigmoid().squeeze(0)
     combined_score = max_class_prob
-    std_score = 1 - std.mean(dim=0).sigmoid()
-    print(f'std stats - min: {std_score.min().item():.6f}, max: {std_score.max().item():.6f}, mean: {std_score.mean().item():.6f}')
 
-    # probmap = ((std_sigmoid.mean(dim=0) + combined_score) / 2).clamp(min=1e-6, max=1.0)
-    probmap = (combined_score * std_score * 50).clamp(min=1e-6, max=1.0)
+    # Use geometric uncertainty from two sigma channels, avoiding channel mean.
+    std_geo = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
+    std_geo = torch.nan_to_num(std_geo, nan=0.0, posinf=1e6, neginf=0.0)
+    q_lo = torch.quantile(std_geo, float(uncert_q_lo))
+    q_hi = torch.quantile(std_geo, float(uncert_q_hi))
+    denom = torch.clamp(q_hi - q_lo, min=1e-6)
+    std_geo_norm = ((std_geo - q_lo) / denom).clamp(0.0, 1.0)
+    uncert_weight = torch.pow((1.0 - std_geo_norm).clamp(0.0, 1.0), float(uncert_gamma))
+
+    cls_stretch = ((max_class_prob - float(cls_floor)) /
+                   max(1.0 - float(cls_floor), 1e-6)).clamp(0.0, 1.0)
+    cls_weight = torch.pow(torch.clamp(cls_stretch, min=1e-6), float(cls_gamma))
+
+    # probmap = (
+    #     torch.pow(torch.clamp(cls_weight, min=1e-6), float(alpha_cls)) *
+    #     torch.pow(torch.clamp(uncert_weight, min=1e-6), float(alpha_uncert)))
+    
+    # or mean
+    probmap = float(alpha_cls) * cls_weight + float(alpha_uncert) * uncert_weight
+
+    if int(prob_smooth_ksize) > 1:
+        k = int(prob_smooth_ksize)
+        if k % 2 == 0:
+            k += 1
+        pad = k // 2
+        probmap = F.avg_pool2d(
+            probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
+
+    beta = float(prob_local_contrast)
+    if beta > 0.0:
+        local_avg = F.avg_pool2d(
+            probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+        probmap = (probmap - beta * local_avg).clamp(min=0.0)
+
+    pmax = torch.clamp(probmap.max(), min=1e-6)
+    probmap = (probmap / pmax).clamp(min=1e-6, max=1.0)
+
+    print(f'std_geo_norm stats - min: {std_geo_norm.min().item():.6f}, max: {std_geo_norm.max().item():.6f}, mean: {std_geo_norm.mean().item():.6f}')
     print(f'probmap stats - min: {probmap.min().item():.6f}, max: {probmap.max().item():.6f}, mean: {probmap.mean().item():.6f}')
 
     if remap_output_mode == 'mask':
@@ -421,7 +509,16 @@ def main():
                 args.min_sigma,
                 args.max_sigma,
                 args.bg_std_scale,
-                args.remap_output_mode)
+                args.remap_output_mode,
+                args.cls_floor,
+                args.cls_gamma,
+                args.uncert_q_lo,
+                args.uncert_q_hi,
+                args.uncert_gamma,
+                args.alpha_cls,
+                args.alpha_uncert,
+                args.prob_smooth_ksize,
+                args.prob_local_contrast)
 
             processed += 1
             progress.update()
