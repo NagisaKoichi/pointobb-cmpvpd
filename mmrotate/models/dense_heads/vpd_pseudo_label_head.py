@@ -50,13 +50,18 @@ class VPDPseudoLabelHead(PseudoLabelHead):
 
         # Remap map settings (aligned with generate_vpd_variance_map.py)
         self.remap_use = train_cfg.get('remap_use', True)
-        self.remap_use_gt_guided = train_cfg.get('remap_use_gt_guided', True)
+        
+        # gt_guided remap: use GT boxes to generate Gaussian priors for remap map, instead of pure model-based remap
+        self.remap_use_gt_guided = train_cfg.get('remap_use_gt_guided', False)
         self.remap_sigma_scale = train_cfg.get('remap_sigma_scale', 0.5)
         self.remap_min_sigma = train_cfg.get('remap_min_sigma', 1.0)
         self.remap_max_sigma = train_cfg.get('remap_max_sigma', 20.0)
         self.remap_score_thr = train_cfg.get('remap_score_thr', 0.04)
         self.remap_topk = train_cfg.get('remap_topk', 0)
         self.remap_bg_std_scale = train_cfg.get('remap_bg_std_scale', 1.5)
+        
+        # Alpha blending between cls-based and uncert-based remap weights (0 = only cls, 1 = only uncert)
+        self.use_vpd_map = train_cfg.get('use_vpd_map', True)
         self.remap_cls_floor = train_cfg.get('remap_cls_floor', 0.05)
         self.remap_cls_gamma = train_cfg.get('remap_cls_gamma', 1.0)
         self.remap_uncert_q_lo = train_cfg.get('remap_uncert_q_lo', 0.01)
@@ -68,9 +73,6 @@ class VPDPseudoLabelHead(PseudoLabelHead):
         self.remap_prob_local_contrast = train_cfg.get('remap_prob_local_contrast', 0.30)
 
         # Per-step switches for VPD vs original flow
-        self.use_vpd_map = train_cfg.get('use_vpd_map', True)  # no effect
-        self.use_vpd_center_refine = train_cfg.get('use_vpd_center_refine', True)  # no effect
-        self.use_vpd_sigma_pca = train_cfg.get('use_vpd_sigma_pca', True)  # no effect, this overlaps with self.sigma_pca
         self.use_vpd_sigma_walk = train_cfg.get('use_vpd_sigma_walk', True)  # no effect
         self.use_vpd_mu_walk = train_cfg.get('use_vpd_mu_walk', True)  # no effect
 
@@ -169,107 +171,6 @@ class VPDPseudoLabelHead(PseudoLabelHead):
         return super().loss(cls_scores, bbox_preds, angle_preds, centernesses,
                             gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore)
 
-    def _refine_centers_with_mu(self, center_point_gt, gt_labels,
-                                cls_scores_sigmoid, mu_map, stride):
-        """Refine GT center points using mu + cls_prob weighted centroid.
-
-        Two complementary signals:
-        1. Mu consensus: mu predictions near the GT center vote on where the
-           true center is. Weighted by cls_prob to suppress background.
-        2. Cls centroid: cls_prob-weighted centroid of the activation blob
-           provides a geometry-based center estimate.
-
-        The final refinement is a blend of both, clipped to max_shift pixels
-        to prevent catastrophic drift.
-
-        Args:
-            center_point_gt: (N, 2) GT center points in image coords.
-            gt_labels: (N,) class labels per GT.
-            cls_scores_sigmoid: (C, H, W) sigmoid class scores at stride-0.
-            mu_map: (2, H, W) mu predictions at stride-0.
-            stride: stride of level 0 (typically 4).
-
-        Returns:
-            refined_centers: (N, 2) refined center points in image coords.
-        """
-        num_gts = center_point_gt.shape[0]
-        H, W = cls_scores_sigmoid.shape[1], cls_scores_sigmoid.shape[2]
-        refined = center_point_gt.clone()
-        radius = self.mu_refine_radius  # in feature pixels
-        max_shift = stride * 2.0  # max allowed shift in pixels (conservative)
-
-        for i in range(num_gts):
-            cx_feat = center_point_gt[i, 0] / stride
-            cy_feat = center_point_gt[i, 1] / stride
-
-            # Define local window
-            x_min = max(int(cx_feat - radius), 0)
-            x_max = min(int(cx_feat + radius) + 1, W)
-            y_min = max(int(cy_feat - radius), 0)
-            y_max = min(int(cy_feat + radius) + 1, H)
-
-            if x_max <= x_min or y_max <= y_min:
-                continue
-
-            # Class probability as weight
-            cls_prob = cls_scores_sigmoid[gt_labels[i],
-                                         y_min:y_max, x_min:x_max]  # (h, w)
-
-            # ── Signal 1: Mu consensus voting ──
-            mu_local = mu_map[:, y_min:y_max, x_min:x_max]  # (2, h, w)
-
-            # Grid of anchor points in image coords
-            yy = torch.arange(y_min, y_max, device=mu_map.device).float()
-            xx = torch.arange(x_min, x_max, device=mu_map.device).float()
-            grid_y, grid_x = torch.meshgrid(yy, xx, indexing='ij')
-            anchor_x = grid_x * stride
-            anchor_y = grid_y * stride
-
-            # Each anchor predicts where the center is: anchor + mu * stride
-            pred_cx = anchor_x + mu_local[0] * stride
-            pred_cy = anchor_y + mu_local[1] * stride
-
-            # ── Signal 2: Cls centroid ──
-            # Anchor positions weighted by cls_prob = geometric center
-            # (no mu needed, pure classifier geometry)
-
-            # Combined: use cls_prob * proximity weight
-            dist_from_gt = torch.sqrt(
-                (anchor_x - center_point_gt[i, 0]) ** 2 +
-                (anchor_y - center_point_gt[i, 1]) ** 2)
-            prox_weight = (1.0 - dist_from_gt / (radius * stride)).clamp(min=0)
-            weight = cls_prob * prox_weight
-            weight_sum = weight.sum()
-
-            if weight_sum < 1e-6:
-                continue
-
-            # Mu consensus: weighted average of predicted centers
-            mu_cx = (pred_cx * weight).sum() / weight_sum
-            mu_cy = (pred_cy * weight).sum() / weight_sum
-
-            # Cls centroid: weighted average of anchor positions
-            cls_cx = (anchor_x * weight).sum() / weight_sum
-            cls_cy = (anchor_y * weight).sum() / weight_sum
-
-            # Blend: 50% mu consensus + 50% cls centroid
-            ref_x = 0.5 * mu_cx + 0.5 * cls_cx
-            ref_y = 0.5 * mu_cy + 0.5 * cls_cy
-
-            # Clip shift to max_shift
-            dx = ref_x - center_point_gt[i, 0]
-            dy = ref_y - center_point_gt[i, 1]
-            shift = torch.sqrt(dx ** 2 + dy ** 2)
-            if shift > max_shift:
-                scale = max_shift / shift
-                dx = dx * scale
-                dy = dy * scale
-
-            refined[i, 0] = center_point_gt[i, 0] + dx
-            refined[i, 1] = center_point_gt[i, 1] + dy
-
-        return refined
-
     @staticmethod
     def _infer_image_shape(img_meta):
         for key in ('img_shape', 'pad_shape', 'ori_shape'):
@@ -333,8 +234,10 @@ class VPDPseudoLabelHead(PseudoLabelHead):
         cls_score_lvl = torch.nan_to_num(
             cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
         max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
+        # or use all levels
 
         if sigma_map is None:
+            print('Warning: sigma_map is None, remap will be based on cls_score only')
             uncert_weight = torch.ones_like(max_class_prob)
         else:
             sigma_map = torch.nan_to_num(
@@ -355,29 +258,54 @@ class VPDPseudoLabelHead(PseudoLabelHead):
             torch.clamp(cls_stretch, min=1e-6),
             float(self.remap_cls_gamma))
 
-        # probmap = (
-        #     torch.pow(torch.clamp(cls_weight, min=1e-6), float(self.remap_alpha_cls)) *
-        #     torch.pow(torch.clamp(uncert_weight, min=1e-6), float(self.remap_alpha_uncert)))
+        probmap = (
+            torch.pow(torch.clamp(cls_weight, min=1e-6), float(self.remap_alpha_cls)) *
+            torch.pow(torch.clamp(uncert_weight, min=1e-6), float(self.remap_alpha_uncert)))
         
         # or mean
-        probmap = float(self.remap_alpha_cls) * cls_weight + float(self.remap_alpha_uncert) * uncert_weight
+        # probmap = float(self.remap_alpha_cls) * cls_weight + float(self.remap_alpha_uncert) * uncert_weight
 
-        if int(self.remap_prob_smooth_ksize) > 1:
-            k = int(self.remap_prob_smooth_ksize)
-            if k % 2 == 0:
-                k += 1
-            pad = k // 2
-            probmap = F_nn.avg_pool2d(
-                probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
+        # Optional smoothing and local contrast enhancement to clean up the remap map
+        # if int(self.remap_prob_smooth_ksize) > 1:
+        #     k = int(self.remap_prob_smooth_ksize)
+        #     if k % 2 == 0:
+        #         k += 1
+        #     pad = k // 2
+        #     probmap = F_nn.avg_pool2d(
+        #         probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
 
-        beta = float(self.remap_prob_local_contrast)
-        if beta > 0.0:
-            local_avg = F_nn.avg_pool2d(
-                probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
-            probmap = (probmap - beta * local_avg).clamp(min=0.0)
+        # beta = float(self.remap_prob_local_contrast)
+        # if beta > 0.0:
+        #     local_avg = F_nn.avg_pool2d(
+        #         probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+        #     probmap = (probmap - beta * local_avg).clamp(min=0.0)
+        
+        
 
         pmax = torch.clamp(probmap.max(), min=1e-6)
-        return (probmap / pmax).clamp(min=1e-6, max=1.0)
+        probmap = (probmap / pmax).clamp(min=1e-6, max=1.0)
+        
+        import matplotlib.pyplot as plt
+        plt.title('Remap Map')
+        plt.imshow(probmap.cpu().detach().numpy(), cmap='viridis')
+        plt.colorbar()
+        plt.savefig(f'/media/ps/passport2/zlk/results/frozen_vpd_v3/vis_dump/_0.png')
+        plt.close()
+        
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.title('Class Scores for Map (Level 0)')
+        plt.imshow(cls_weight.cpu().detach().numpy(), cmap='viridis')
+        plt.colorbar()
+        plt.subplot(1, 2, 2)
+        plt.title('Sigma Map')
+        plt.imshow(uncert_weight.cpu().detach().numpy(), cmap='viridis')
+        plt.colorbar()
+        plt.savefig(f'/media/ps/passport2/zlk/results/frozen_vpd_v3/vis_dump/_1.png')
+        plt.close()
+
+        
+        return probmap
 
     def _build_gt_guided_remap_map(self, probmap, gt_bboxes, img_meta):
         if gt_bboxes is None or gt_bboxes.numel() == 0:
@@ -429,10 +357,141 @@ class VPDPseudoLabelHead(PseudoLabelHead):
     def _build_remap_map(self, cls_score_lvl, sigma_map, gt_bboxes, img_meta):
         probmap = self._build_probmap_from_maps(
             cls_score_lvl=cls_score_lvl, sigma_map=sigma_map)
-        if self.remap_use_gt_guided:
+        if self.remap_use_gt_guided: # false
             return self._build_gt_guided_remap_map(
                 probmap=probmap, gt_bboxes=gt_bboxes, img_meta=img_meta)
         return probmap
+    
+    def _get_target_single(self, gt_bboxes, gt_labels, cls_scores_all, img_metas, points, regress_ranges,
+                           num_points_per_lvl, alpha=1, thresh1=8, thresh2_bg=4, thresh3=0.1, pca_length=28, default_max_length=128, mode='near'):
+        """Compute regression, classification and angle targets for a single
+        image.
+        
+        Args:
+            cls_scores_all (list[Tensor]): feature map scores on each point for each scale level, 
+                len(cls_scores_all) = num_levels, cls_scores_all[i].size() = (num_classes, w, h)
+        """
+        alpha = alpha
+        thresh3 = self.thresh3
+        pca_length = self.pca_length
+        num_points = points.size(0)
+        num_gts = gt_labels.size(0)
+        center_point_gt = gt_bboxes[:, :2]
+        
+        # ── Mu-based center refinement ──────────────────────────
+        stride0 = self.strides[0]
+        sigma_img_idx = None
+        sigma_map_for_img = None
+        if self._sigma_batch is not None:
+            sigma_img_idx = min(self._sigma_img_idx, self._sigma_batch.shape[0] - 1)
+            sigma_map_for_img = self._sigma_batch[sigma_img_idx]
+        cls_scores_for_map = cls_scores_all
+        if self.remap_use and self.use_vpd_map:
+            sigma_map_for_remap = sigma_map_for_img
+            remap_map = self._build_remap_map(
+                cls_score_lvl=cls_scores_all[0],
+                sigma_map=sigma_map_for_remap,
+                gt_bboxes=gt_bboxes,
+                img_meta=img_metas)
+            if remap_map is not None:
+                # remap_logits = self._prob_to_logit(remap_map)
+                # remap_logits = remap_logits.unsqueeze(0).repeat(
+                #     cls_scores_all[0].shape[0], 1, 1)
+                cls_scores_for_map = list(cls_scores_all)
+                cls_scores_max_legacy = cls_scores_for_map[0].sigmoid().max(dim=1)[0]
+                # cls_scores_for_map[0] = remap_logits
+                cls_scores_for_map[0] = remap_map.unsqueeze(0).repeat(
+                    cls_scores_all[0].shape[0], 1, 1)
+
+        # The following code only use the center point of the gt_bboxes, the code include "gt_bboxes" is for the vector shape
+        if num_gts == 0:
+            filename_raw = img_metas['filename'].split('/')[-1].split('.')[0]
+            with open(self.store_ann_dir + filename_raw + '.txt', 'w') as w:
+                w.write('\n')
+            return gt_labels.new_full((num_points,), self.num_classes), \
+                   gt_bboxes.new_zeros((num_points, 4)), \
+                   gt_bboxes.new_zeros((num_points, 1))
+
+        dist_sample_and_gt = torch.cdist(points, center_point_gt) # [num_sample, num_gt]
+        dist_gt_and_gt = torch.cdist(center_point_gt, center_point_gt) + torch.eye(num_gts).to(dist_sample_and_gt.device) * INF # [num_gt, num_gt]
+        dist_min_gt_and_gt, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
+        dist_min_sample_and_gt = dist_sample_and_gt.min(dim=1)[0]
+        labels = -1 * torch.ones(num_points, dtype=gt_labels.dtype, device=gt_labels.device)
+        
+        index_neg = ((alpha * dist_sample_and_gt) > dist_min_gt_and_gt).all(dim=1).nonzero().squeeze(-1)
+        if len(index_neg) > 0:
+            # gt_labels = gt_labels.clone()
+            labels[index_neg] = self.num_classes
+            
+        # positive labels
+        thresh1_tensor = thresh1 * torch.ones_like(dist_min_gt_and_gt)
+        dist_min_thresh1_gt = torch.min(dist_min_gt_and_gt/2, thresh1_tensor)
+        index_pos = (dist_sample_and_gt < dist_min_thresh1_gt).nonzero()
+        if len(index_pos) > 0:
+            # gt_labels = gt_labels.clone()
+            labels[index_pos[:, 0]] = gt_labels[index_pos[:, 1]]
+            
+        # additional background labels
+        # gt_labels[dist_min_gt_and_gt_index] is the nearest gt label
+        # center_point_gt[dist_min_gt_and_gt_index] is the nearest gt center point
+        is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels) # [num_gt]
+        valid_middle_point = (center_point_gt[is_nearest_same_class] + center_point_gt[dist_min_gt_and_gt_index][is_nearest_same_class]) / 2
+        dist_sample_and_gt = torch.cdist(points, valid_middle_point)
+        index_neg_additional = (dist_sample_and_gt < thresh2_bg).any(dim=1).nonzero().squeeze(-1)
+        if len(index_neg_additional) > 0:
+            labels[index_neg_additional] = self.num_classes
+        
+        # extract the rectangle of each gt, and gt_ctr is the center of the gt box
+        center_factor = self.get_center_factor(center_point_gt, gt_labels, cls_scores_all[0])
+        gt_ctr_rect = self.get_rectangle_cls_prob(cls_scores_all[0].sigmoid(), self.strides[0], center_factor, center_point_gt, pca_length, mode='near')
+        # gt_ctr_rect = self.process_rectangle_decay(gt_ctr_rect.detach().clone())
+        
+        # get the PCA of each gt rectangle
+        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :] # [num_gts, pca_length, pca_length]
+        gt_rect_ctr2edge = gt_ctr_rect_label.shape[-1]//2
+        points_rect_x = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
+        points_rect_y = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
+        points_rect_xy = torch.stack(torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2) # [pca_length^2, 2]
+        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1) # [num_gts, pca_length^2]
+        points_rect_xy_adapt = points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1) * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1) # [num_gts, pca_length^2, 2] 
+        points_cov_matrix = torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt) / (gt_ctr_rect_label.shape[-1] ** 2 - 1) # [num_gts, 2, 2]
+        eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
+        
+        # get the largest eigval and the corresponding eigvec
+        larger_eigvals_index = (eigvals[:, 1] > eigvals[:, 0]).int()
+        eigval_first = eigvals[:, 0] * (1 - larger_eigvals_index) + eigvals[:, 1] * larger_eigvals_index
+        eigvec_first = eigvecs[:, 0, :] * (1 - larger_eigvals_index).unsqueeze(1).repeat(1, 2) + eigvecs[:, 1, :] * larger_eigvals_index.unsqueeze(1).repeat(1, 2)
+        # eigvec_first = eigvec_first + 1e-6 # [num_gts, 2]
+        mask_eigvec = (eigvec_first[:, 1] > 0).int()
+        epsilon = mask_eigvec * 1e-6 + (1 - mask_eigvec) * -1e-6
+        
+        # get the angle target (only for le90)
+        angle_targets = -torch.atan(eigvec_first[:, 0] / (eigvec_first[:, 1] + epsilon)).unsqueeze(-1)
+        
+        # get the second axis direction
+        eigvec_second = torch.stack([-eigvec_first[:, 1], eigvec_first[:, 0]], -1)
+        
+        first_axis_range = self.get_closest_gt_first_axis(gt_labels, eigvec_first, center_point_gt, angle_threshold=0.866)
+        
+        top_simple, bottom_simple = self.get_edge_boundary_simple(gt_labels, eigvec_first, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple',
+                                                                  is_secondary=False, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index], first_axis_range=first_axis_range) 
+        left_simple, right_simple = self.get_edge_boundary_simple(gt_labels, eigvec_second, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple', 
+                                                                  is_secondary=True, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index]) 
+        top_simple, bottom_simple = top_simple * self.strides[0] + 1, bottom_simple * self.strides[0] + 1
+        left_simple, right_simple = left_simple * self.strides[0] + 1, right_simple * self.strides[0] + 1
+        pseudo_gt_bboxes = torch.cat([center_point_gt, (left_simple+right_simple).unsqueeze(-1), (top_simple+bottom_simple).unsqueeze(-1), angle_targets], -1)
+        pseudo_gt_bboxes = pseudo_gt_bboxes.detach()
+        
+        self.generate_labels(gt_labels, pseudo_gt_bboxes, angle_targets, img_metas)
+        
+        if num_gts == 1:
+            index_pos = (dist_sample_and_gt < 8).nonzero().reshape(-1)
+            index_neg = (dist_sample_and_gt > 128).nonzero().reshape(-1)
+            labels[index_pos] = gt_labels[0]
+            labels[index_neg] = self.num_classes
+            return labels, gt_bboxes.new_zeros((num_points, 4)), gt_bboxes.new_zeros((num_points, 1))
+
+        return labels, None, None
 
     def _get_target_single(self, gt_bboxes, gt_labels, cls_scores_all,
                            img_metas, points, regress_ranges,
@@ -471,11 +530,29 @@ class VPDPseudoLabelHead(PseudoLabelHead):
                 gt_bboxes=gt_bboxes,
                 img_meta=img_metas)
             if remap_map is not None:
-                remap_logits = self._prob_to_logit(remap_map)
-                remap_logits = remap_logits.unsqueeze(0).repeat(
-                    cls_scores_all[0].shape[0], 1, 1)
+                # remap_logits = self._prob_to_logit(remap_map)
+                # remap_logits = remap_logits.unsqueeze(0).repeat(
+                #     cls_scores_all[0].shape[0], 1, 1)
                 cls_scores_for_map = list(cls_scores_all)
-                cls_scores_for_map[0] = remap_logits
+                cls_scores_max_legacy = cls_scores_for_map[0].sigmoid().max(dim=1)[0]
+                # cls_scores_for_map[0] = remap_logits
+                cls_scores_for_map[0] = remap_map.unsqueeze(0).repeat(
+                    cls_scores_all[0].shape[0], 1, 1)
+                
+        # visualize cls_scores_for_map[0] and remap_map for debugging
+        # import matplotlib.pyplot as plt
+        # plt.figure(figsize=(12, 6))
+        # plt.subplot(1, 2, 1)
+        # plt.title('Class Scores for Map (Level 0)')
+        # plt.imshow(cls_scores_for_map[0][0].cpu().detach().numpy(), cmap='viridis')
+        # plt.colorbar()
+        # plt.subplot(1, 2, 2)
+        # plt.title('Remap Map')
+        # plt.imshow(remap_map.cpu().detach().numpy(), cmap='viridis')
+        # plt.colorbar()
+        # plt.savefig(f'/media/ps/passport2/zlk/results/frozen_vpd_v3/vis_dump/{img_metas["filename"].split("/")[-1].split(".")[0]}.png')
+        # plt.close()
+                
         mu_map_refine = None
         if (self._mu_batch is not None and self.mu_refine_radius > 1
                 and self.use_vpd_center_refine):
@@ -483,12 +560,7 @@ class VPDPseudoLabelHead(PseudoLabelHead):
                    else min(self._sigma_img_idx, self._mu_batch.shape[0] - 1))
             mu_map_refine = self._mu_batch[idx]  # (2, H, W)
 
-        if mu_map_refine is not None and self.use_vpd_center_refine:
-            refined_center = self._refine_centers_with_mu(
-                center_point_gt, gt_labels,
-                cls_scores_for_map[0].sigmoid(), mu_map_refine, stride0)
-        else:
-            refined_center = center_point_gt
+        refined_center = center_point_gt
 
         # Use refined_center for PCA and boundary walk,
         # but keep original center_point_gt for label assignment
@@ -521,12 +593,12 @@ class VPDPseudoLabelHead(PseudoLabelHead):
             dim=1).nonzero().squeeze(-1)
         if len(index_neg_additional) > 0:
             labels[index_neg_additional] = self.num_classes
-
+        
         # ── PCA on refined centers ──────────────────────────────
         center_factor = self.get_center_factor(
             refined_center, gt_labels, cls_scores_for_map[0])
         gt_ctr_rect = self.get_rectangle_cls_prob(
-            cls_scores_for_map[0].sigmoid(), self.strides[0], center_factor,
+            cls_scores_for_map[0], self.strides[0], center_factor,
             refined_center, pca_length, mode='near')
         gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :]
 
@@ -611,18 +683,20 @@ class VPDPseudoLabelHead(PseudoLabelHead):
             is_nearest_same_class=is_nearest_same_class,
             nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index],
             first_axis_range=first_axis_range,
-            sigma_map=sigma_map,
-            mu_map=mu_map_walk,
-            original_center=center_point_gt)
+            # sigma_map=sigma_map,
+            # mu_map=mu_map_walk,
+            # original_center=center_point_gt
+            )
         left_simple, right_simple = self.get_edge_boundary_simple(
             gt_labels, eigvec_second, refined_center, cls_scores_for_map,
             thresh3, default_max_length, mode='simple',
             is_secondary=True,
             is_nearest_same_class=is_nearest_same_class,
             nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index],
-            sigma_map=sigma_map,
-            mu_map=mu_map_walk,
-            original_center=center_point_gt)
+            # sigma_map=sigma_map,
+            # mu_map=mu_map_walk,
+            # original_center=center_point_gt
+            )
 
         top_simple = top_simple * self.strides[0] + 1
         bottom_simple = bottom_simple * self.strides[0] + 1
@@ -649,206 +723,206 @@ class VPDPseudoLabelHead(PseudoLabelHead):
 
         return labels, None, None
 
-    def get_edge_boundary_simple(self, gt_labels, eigvec, center_point_gt,
-                                 cls_scores_all, thresh3=0.1,
-                                 default_max_length=128, mode='near',
-                                 is_secondary=False,
-                                 is_nearest_same_class=None,
-                                 nearest_gt_point=None,
-                                 first_axis_range=None,
-                                 sigma_map=None,
-                                 mu_map=None,
-                                 original_center=None):
-        """Boundary walk with directional sigma + mu consistency.
+    # def get_edge_boundary_simple(self, gt_labels, eigvec, center_point_gt,
+    #                              cls_scores_all, thresh3=0.1,
+    #                              default_max_length=128, mode='near',
+    #                              is_secondary=False,
+    #                              is_nearest_same_class=None,
+    #                              nearest_gt_point=None,
+    #                              first_axis_range=None,
+    #                              sigma_map=None,
+    #                              mu_map=None,
+    #                              original_center=None):
+    #     """Boundary walk with directional sigma + mu consistency.
 
-        Sigma: Projects 2D sigma onto walk direction for direction-aware
-        threshold modulation.
+    #     Sigma: Projects 2D sigma onto walk direction for direction-aware
+    #     threshold modulation.
 
-        Mu (optional): At each walk step, mu predicts where the center is.
-        If the predicted center diverges from the original GT center, the
-        walk has entered another object's territory → stop. This provides
-        object-identity awareness that sigma alone cannot.
+    #     Mu (optional): At each walk step, mu predicts where the center is.
+    #     If the predicted center diverges from the original GT center, the
+    #     walk has entered another object's territory → stop. This provides
+    #     object-identity awareness that sigma alone cannot.
 
-        effective_thresh = thresh3 * (sigma_dir / sigma_center_dir) ^ sigma_power
-        mu_stop: |pred_center - gt_center| > mu_diverge_thresh * stride
-        """
-        num_gts = center_point_gt.shape[0]
-        stride = self.strides[0]
-        center_point_gt_feat = center_point_gt / stride
+    #     effective_thresh = thresh3 * (sigma_dir / sigma_center_dir) ^ sigma_power
+    #     mu_stop: |pred_center - gt_center| > mu_diverge_thresh * stride
+    #     """
+    #     num_gts = center_point_gt.shape[0]
+    #     stride = self.strides[0]
+    #     center_point_gt_feat = center_point_gt / stride
 
-        eigvec_norm = eigvec / torch.norm(eigvec, dim=1, keepdim=True)
-        top_bottom = torch.zeros(num_gts, 2).to(center_point_gt.device)
-        cls_scores_sigmoid = cls_scores_all[0].sigmoid()
-        H, W = cls_scores_all[0].shape[1], cls_scores_all[0].shape[2]
+    #     eigvec_norm = eigvec / torch.norm(eigvec, dim=1, keepdim=True)
+    #     top_bottom = torch.zeros(num_gts, 2).to(center_point_gt.device)
+    #     cls_scores_sigmoid = cls_scores_all[0].sigmoid()
+    #     H, W = cls_scores_all[0].shape[1], cls_scores_all[0].shape[2]
 
-        # Precompute sigma components
-        sigma_dx = None
-        sigma_dy = None
-        if sigma_map is not None:
-            sigma_dx = sigma_map[0]  # (H_s, W_s) - x uncertainty
-            sigma_dy = sigma_map[1]  # (H_s, W_s) - y uncertainty
-            if sigma_dx.shape[0] != H or sigma_dx.shape[1] != W:
-                sigma_dx = F_nn.interpolate(
-                    sigma_dx[None, None], size=(H, W),
-                    mode='bilinear', align_corners=False)[0, 0]
-                sigma_dy = F_nn.interpolate(
-                    sigma_dy[None, None], size=(H, W),
-                    mode='bilinear', align_corners=False)[0, 0]
+    #     # Precompute sigma components
+    #     sigma_dx = None
+    #     sigma_dy = None
+    #     if sigma_map is not None:
+    #         sigma_dx = sigma_map[0]  # (H_s, W_s) - x uncertainty
+    #         sigma_dy = sigma_map[1]  # (H_s, W_s) - y uncertainty
+    #         if sigma_dx.shape[0] != H or sigma_dx.shape[1] != W:
+    #             sigma_dx = F_nn.interpolate(
+    #                 sigma_dx[None, None], size=(H, W),
+    #                 mode='bilinear', align_corners=False)[0, 0]
+    #             sigma_dy = F_nn.interpolate(
+    #                 sigma_dy[None, None], size=(H, W),
+    #                 mode='bilinear', align_corners=False)[0, 0]
 
-        # Precompute mu components for consistency check
-        mu_dx = None
-        mu_dy = None
-        if mu_map is not None:
-            mu_dx = mu_map[0]  # (H_m, W_m)
-            mu_dy = mu_map[1]
-            if mu_dx.shape[0] != H or mu_dx.shape[1] != W:
-                mu_dx = F_nn.interpolate(
-                    mu_dx[None, None], size=(H, W),
-                    mode='bilinear', align_corners=False)[0, 0]
-                mu_dy = F_nn.interpolate(
-                    mu_dy[None, None], size=(H, W),
-                    mode='bilinear', align_corners=False)[0, 0]
-        # Mu divergence threshold: cosine similarity between mu prediction
-        # and direction from walk point to GT center. Below this = stop.
-        # cos(45°)=0.707, cos(60°)=0.5, cos(90°)=0
-        mu_cos_thresh = 0.5  # stop if mu points >60° away from GT center
+    #     # Precompute mu components for consistency check
+    #     mu_dx = None
+    #     mu_dy = None
+    #     if mu_map is not None:
+    #         mu_dx = mu_map[0]  # (H_m, W_m)
+    #         mu_dy = mu_map[1]
+    #         if mu_dx.shape[0] != H or mu_dx.shape[1] != W:
+    #             mu_dx = F_nn.interpolate(
+    #                 mu_dx[None, None], size=(H, W),
+    #                 mode='bilinear', align_corners=False)[0, 0]
+    #             mu_dy = F_nn.interpolate(
+    #                 mu_dy[None, None], size=(H, W),
+    #                 mode='bilinear', align_corners=False)[0, 0]
+    #     # Mu divergence threshold: cosine similarity between mu prediction
+    #     # and direction from walk point to GT center. Below this = stop.
+    #     # cos(45°)=0.707, cos(60°)=0.5, cos(90°)=0
+    #     mu_cos_thresh = 0.5  # stop if mu points >60° away from GT center
 
-        # Use original_center (annotation) for mu consistency check,
-        # not the potentially refined center_point_gt
-        if original_center is not None:
-            orig_ctr_feat = original_center / stride
-        else:
-            orig_ctr_feat = center_point_gt_feat
+    #     # Use original_center (annotation) for mu consistency check,
+    #     # not the potentially refined center_point_gt
+    #     if original_center is not None:
+    #         orig_ctr_feat = original_center / stride
+    #     else:
+    #         orig_ctr_feat = center_point_gt_feat
 
-        if first_axis_range is not None:
-            first_axis_range = first_axis_range / stride
+    #     if first_axis_range is not None:
+    #         first_axis_range = first_axis_range / stride
 
-        for i in range(num_gts):
-            ctr = center_point_gt_feat[i]
-            eigvec_i = eigvec_norm[i]
-            is_same_class = is_nearest_same_class[i]
-            nearest_gt_point_i = nearest_gt_point[i] / stride
-            direction = nearest_gt_point_i - ctr
-            direction_norm = direction / torch.norm(direction)
-            distance = torch.abs((direction * eigvec_i).sum())
-            if not is_secondary:
-                valid_dup_remove = torch.abs(
-                    (direction_norm * eigvec_i).sum()) > 0.866
-            else:
-                valid_dup_remove = torch.abs(
-                    (direction_norm * eigvec_i).sum()) > 0.5
+    #     for i in range(num_gts):
+    #         ctr = center_point_gt_feat[i]
+    #         eigvec_i = eigvec_norm[i]
+    #         is_same_class = is_nearest_same_class[i]
+    #         nearest_gt_point_i = nearest_gt_point[i] / stride
+    #         direction = nearest_gt_point_i - ctr
+    #         direction_norm = direction / torch.norm(direction)
+    #         distance = torch.abs((direction * eigvec_i).sum())
+    #         if not is_secondary:
+    #             valid_dup_remove = torch.abs(
+    #                 (direction_norm * eigvec_i).sum()) > 0.866
+    #         else:
+    #             valid_dup_remove = torch.abs(
+    #                 (direction_norm * eigvec_i).sum()) > 0.5
 
-            # Directional sigma at GT center for threshold modulation
-            # Project sigma vector onto walk direction:
-            # sigma_dir = |eigvec_x| * sigma_dx + |eigvec_y| * sigma_dy
-            sigma_center_dir = None
-            abs_ex = abs(eigvec_i[0].item())
-            abs_ey = abs(eigvec_i[1].item())
-            if sigma_dx is not None:
-                cy = int(ctr[1].clamp(0, H - 1).item())
-                cx = int(ctr[0].clamp(0, W - 1).item())
-                sigma_center_dir = max(
-                    abs_ex * sigma_dx[cy, cx].item() +
-                    abs_ey * sigma_dy[cy, cx].item(), 1e-6)
+    #         # Directional sigma at GT center for threshold modulation
+    #         # Project sigma vector onto walk direction:
+    #         # sigma_dir = |eigvec_x| * sigma_dx + |eigvec_y| * sigma_dy
+    #         sigma_center_dir = None
+    #         abs_ex = abs(eigvec_i[0].item())
+    #         abs_ey = abs(eigvec_i[1].item())
+    #         if sigma_dx is not None:
+    #             cy = int(ctr[1].clamp(0, H - 1).item())
+    #             cx = int(ctr[0].clamp(0, W - 1).item())
+    #             sigma_center_dir = max(
+    #                 abs_ex * sigma_dx[cy, cx].item() +
+    #                 abs_ey * sigma_dy[cy, cx].item(), 1e-6)
 
-            base_thresh = self.thresh3[gt_labels[i]]
+    #         base_thresh = self.thresh3[gt_labels[i]]
 
-            # Original GT center in feature coords for mu consistency
-            orig_ctr_i = orig_ctr_feat[i]
+    #         # Original GT center in feature coords for mu consistency
+    #         orig_ctr_i = orig_ctr_feat[i]
 
-            # Walk forward
-            for j in range(default_max_length):
-                point = (ctr + j * eigvec_i).round().long()
-                if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
-                    top_bottom[i, 0] = j
-                    break
-                # Bidirectional sigma-modulated threshold
-                # neutral_sigma = sigma_center * sigma_neutral (a "typical boundary" level)
-                # ratio = sigma_walk / neutral_sigma
-                #   ratio < 1 (clearer than neutral) → lower thresh → expand
-                #   ratio > 1 (more uncertain)       → raise thresh → shrink
-                if sigma_center_dir is not None:
-                    s_dir = (abs_ex * sigma_dx[point[1], point[0]].item() +
-                             abs_ey * sigma_dy[point[1], point[0]].item())
-                    neutral_sigma = sigma_center_dir * self.sigma_neutral
-                    ratio = s_dir / neutral_sigma
-                    eff_thresh = base_thresh * (ratio ** self.sigma_power)
-                    eff_thresh = max(min(eff_thresh, 0.9), base_thresh * 0.3)
-                else:
-                    eff_thresh = base_thresh
-                if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < eff_thresh:
-                    top_bottom[i, 0] = j
-                    break
-                # Sigma spike stopping: sudden uncertainty increase = boundary
-                if sigma_center_dir is not None and j >= 3:
-                    if ratio > self.sigma_spike_thresh:
-                        top_bottom[i, 0] = j
-                        break
-                # Mu consistency: check if mu at walk point still points
-                # toward our GT center (cosine similarity with direction to GT)
-                if mu_dx is not None and j > 2:
-                    mu_x = mu_dx[point[1], point[0]]
-                    mu_y = mu_dy[point[1], point[0]]
-                    # Direction from walk point to GT center
-                    dir_x = orig_ctr_i[0] - point[0].float()
-                    dir_y = orig_ctr_i[1] - point[1].float()
-                    dir_norm = (dir_x ** 2 + dir_y ** 2).sqrt().clamp(min=1e-6)
-                    mu_norm = (mu_x ** 2 + mu_y ** 2).sqrt().clamp(min=1e-6)
-                    cos_sim = (mu_x * dir_x + mu_y * dir_y) / (mu_norm * dir_norm)
-                    if cos_sim < mu_cos_thresh:
-                        top_bottom[i, 0] = j
-                        break
-                if valid_dup_remove:
-                    if is_same_class and j > 0.5 * distance:
-                        top_bottom[i, 0] = j
-                        break
-                if first_axis_range is not None:
-                    if j > 0.6 * first_axis_range[i]:
-                        top_bottom[i, 0] = j
-                        break
+    #         # Walk forward
+    #         for j in range(default_max_length):
+    #             point = (ctr + j * eigvec_i).round().long()
+    #             if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
+    #                 top_bottom[i, 0] = j
+    #                 break
+    #             # Bidirectional sigma-modulated threshold
+    #             # neutral_sigma = sigma_center * sigma_neutral (a "typical boundary" level)
+    #             # ratio = sigma_walk / neutral_sigma
+    #             #   ratio < 1 (clearer than neutral) → lower thresh → expand
+    #             #   ratio > 1 (more uncertain)       → raise thresh → shrink
+    #             if sigma_center_dir is not None:
+    #                 s_dir = (abs_ex * sigma_dx[point[1], point[0]].item() +
+    #                          abs_ey * sigma_dy[point[1], point[0]].item())
+    #                 neutral_sigma = sigma_center_dir * self.sigma_neutral
+    #                 ratio = s_dir / neutral_sigma
+    #                 eff_thresh = base_thresh * (ratio ** self.sigma_power)
+    #                 eff_thresh = max(min(eff_thresh, 0.9), base_thresh * 0.3)
+    #             else:
+    #                 eff_thresh = base_thresh
+    #             if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < eff_thresh:
+    #                 top_bottom[i, 0] = j
+    #                 break
+    #             # Sigma spike stopping: sudden uncertainty increase = boundary
+    #             if sigma_center_dir is not None and j >= 3:
+    #                 if ratio > self.sigma_spike_thresh:
+    #                     top_bottom[i, 0] = j
+    #                     break
+    #             # Mu consistency: check if mu at walk point still points
+    #             # toward our GT center (cosine similarity with direction to GT)
+    #             if mu_dx is not None and j > 2:
+    #                 mu_x = mu_dx[point[1], point[0]]
+    #                 mu_y = mu_dy[point[1], point[0]]
+    #                 # Direction from walk point to GT center
+    #                 dir_x = orig_ctr_i[0] - point[0].float()
+    #                 dir_y = orig_ctr_i[1] - point[1].float()
+    #                 dir_norm = (dir_x ** 2 + dir_y ** 2).sqrt().clamp(min=1e-6)
+    #                 mu_norm = (mu_x ** 2 + mu_y ** 2).sqrt().clamp(min=1e-6)
+    #                 cos_sim = (mu_x * dir_x + mu_y * dir_y) / (mu_norm * dir_norm)
+    #                 if cos_sim < mu_cos_thresh:
+    #                     top_bottom[i, 0] = j
+    #                     break
+    #             if valid_dup_remove:
+    #                 if is_same_class and j > 0.5 * distance:
+    #                     top_bottom[i, 0] = j
+    #                     break
+    #             if first_axis_range is not None:
+    #                 if j > 0.6 * first_axis_range[i]:
+    #                     top_bottom[i, 0] = j
+    #                     break
 
-            # Walk backward
-            for j in range(default_max_length):
-                point = (ctr - j * eigvec_i).round().long()
-                if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
-                    top_bottom[i, 1] = j
-                    break
-                if sigma_center_dir is not None:
-                    s_dir = (abs_ex * sigma_dx[point[1], point[0]].item() +
-                             abs_ey * sigma_dy[point[1], point[0]].item())
-                    neutral_sigma = sigma_center_dir * self.sigma_neutral
-                    ratio = s_dir / neutral_sigma
-                    eff_thresh = base_thresh * (ratio ** self.sigma_power)
-                    eff_thresh = max(min(eff_thresh, 0.9), base_thresh * 0.3)
-                else:
-                    eff_thresh = base_thresh
-                if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < eff_thresh:
-                    top_bottom[i, 1] = j
-                    break
-                # Sigma spike stopping (backward)
-                if sigma_center_dir is not None and j >= 3:
-                    if ratio > self.sigma_spike_thresh:
-                        top_bottom[i, 1] = j
-                        break
-                # Mu consistency check (backward) — cosine direction
-                if mu_dx is not None and j > 2:
-                    mu_x = mu_dx[point[1], point[0]]
-                    mu_y = mu_dy[point[1], point[0]]
-                    dir_x = orig_ctr_i[0] - point[0].float()
-                    dir_y = orig_ctr_i[1] - point[1].float()
-                    dir_norm = (dir_x ** 2 + dir_y ** 2).sqrt().clamp(min=1e-6)
-                    mu_norm = (mu_x ** 2 + mu_y ** 2).sqrt().clamp(min=1e-6)
-                    cos_sim = (mu_x * dir_x + mu_y * dir_y) / (mu_norm * dir_norm)
-                    if cos_sim < mu_cos_thresh:
-                        top_bottom[i, 1] = j
-                        break
-                if is_secondary and valid_dup_remove:
-                    if is_same_class and j > 0.5 * distance:
-                        top_bottom[i, 0] = j - 1
-                        break
-                if first_axis_range is not None:
-                    if j > 0.6 * first_axis_range[i]:
-                        top_bottom[i, 0] = j
-                        break
+    #         # Walk backward
+    #         for j in range(default_max_length):
+    #             point = (ctr - j * eigvec_i).round().long()
+    #             if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
+    #                 top_bottom[i, 1] = j
+    #                 break
+    #             if sigma_center_dir is not None:
+    #                 s_dir = (abs_ex * sigma_dx[point[1], point[0]].item() +
+    #                          abs_ey * sigma_dy[point[1], point[0]].item())
+    #                 neutral_sigma = sigma_center_dir * self.sigma_neutral
+    #                 ratio = s_dir / neutral_sigma
+    #                 eff_thresh = base_thresh * (ratio ** self.sigma_power)
+    #                 eff_thresh = max(min(eff_thresh, 0.9), base_thresh * 0.3)
+    #             else:
+    #                 eff_thresh = base_thresh
+    #             if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < eff_thresh:
+    #                 top_bottom[i, 1] = j
+    #                 break
+    #             # Sigma spike stopping (backward)
+    #             if sigma_center_dir is not None and j >= 3:
+    #                 if ratio > self.sigma_spike_thresh:
+    #                     top_bottom[i, 1] = j
+    #                     break
+    #             # Mu consistency check (backward) — cosine direction
+    #             if mu_dx is not None and j > 2:
+    #                 mu_x = mu_dx[point[1], point[0]]
+    #                 mu_y = mu_dy[point[1], point[0]]
+    #                 dir_x = orig_ctr_i[0] - point[0].float()
+    #                 dir_y = orig_ctr_i[1] - point[1].float()
+    #                 dir_norm = (dir_x ** 2 + dir_y ** 2).sqrt().clamp(min=1e-6)
+    #                 mu_norm = (mu_x ** 2 + mu_y ** 2).sqrt().clamp(min=1e-6)
+    #                 cos_sim = (mu_x * dir_x + mu_y * dir_y) / (mu_norm * dir_norm)
+    #                 if cos_sim < mu_cos_thresh:
+    #                     top_bottom[i, 1] = j
+    #                     break
+    #             if is_secondary and valid_dup_remove:
+    #                 if is_same_class and j > 0.5 * distance:
+    #                     top_bottom[i, 0] = j - 1
+    #                     break
+    #             if first_axis_range is not None:
+    #                 if j > 0.6 * first_axis_range[i]:
+    #                     top_bottom[i, 0] = j
+    #                     break
 
-        return top_bottom[:, 0], top_bottom[:, 1]
+    #     return top_bottom[:, 0], top_bottom[:, 1]
