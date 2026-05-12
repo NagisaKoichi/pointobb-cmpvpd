@@ -1,18 +1,14 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """CPMVPDHead: CPM Head with Point-Supervised Variational Inference.
 
-Center-only latent: z = (delta_x, delta_y) per anchor point.
-No w/h prediction — point supervision has no box size signal.
+Sigma-only variant: network predicts per-point uncertainty (log_sx, log_sy).
+No center offset (mu) branch and no w/h regression.
 
-Posterior: q_phi(z|f,p) = N(mu_phi, diag(sigma_phi^2))   (2-dim)
-Prior:     p_psi(z|p_i, N_i) = N(0, sigma_c^2 I)         (point-conditioned)
+Network output:
+    conv_sigma (2 channels): (log_sx, log_sy)
 
-Network output (two separate conv heads):
-    conv_reg   (2 channels): (delta_x, delta_y)   -- posterior mean mu_phi
-    conv_sigma (2 channels): (log_sx, log_sy)      -- posterior log-std
-
-Inference: center = anchor + (delta_x, delta_y) * stride
-           w = h = kNN_distance (placeholder), angle = 0
+Inference: center = anchor point
+           w = h = stride proxy (placeholder), angle = 0
 """
 
 import torch
@@ -43,10 +39,9 @@ class CPMVPDHead(CPMHead):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Dense spatial supervision for mu and sigma (configurable via train_cfg)
+        # Dense spatial supervision for sigma (configurable via train_cfg)
         train_cfg = kwargs.get('train_cfg', {})
         self.dense_radius = train_cfg.get('dense_radius', 8) if train_cfg else 8
-        self.lambda_mu_dense = train_cfg.get('lambda_mu_dense', 1.0) if train_cfg else 1.0
         self.lambda_sigma_dense = train_cfg.get('lambda_sigma_dense', 1.0) if train_cfg else 1.0
         self.sigma_min_target = train_cfg.get('sigma_min_target', 1.0) if train_cfg else 1.0
         self.sigma_max_target = train_cfg.get('sigma_max_target', 4.0) if train_cfg else 4.0
@@ -70,15 +65,10 @@ class CPMVPDHead(CPMHead):
         self.freeze_base = train_cfg.get('freeze_base', False) if train_cfg else False
 
     def _init_predictor(self):
-        """Separate heads for mu (conv_reg) and sigma (sigma_convs + conv_sigma).
-
-        sigma has its own 2-layer conv tower so its gradients don't interfere
-        with the shared reg_convs used by mu.
-        """
+        """Sigma-only head (sigma_convs + conv_sigma)."""
         super()._init_predictor()
-        self.conv_reg = nn.Conv2d(self.feat_channels, 2, 3, padding=1)
 
-        # Independent sigma feature tower (2 layers, lighter than 4-layer reg)
+        # Independent sigma feature tower (2 layers).
         self.sigma_convs = nn.ModuleList()
         for i in range(2):
             chn = self.in_channels if i == 0 else self.feat_channels
@@ -91,7 +81,7 @@ class CPMVPDHead(CPMHead):
         """Forward for a single FPN level.
 
         Returns (cls_score, bbox_pred, centerness).
-        bbox_pred: (B, 4, H, W)  — [0:2]=mu, [2:4]=log_sigma
+        bbox_pred: (B, 2, H, W)  — [0:2]=log_sigma
         """
         cls_score, _, cls_feat, reg_feat = \
             super(RotatedAnchorFreeHead, self).forward_single(x)
@@ -101,15 +91,11 @@ class CPMVPDHead(CPMHead):
         else:
             centerness = self.conv_centerness(cls_feat)
 
-        bbox_mu = scale(self.conv_reg(reg_feat).float())    # (B, 2, H, W)
-
-        # Sigma uses its own tower from raw FPN features (x), not reg_feat
+        # Sigma uses its own tower from raw FPN features (x), not reg_feat.
         sigma_feat = x
         for conv in self.sigma_convs:
             sigma_feat = conv(sigma_feat)
-        bbox_log_sigma = self.conv_sigma(sigma_feat).float()  # (B, 2, H, W)
-
-        bbox_pred = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (B, 4, H, W)
+        bbox_pred = self.conv_sigma(sigma_feat).float()  # (B, 2, H, W)
         return cls_score, bbox_pred, centerness
 
     # ------------------------------------------------------------------
@@ -232,12 +218,10 @@ class CPMVPDHead(CPMHead):
         return Image.fromarray(blended.astype(np.uint8))
 
     def draw_image(self, img_path, flip, score_probs, bbox_pred):
-        """Visualize CPM class mask + mu + sigma during training.
+        """Visualize CPM class mask + sigma during training.
 
         Outputs per iteration directory:
             {thr}.jpg        — CPM class mask
-            mu_dx.jpg        — predicted x-offset heatmap (diverging)
-            mu_dy.jpg        — predicted y-offset heatmap (diverging)
             sigma_dx.jpg     — x uncertainty heatmap
             sigma_dy.jpg     — y uncertainty heatmap
             sigma_center.jpg — combined center uncertainty
@@ -246,7 +230,7 @@ class CPMVPDHead(CPMHead):
             img_path (str): Original image path.
             flip (str or None): Flip direction.
             score_probs (Tensor): (C, H, W) sigmoid class scores.
-            bbox_pred (Tensor): (4, H, W) — [0:2]=mu, [2:4]=log_sigma.
+            bbox_pred (Tensor): (2, H, W) — [0:2]=log_sigma.
         """
         H, W = score_probs.shape[1:]
         out_dir = os.path.join(self.store_dir, 'visualize', str(self.iter))
@@ -262,14 +246,8 @@ class CPMVPDHead(CPMHead):
                 max_probs, max_indices, thr, flip, img_A, H)
             combined.save(os.path.join(out_dir, f'{thr}.jpg'))
 
-        # ── Mu maps (signed offset, diverging colormap) ──
-        mu = bbox_pred[0:2].detach().cpu().numpy()  # (2, H, W)
-        for ch, name in enumerate(['mu_dx', 'mu_dy']):
-            hm = self._mu_to_heatmap(mu[ch], img_np, flip)
-            hm.save(os.path.join(out_dir, f'{name}.jpg'))
-
         # ── Sigma maps ──
-        log_sigma = bbox_pred[2:4]
+        log_sigma = bbox_pred[0:2]
         sigma = log_sigma.exp().detach().cpu().numpy()  # (2, H, W)
         for ch, name in enumerate(['sigma_dx', 'sigma_dy']):
             hm = self._sigma_to_heatmap(sigma[ch], img_np, flip)
@@ -292,20 +270,16 @@ class CPMVPDHead(CPMHead):
 
         # ── Dump statistics for debugging ──
         stats = (
-            f"mu_dx:  min={mu[0].min():.4f} max={mu[0].max():.4f} "
-            f"mean={mu[0].mean():.4f} std={mu[0].std():.4f}\n"
-            f"mu_dy:  min={mu[1].min():.4f} max={mu[1].max():.4f} "
-            f"mean={mu[1].mean():.4f} std={mu[1].std():.4f}\n"
             f"sigma_dx: min={sigma[0].min():.4f} max={sigma[0].max():.4f} "
             f"mean={sigma[0].mean():.4f} std={sigma[0].std():.4f}\n"
             f"sigma_dy: min={sigma[1].min():.4f} max={sigma[1].max():.4f} "
             f"mean={sigma[1].mean():.4f} std={sigma[1].std():.4f}\n"
-            f"log_sigma_dx: min={bbox_pred[2].min().item():.4f} "
-            f"max={bbox_pred[2].max().item():.4f} "
-            f"std={bbox_pred[2].std().item():.4f}\n"
-            f"log_sigma_dy: min={bbox_pred[3].min().item():.4f} "
-            f"max={bbox_pred[3].max().item():.4f} "
-            f"std={bbox_pred[3].std().item():.4f}\n"
+            f"log_sigma_dx: min={bbox_pred[0].min().item():.4f} "
+            f"max={bbox_pred[0].max().item():.4f} "
+            f"std={bbox_pred[0].std().item():.4f}\n"
+            f"log_sigma_dy: min={bbox_pred[1].min().item():.4f} "
+            f"max={bbox_pred[1].max().item():.4f} "
+            f"std={bbox_pred[1].std().item():.4f}\n"
         )
         with open(os.path.join(out_dir, 'stats.txt'), 'w') as f:
             f.write(stats)
@@ -320,22 +294,6 @@ class CPMVPDHead(CPMHead):
         elif flip == 'diagonal':
             return arr[::-1, ::-1].copy()
         return arr
-
-    @staticmethod
-    def _mu_to_heatmap(mu_hw, img_np, flip):
-        """(H, W) signed mu → overlay heatmap (blue=negative, red=positive)."""
-        import cv2
-        mu_hw = CPMVPDHead._undo_flip(mu_hw, flip)
-
-        # Symmetric normalisation around 0
-        amax = max(float(np.abs(mu_hw).max()), 1e-6)
-        norm = np.clip((mu_hw + amax) / (2 * amax), 0, 1)  # [0, 1], 0.5 = zero
-        norm_u8 = (norm * 255).astype(np.uint8)
-        hm_bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_COOL)
-        hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
-        blended = (img_np.astype(np.float32) * 0.4
-                   + hm_rgb.astype(np.float32) * 0.6).astype(np.uint8)
-        return Image.fromarray(blended)
 
     @staticmethod
     def _sigma_to_heatmap(sigma_hw, img_np, flip):
@@ -361,7 +319,7 @@ class CPMVPDHead(CPMHead):
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def loss(self, cls_scores, bbox_preds, centernesses,
              gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
-        """Compute loss: cls + dense mu/sigma."""
+        """Compute loss: cls + dense sigma."""
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         import torch.nn.functional as F
 
@@ -389,7 +347,7 @@ class CPMVPDHead(CPMHead):
             ct.permute(0, 2, 3, 1).reshape(-1)
             for ct in centernesses]).sigmoid()
         flatten_bbox_preds = torch.cat([
-            bp.permute(0, 2, 3, 1).reshape(-1, 4)
+            bp.permute(0, 2, 3, 1).reshape(-1, 2)
             for bp in bbox_preds])
         flatten_labels = torch.cat(labels)
         flatten_points = torch.cat(
@@ -419,16 +377,14 @@ class CPMVPDHead(CPMHead):
             flatten_labels[avail_inds],
             avg_factor=num_avail)
 
-        # ── Dense mu & sigma losses (all points, per-image) ─────────
+        # ── Dense sigma loss (all points, per-image) ─────────
         P = flatten_points.shape[0]
-        all_mu = flatten_bbox_preds[:, :2]           # (P, 2)
-        all_log_sigma = flatten_bbox_preds[:, 2:]    # (P, 2)
+        all_log_sigma = flatten_bbox_preds            # (P, 2)
 
-        # Per-point: nearest GT center, distance, and offset target
+        # Per-point: nearest GT center and nearest-neighbor distances.
         # Computed in no_grad to save memory (these are fixed targets)
         d_nearest = torch.full((P,), float('inf'), device=flatten_points.device)
         d_second = torch.full((P,), float('inf'), device=flatten_points.device)
-        gt_delta_dense = torch.zeros(P, 2, device=flatten_points.device)
 
         with torch.no_grad():
             for img_id in range(num_imgs):
@@ -437,16 +393,14 @@ class CPMVPDHead(CPMHead):
                 if gt_c.shape[0] == 0:
                     continue
                 pts = flatten_points[img_mask]                     # (P_i, 2)
-                strides_i = flatten_strides[img_mask].unsqueeze(1) # (P_i, 1)
 
                 # Chunked cdist to limit peak memory
                 chunk_size = 4096
                 pts_chunks = pts.split(chunk_size, dim=0)
-                strides_chunks = strides_i.split(chunk_size, dim=0)
                 idx_start = 0
                 inds = img_mask.nonzero(as_tuple=False).squeeze(1)
 
-                for pts_c, strides_c in zip(pts_chunks, strides_chunks):
+                for pts_c in pts_chunks:
                     n = pts_c.shape[0]
                     dists_c = torch.cdist(pts_c, gt_c)        # (n, M_i)
                     sl = inds[idx_start:idx_start + n]
@@ -458,24 +412,10 @@ class CPMVPDHead(CPMHead):
                     else:
                         d_nearest[sl] = dists_c[:, 0]
 
-                    min_idx = dists_c.argmin(dim=1)
-                    nearest_gt = gt_c[min_idx]
-                    gt_delta_dense[sl] = (nearest_gt - pts_c) / strides_c
-
                     idx_start += n
                     del dists_c  # free immediately
 
-        # Mu: weighted SmoothL1 within dense_radius (stride units)
         d_norm = d_nearest / flatten_strides                   # (P,)
-        mu_weight = (1.0 - d_norm / self.dense_radius).clamp(min=0)  # (P,)
-        # Weighted element-wise SmoothL1
-        mu_loss_per_pt = F.smooth_l1_loss(
-            all_mu, gt_delta_dense.detach(),
-            reduction='none', beta=0.5)                        # (P, 2)
-        mu_loss_weighted = (mu_loss_per_pt * mu_weight.unsqueeze(1)).sum() \
-            / max(mu_weight.sum(), 1.0)
-        loss_mu_dense = self.lambda_mu_dense * mu_loss_weighted
-
         if self.sigma_supervision_mode == 'legacy':
             # Sigma: distance-based target with boundary ambiguity boost
             # ambiguity = d_nearest / d_second ∈ [0, 1];  ≈1 at boundary, ≈0 near GT
@@ -531,7 +471,6 @@ class CPMVPDHead(CPMHead):
 
         return dict(
             loss_cls=loss_cls,
-            loss_mu_dense=loss_mu_dense,
             loss_sigma_dense=loss_sigma_dense,
         )
 
@@ -542,7 +481,7 @@ class CPMVPDHead(CPMHead):
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def get_bboxes(self, cls_scores, bbox_preds, centernesses,
                    img_metas, cfg=None, rescale=None):
-        """Inference: decode center, use placeholder w/h, apply NMS."""
+        """Inference: use anchor point as center, apply NMS."""
         cfg = cfg or self.test_cfg
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         num_levels = len(cls_scores)
@@ -566,7 +505,6 @@ class CPMVPDHead(CPMHead):
 
                 cls_score = cls_score.permute(1, 2, 0).reshape(
                     -1, self.cls_out_channels)
-                bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
                 centerness = centerness.reshape(-1).sigmoid()
 
                 scores = cls_score.sigmoid() * centerness[:, None]
@@ -577,16 +515,11 @@ class CPMVPDHead(CPMHead):
                 _, topk_inds = max_scores.topk(nms_pre)
 
                 points = points[topk_inds]
-                pred_delta = bbox_pred[topk_inds, :2]
                 scores = scores[topk_inds]
 
-                # Decode center
-                if self.norm_on_bbox:
-                    cx = points[:, 0] + pred_delta[:, 0] * stride
-                    cy = points[:, 1] + pred_delta[:, 1] * stride
-                else:
-                    cx = points[:, 0] + pred_delta[:, 0]
-                    cy = points[:, 1] + pred_delta[:, 1]
+                # Sigma-only head: center equals anchor point.
+                cx = points[:, 0]
+                cy = points[:, 1]
 
                 # Placeholder w/h: use stride as a rough size proxy
                 w = torch.full_like(cx, stride * 4.0)

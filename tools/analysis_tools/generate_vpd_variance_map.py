@@ -219,13 +219,20 @@ def _save_maps_for_image(img_path,
                          alpha_uncert,
                          prob_smooth_ksize,
                          prob_local_contrast):
-    # Channels 0:2 are posterior center mean for (x, y).
-    mu = torch.nan_to_num(bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
-    center_mu = mu[0:2].mean(dim=0)
+    # New sigma-only head outputs 2 channels [log_sigma_x, log_sigma_y].
+    # Keep compatibility with old 4-channel checkpoints [mu_x, mu_y, log_sx, log_sy].
+    num_bbox_channels = int(bbox_pred_lvl.shape[0])
+    if num_bbox_channels == 2:
+        log_sigma = bbox_pred_lvl[0:2]
+    elif num_bbox_channels >= 4:
+        log_sigma = bbox_pred_lvl[2:4]
+    else:
+        raise ValueError(
+            f'Unsupported bbox_pred channels: {num_bbox_channels}. '
+            'Expected 2 (sigma-only) or >=4 (legacy format).')
 
-    # Channels 2:4 are center log_sigma for (x, y).
-    log_sigma = bbox_pred_lvl[2:4]
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+    center_lstd = lstd.mean(dim=0)
 
     std = lstd.exp()
     center_std = std.mean(dim=0)
@@ -307,7 +314,7 @@ def _save_maps_for_image(img_path,
             bg_std_scale=bg_std_scale)
         remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
 
-    center_mu_img = _to_heatmap(center_mu, flip_direction)
+    center_lstd_img = _to_heatmap(center_lstd, flip_direction)
     center_std_img = _to_heatmap(center_std, flip_direction)
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
     max_cls_img = _to_heatmap(max_class_prob, flip_direction)
@@ -321,7 +328,7 @@ def _save_maps_for_image(img_path,
 
     merged.paste(base_img, (0, 0))
     merged.paste(center_std_img, (cell_w, 0))
-    merged.paste(center_mu_img, (cell_w * 2, 0))
+    merged.paste(center_lstd_img, (cell_w * 2, 0))
 
     merged.paste(centerness_img, (0, cell_h))
     merged.paste(max_cls_img, (cell_w, cell_h))
@@ -331,7 +338,7 @@ def _save_maps_for_image(img_path,
 
     mean_merged = Image.new('RGB', (cell_w * 2, cell_h))
     mean_merged.paste(base_img, (0, 0))
-    mean_merged.paste(center_mu_img, (cell_w, 0))
+    mean_merged.paste(center_lstd_img, (cell_w, 0))
     mean_merged.save(out_mean_path)
 
     remapped_img.save(out_remap_path)

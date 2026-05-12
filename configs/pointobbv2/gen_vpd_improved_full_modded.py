@@ -56,12 +56,29 @@ model = dict(
     train_cfg=dict(store_dir=store_dir, cls_weight=1.0,
         thresh3=[0.03,0.04,0.1,0.01,0.10,0.06,0.08,0.02,0.01,0.03,0.005,0.02,0.05,0.1,0.015],
         pca_length=28,
-        store_ann_dir='/media/ps/passport2/zlk/datasets/DOTAv10pseudolabel_vpd_improved_pca28/',
+        store_ann_dir='/media/ps/passport2/zlk/results/frozen_vpd_v3/pseudo_labels_pca_07b_ep3',
         multiple_factor=1/4,
         sigma_power=1.0,
         sigma_spike_thresh=2.0,
-        sigma_pca=True,
-        mu_refine_radius=0),
+        sigma_pca=False,
+        mu_refine_radius=0,
+        remap_use=True,
+        remap_use_gt_guided=False,
+        remap_sigma_scale=0.5,
+        remap_min_sigma=1.0,
+        remap_max_sigma=20.0,
+        remap_score_thr=0.04,
+        remap_topk=0,
+        remap_bg_std_scale=1.5,
+        remap_cls_floor=0.01,
+        remap_cls_gamma=1.0,
+        remap_uncert_q_lo=0.01,
+        remap_uncert_q_hi=0.30,
+        remap_uncert_gamma=1.5,
+        remap_alpha_cls=1.0,
+        remap_alpha_uncert=0.0,
+        remap_prob_smooth_ksize=3,
+        remap_prob_local_contrast=0.30),
     test_cfg=dict(store_dir=store_dir, nms_pre=2000, min_bbox_size=0,
         score_thr=0.05, nms=dict(iou_thr=0.1), max_per_img=2000))
 find_unused_parameters = True
@@ -70,4 +87,4 @@ lr_config = dict(_delete_=True, policy='step', warmup='linear',
     warmup_iters=500, warmup_ratio=1.0/3, step=[4])
 evaluation = dict(interval=3, metric='mAP')
 optimizer = dict(lr=0.0)
-load_from = 'work_dirs/frozen_vpd_v2/epoch_1.pth'
+load_from = 'work_dirs/frozen_vpd_v2/epoch_3.pth'

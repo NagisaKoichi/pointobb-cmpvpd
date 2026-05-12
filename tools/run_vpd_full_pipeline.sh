@@ -17,6 +17,7 @@ set -euo pipefail
 #   ENABLE_FROZEN_V3_FINETUNE=True ./tools/run_vpd_full_pipeline.sh
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK_DIR_GLOBAL="${WORK_DIR_GLOBAL:-/media/ps/passport2/zlk/}"
 
 # -----------------------------
 # User-configurable parameters
@@ -32,9 +33,10 @@ CFG_STAGE2="${CFG_STAGE2:-${REPO_ROOT}/configs/pointobbv2/generate_pseudo_label_
 CFG_STAGE3="${CFG_STAGE3:-${REPO_ROOT}/configs/pointobbv2/redet_dotav10.py}"
 CFG_STAGE1P5="${CFG_STAGE1P5:-${REPO_ROOT}/configs/pointobbv2/train_cpm_vpd_frozen_v3.py}"
 
-WORK_DIR_STAGE1="${WORK_DIR_STAGE1:-${REPO_ROOT}/work_dirs/vpd_cpm_dotav10}"
+NAME="${NAME:-default_exp}"
+WORK_DIR_STAGE1="${WORK_DIR_STAGE1:-${WORK_DIR_GLOBAL}/results/${NAME}/vpd_cpm_dotav10}"
 WORK_DIR_STAGE1P5="${WORK_DIR_STAGE1P5:-${WORK_DIR_STAGE1}/frozen_v3_finetune}"
-WORK_DIR_STAGE3="${WORK_DIR_STAGE3:-${REPO_ROOT}/work_dirs/redet_dotav10_vpd}"
+WORK_DIR_STAGE3="${WORK_DIR_STAGE3:-${WORK_DIR_GLOBAL}/results/${NAME}/redet_dotav10_vpd}"
 
 # Stage-2 pseudo label directory.
 # Keep trailing slash for writer path because code concatenates file names directly.
