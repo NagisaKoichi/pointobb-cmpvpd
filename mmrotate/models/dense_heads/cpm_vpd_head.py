@@ -1,19 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 """CPMVPDHead: CPM Head with Point-Supervised Variational Inference.
 
-Sigma-only variant: network predicts per-point uncertainty (log_sx, log_sy).
-No center offset (mu) branch and no w/h regression.
+Latent variable z = (delta_x, delta_y) per anchor point.
+Posterior: q_phi(z|f,p) = N(mu_phi, diag(sigma_phi^2))
+Prior:     p_psi(z|p_i, N_i) = N(mu_psi, diag(sigma_psi^2))  [point-conditioned]
 
-Network output:
-    conv_sigma (2 channels): (log_sx, log_sy)
-
-Inference: center = anchor point
-           w = h = stride proxy (placeholder), angle = 0
+Network output (conv_reg, 4 channels):
+    [0:2] = (delta_x, delta_y)  -- posterior mean mu_phi
+    [2:4] = (log_sx, log_sy)    -- posterior log-std
 """
 
 import torch
 import torch.nn as nn
-from mmcv.cnn import ConvModule
 import numpy as np
 import os
 from PIL import Image
@@ -21,7 +19,7 @@ from mmcv.runner import force_fp32
 from mmdet.core import multi_apply, reduce_mean
 
 from mmrotate.core import multiclass_nms_rotated
-from ..builder import ROTATED_HEADS
+from ..builder import ROTATED_HEADS, build_loss
 from .cpm_head import CPMHead
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
 
@@ -30,58 +28,70 @@ INF = 1e8
 
 @ROTATED_HEADS.register_module()
 class CPMVPDHead(CPMHead):
-    """CPM Head with Point-Supervised VPD (center-only, no w/h).
+    """CPM Head with Point-Supervised Variational Inference.
+
+    Predicts a Gaussian posterior q_phi(z|f,p) over the latent proposal state
+    z = (delta_x, delta_y, log_w, log_h), regularized by a point-conditioned
+    prior p_psi(z|p_i, N_i) constructed from GT point annotation geometry.
 
     Args:
         warmup_iters (int): Iterations for KL warm-up. Default: 2000.
+        num_samples (int): Number of samples for inference refinement. Default: 10.
+        use_refinement (bool): Use sampling-based bbox refinement at test time.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args,
+                 warmup_iters=2000,
+                 num_samples=10,
+                 use_refinement=False,
+                 **kwargs):
+        self.warmup_iters = warmup_iters
+        self.num_samples = num_samples
+        self.use_refinement = use_refinement
         super().__init__(*args, **kwargs)
 
-        # Dense spatial supervision for sigma (configurable via train_cfg)
-        train_cfg = kwargs.get('train_cfg', {})
-        self.dense_radius = train_cfg.get('dense_radius', 8) if train_cfg else 8
-        self.lambda_sigma_dense = train_cfg.get('lambda_sigma_dense', 1.0) if train_cfg else 1.0
-        self.sigma_min_target = train_cfg.get('sigma_min_target', 1.0) if train_cfg else 1.0
-        self.sigma_max_target = train_cfg.get('sigma_max_target', 4.0) if train_cfg else 4.0
-        self.ambiguity_weight = train_cfg.get('ambiguity_weight', 2.0) if train_cfg else 2.0
+        train_cfg = kwargs.get('train_cfg') or {}
+        test_cfg = kwargs.get('test_cfg') or {}
+        if 'warmup_iters' in train_cfg:
+            self.warmup_iters = train_cfg['warmup_iters']
+        if 'num_samples' in test_cfg:
+            self.num_samples = test_cfg['num_samples']
+        if 'use_refinement' in test_cfg:
+            self.use_refinement = test_cfg['use_refinement']
+        self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
 
-        # Sigma supervision mode for ablation:
-        #  - legacy: distance-based target (existing behavior)
-        #  - feature_guided: geometry + feature foreground fusion target
-        self.sigma_supervision_mode = train_cfg.get(
-            'sigma_supervision_mode', 'legacy') if train_cfg else 'legacy'
-        self.fg_inner_radius = train_cfg.get('fg_inner_radius', 4.0) if train_cfg else 4.0
-        self.fg_transition = train_cfg.get('fg_transition', 1.5) if train_cfg else 1.5
-        self.fg_cls_thr = train_cfg.get('fg_cls_thr', 0.25) if train_cfg else 0.25
-        self.fg_logit_scale = train_cfg.get('fg_logit_scale', 12.0) if train_cfg else 12.0
-        self.fg_geo_weight = train_cfg.get('fg_geo_weight', 0.7) if train_cfg else 0.7
-        self.fg_detach = train_cfg.get('fg_detach', True) if train_cfg else True
-        self.sigma_fg_target = train_cfg.get('sigma_fg_target', 1.0) if train_cfg else 1.0
-        self.sigma_bg_target = train_cfg.get('sigma_bg_target', 4.0) if train_cfg else 4.0
+        self.visualize_variance_map = bool(
+            train_cfg.get('visualize_variance_map', False))
+        if self.visualize_variance_map and self.store_dir:
+            os.makedirs(os.path.join(self.store_dir, 'variance_map'), exist_ok=True)
 
-        # Freeze base model (backbone/FPN/cls/reg_convs), only train mu+sigma
-        self.freeze_base = train_cfg.get('freeze_base', False) if train_cfg else False
+        self.loss_vpd = build_loss(dict(
+            type='PointSupervisedVPDLoss',
+            lambda_center=1.0,
+            lambda_kl=0.1,
+            lambda_kl_warmup=0.02,
+            lambda_var=0.01,
+            lambda_var_warmup=0.002,
+            warmup_iters=self.warmup_iters,
+        ))
 
     def _init_predictor(self):
-        """Sigma-only head (sigma_convs + conv_sigma)."""
-        super()._init_predictor()
+        """Override predictor: conv_reg outputs 4 channels (2 mu + 2 log_sigma).
 
-        # Independent sigma feature tower (2 layers).
-        self.sigma_convs = nn.ModuleList()
-        for i in range(2):
-            chn = self.in_channels if i == 0 else self.feat_channels
-            self.sigma_convs.append(
-                ConvModule(chn, self.feat_channels, 3, stride=1, padding=1,
-                           norm_cfg=self.norm_cfg, bias=self.conv_bias))
-        self.conv_sigma = nn.Conv2d(self.feat_channels, 2, 3, padding=1)
+        _init_predictor is called last in _init_layers, after _init_reg_convs,
+        so overriding here prevents the base class from re-creating a 4-ch conv_reg.
+        """
+        super()._init_predictor()
+        # Replace conv_reg with 4-channel version:
+        # (delta_x, delta_y, log_sx, log_sy)
+        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)
 
     def forward_single(self, x, scale, stride):
-        """Forward for a single FPN level.
+        """Forward for a single FPN level. Returns (cls_score, bbox_pred, centerness).
 
-        Returns (cls_score, bbox_pred, centerness).
-        bbox_pred: (B, 2, H, W)  — [0:2]=log_sigma
+        bbox_pred: (N, 4, H, W)
+            [:, 0:2] = posterior mean (delta_x, delta_y)
+            [:, 2:4] = posterior log-std
         """
         cls_score, _, cls_feat, reg_feat = \
             super(RotatedAnchorFreeHead, self).forward_single(x)
@@ -91,20 +101,73 @@ class CPMVPDHead(CPMHead):
         else:
             centerness = self.conv_centerness(cls_feat)
 
-        # Sigma uses its own tower from raw FPN features (x), not reg_feat.
-        sigma_feat = x
-        for conv in self.sigma_convs:
-            sigma_feat = conv(sigma_feat)
-        bbox_pred = self.conv_sigma(sigma_feat).float()  # (B, 2, H, W)
-        return cls_score, bbox_pred, centerness
+        bbox_dist = self.conv_reg(reg_feat).float()  # (N, 4, H, W)
+
+        # Mean: scale center offsets only.
+        bbox_mu = scale(bbox_dist[:, :2])   # (N, 2, H, W)
+        bbox_log_sigma = bbox_dist[:, 2:]   # (N, 2, H, W)
+
+        bbox_pred_full = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (N, 4, H, W)
+        return cls_score, bbox_pred_full, centerness
+
+    def _save_variance_map(self, img_path, flip_direction, bbox_pred_lvl):
+        """Visualize and save center/scale lstd maps from predicted log-std."""
+        if bbox_pred_lvl.dim() != 3 or bbox_pred_lvl.shape[0] < 4:
+            return
+
+        # Channels map to lstd of (x, y).
+        log_sigma = bbox_pred_lvl[2:4]
+        lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        center_lstd = lstd.mean(dim=0)
+
+        def to_heatmap(var_tensor):
+            var_np = var_tensor.detach().cpu().numpy().astype(np.float32)
+            var_min = float(var_np.min())
+            var_max = float(var_np.max())
+            if var_max - var_min < 1e-8:
+                norm = np.zeros_like(var_np, dtype=np.float32)
+            else:
+                norm = (var_np - var_min) / (var_max - var_min)
+
+            # Lightweight blue->cyan->yellow->red colormap without extra deps.
+            heatmap = np.zeros((norm.shape[0], norm.shape[1], 3), dtype=np.uint8)
+            heatmap[..., 0] = np.clip(255.0 * norm, 0, 255).astype(np.uint8)
+            heatmap[..., 1] = np.clip(255.0 * (1.0 - np.abs(2.0 * norm - 1.0)), 0, 255).astype(np.uint8)
+            heatmap[..., 2] = np.clip(255.0 * (1.0 - norm), 0, 255).astype(np.uint8)
+
+            var_img = Image.fromarray(heatmap, mode='RGB')
+            if flip_direction == 'horizontal':
+                var_img = var_img.transpose(Image.FLIP_LEFT_RIGHT)
+            elif flip_direction == 'vertical':
+                var_img = var_img.transpose(Image.FLIP_TOP_BOTTOM)
+            elif flip_direction == 'diagonal':
+                var_img = var_img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
+            return var_img
+
+        center_img = to_heatmap(center_lstd)
+        base_img = Image.open(img_path).convert('RGB')
+        base_img = base_img.resize((center_img.width, center_img.height))
+
+        center_merged = Image.new('RGB', (base_img.width + center_img.width, base_img.height))
+        center_merged.paste(base_img, (0, 0))
+        center_merged.paste(center_img, (base_img.width, 0))
+
+        out_dir = os.path.join(self.store_dir, 'variance_map', str(self.iter))
+        os.makedirs(out_dir, exist_ok=True)
+        center_merged.save(os.path.join(out_dir, 'center_lstd.jpg'))
 
     # ------------------------------------------------------------------
-    # Label assignment
+    # Label assignment: override _get_target_single to also return gt_ids
     # ------------------------------------------------------------------
 
     def _get_target_single_vpd(self, gt_bboxes, gt_labels, points,
                                 regress_ranges, num_points_per_lvl):
-        """Assign labels + gt_ids per feature point."""
+        """Like CPMHead._get_target_single but also returns gt_instance_ids.
+
+        gt_instance_ids[i] = index into gt_bboxes for positive point i,
+                             -1 for ignored/negative points.
+        """
         alpha = self.alpha
         thresh1 = self.thresh1
         num_points = points.size(0)
@@ -120,7 +183,7 @@ class CPMVPDHead(CPMHead):
             return (gt_labels.new_full((num_points,), self.num_classes),
                     gt_ids)
 
-        dist_sample_and_gt = torch.cdist(points, center_point_gt)
+        dist_sample_and_gt = torch.cdist(points, center_point_gt)  # (P, G)
         dist_gt_and_gt = (torch.cdist(center_point_gt, center_point_gt)
                           + torch.eye(num_gts, device=dist_sample_and_gt.device) * INF)
         dist_min_gt_and_gt, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
@@ -133,11 +196,13 @@ class CPMVPDHead(CPMHead):
             labels[index_neg] = self.num_classes
             return labels, gt_ids
 
+        # Negative labels
         index_neg = ((alpha * dist_sample_and_gt) > dist_min_gt_and_gt).all(
             dim=1).nonzero().squeeze(-1)
         if len(index_neg) > 0:
             labels[index_neg] = self.num_classes
 
+        # Positive labels
         thresh1_tensor = thresh1 * torch.ones_like(dist_min_gt_and_gt)
         dist_min_thresh1_gt = torch.min(dist_min_gt_and_gt / 2, thresh1_tensor)
         index_pos = (dist_sample_and_gt < dist_min_thresh1_gt).nonzero()
@@ -145,6 +210,7 @@ class CPMVPDHead(CPMHead):
             labels[index_pos[:, 0]] = gt_labels[index_pos[:, 1]]
             gt_ids[index_pos[:, 0]] = index_pos[:, 1].long()
 
+        # Additional background labels (midpoints between same-class neighbors)
         is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels)
         valid_middle_point = (
             center_point_gt[is_nearest_same_class]
@@ -158,7 +224,12 @@ class CPMVPDHead(CPMHead):
         return labels, gt_ids
 
     def get_targets_vpd(self, points, gt_bboxes_list, gt_labels_list):
-        """Return per-level labels and gt_ids."""
+        """Like CPMHead.get_targets but also returns per-point gt_instance_ids.
+
+        Returns:
+            concat_lvl_labels (list[Tensor]): Per-level class labels.
+            concat_lvl_gt_ids (list[Tensor]): Per-level GT instance index (-1=ignore/neg).
+        """
         assert len(points) == len(self.regress_ranges)
         num_levels = len(points)
         expanded_regress_ranges = [
@@ -170,11 +241,13 @@ class CPMVPDHead(CPMHead):
 
         labels_list, gt_ids_list = multi_apply(
             self._get_target_single_vpd,
-            gt_bboxes_list, gt_labels_list,
+            gt_bboxes_list,
+            gt_labels_list,
             points=concat_points,
             regress_ranges=concat_regress_ranges,
             num_points_per_lvl=num_points)
 
+        # Split per-level
         labels_list = [labels.split(num_points, 0) for labels in labels_list]
         gt_ids_list = [gt_ids.split(num_points, 0) for gt_ids in gt_ids_list]
 
@@ -189,180 +262,63 @@ class CPMVPDHead(CPMHead):
         return concat_lvl_labels, concat_lvl_gt_ids
 
     # ------------------------------------------------------------------
-    # Visualization
-    # ------------------------------------------------------------------
-
-    def _draw_image(self, max_probs, max_indices, thr, img_flip_direction,
-                    img_A, num_width):
-        """Override: overlay class mask on image instead of side-by-side."""
-        mask_rgb = self.get_mask_image(max_probs, max_indices, thr, num_width)
-
-        # Undo augmentation flip on mask
-        mask_pil = Image.fromarray(mask_rgb)
-        if img_flip_direction == 'horizontal':
-            mask_pil = mask_pil.transpose(Image.FLIP_LEFT_RIGHT)
-        elif img_flip_direction == 'vertical':
-            mask_pil = mask_pil.transpose(Image.FLIP_TOP_BOTTOM)
-        elif img_flip_direction == 'diagonal':
-            mask_pil = mask_pil.transpose(Image.FLIP_TOP_BOTTOM) \
-                               .transpose(Image.FLIP_LEFT_RIGHT)
-        mask_np = np.array(mask_pil)
-
-        img_np = np.array(img_A).astype(np.float32)
-        mask_f = mask_np.astype(np.float32)
-
-        # White pixels (255,255,255) = no detection → show original image
-        is_active = ~np.all(mask_np == 255, axis=-1)   # (H, W) bool
-        alpha = np.where(is_active, 0.6, 0.0)[..., None]
-        blended = img_np * (1.0 - alpha) + mask_f * alpha
-        return Image.fromarray(blended.astype(np.uint8))
-
-    def draw_image(self, img_path, flip, score_probs, bbox_pred):
-        """Visualize CPM class mask + sigma during training.
-
-        Outputs per iteration directory:
-            {thr}.jpg        — CPM class mask
-            sigma_dx.jpg     — x uncertainty heatmap
-            sigma_dy.jpg     — y uncertainty heatmap
-            sigma_center.jpg — combined center uncertainty
-
-        Args:
-            img_path (str): Original image path.
-            flip (str or None): Flip direction.
-            score_probs (Tensor): (C, H, W) sigmoid class scores.
-            bbox_pred (Tensor): (2, H, W) — [0:2]=log_sigma.
-        """
-        H, W = score_probs.shape[1:]
-        out_dir = os.path.join(self.store_dir, 'visualize', str(self.iter))
-        os.makedirs(out_dir, exist_ok=True)
-
-        img_A = Image.open(img_path).convert('RGB').resize((W, H))
-        img_np = np.array(img_A)
-
-        # ── CPM class mask ──
-        max_probs, max_indices = torch.max(score_probs, dim=0)
-        for thr in [0.01, 0.03, 0.05, 0.08, 0.1, 0.15]:
-            combined = self._draw_image(
-                max_probs, max_indices, thr, flip, img_A, H)
-            combined.save(os.path.join(out_dir, f'{thr}.jpg'))
-
-        # ── Sigma maps ──
-        log_sigma = bbox_pred[0:2]
-        sigma = log_sigma.exp().detach().cpu().numpy()  # (2, H, W)
-        for ch, name in enumerate(['sigma_dx', 'sigma_dy']):
-            hm = self._sigma_to_heatmap(sigma[ch], img_np, flip)
-            hm.save(os.path.join(out_dir, f'{name}.jpg'))
-
-        center_unc = np.sqrt(sigma[0] ** 2 + sigma[1] ** 2)
-        hm = self._sigma_to_heatmap(center_unc, img_np, flip)
-        hm.save(os.path.join(out_dir, 'sigma_center.jpg'))
-
-        # ── Center uncertainty (clean, no background image) ──
-        import cv2
-        center_unc_flipped = self._undo_flip(center_unc, flip)
-        vmin = float(np.percentile(center_unc_flipped, 2))
-        vmax = float(np.percentile(center_unc_flipped, 98))
-        vmax = max(vmax, vmin + 1e-6)
-        norm = np.clip((center_unc_flipped - vmin) / (vmax - vmin), 0, 1)
-        norm_u8 = (norm * 255).astype(np.uint8)
-        hm_bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_MAGMA)
-        cv2.imwrite(os.path.join(out_dir, 'sigma_center_clean.jpg'), hm_bgr)
-
-        # ── Dump statistics for debugging ──
-        stats = (
-            f"sigma_dx: min={sigma[0].min():.4f} max={sigma[0].max():.4f} "
-            f"mean={sigma[0].mean():.4f} std={sigma[0].std():.4f}\n"
-            f"sigma_dy: min={sigma[1].min():.4f} max={sigma[1].max():.4f} "
-            f"mean={sigma[1].mean():.4f} std={sigma[1].std():.4f}\n"
-            f"log_sigma_dx: min={bbox_pred[0].min().item():.4f} "
-            f"max={bbox_pred[0].max().item():.4f} "
-            f"std={bbox_pred[0].std().item():.4f}\n"
-            f"log_sigma_dy: min={bbox_pred[1].min().item():.4f} "
-            f"max={bbox_pred[1].max().item():.4f} "
-            f"std={bbox_pred[1].std().item():.4f}\n"
-        )
-        with open(os.path.join(out_dir, 'stats.txt'), 'w') as f:
-            f.write(stats)
-
-    @staticmethod
-    def _undo_flip(arr, flip):
-        """Undo data-augmentation flip on a (H, W) numpy array."""
-        if flip == 'horizontal':
-            return arr[:, ::-1].copy()
-        elif flip == 'vertical':
-            return arr[::-1, :].copy()
-        elif flip == 'diagonal':
-            return arr[::-1, ::-1].copy()
-        return arr
-
-    @staticmethod
-    def _sigma_to_heatmap(sigma_hw, img_np, flip):
-        """(H, W) sigma → overlay heatmap on original image."""
-        import cv2
-        sigma_hw = CPMVPDHead._undo_flip(sigma_hw, flip)
-
-        vmin = float(np.percentile(sigma_hw, 2))
-        vmax = float(np.percentile(sigma_hw, 98))
-        vmax = max(vmax, vmin + 1e-6)
-        norm = np.clip((sigma_hw - vmin) / (vmax - vmin), 0, 1)
-        norm_u8 = (norm * 255).astype(np.uint8)
-        hm_bgr = cv2.applyColorMap(norm_u8, cv2.COLORMAP_MAGMA)
-        hm_rgb = cv2.cvtColor(hm_bgr, cv2.COLOR_BGR2RGB)
-        blended = (img_np.astype(np.float32) * 0.4
-                   + hm_rgb.astype(np.float32) * 0.6).astype(np.uint8)
-        return Image.fromarray(blended)
-
-    # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def loss(self, cls_scores, bbox_preds, centernesses,
              gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
-        """Compute loss: cls + dense sigma."""
+        """Compute ELBO loss for point-supervised VPD."""
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
-        import torch.nn.functional as F
 
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
             featmap_sizes, dtype=bbox_preds[0].dtype,
             device=bbox_preds[0].device)
 
-        labels, _ = self.get_targets_vpd(
+        # Label assignment with GT instance IDs
+        labels, gt_ids = self.get_targets_vpd(
             all_level_points, gt_bboxes, gt_labels)
 
         if self.visualize and self.store_dir and self.iter % self.train_duration == 0:
             self.draw_image(img_metas[0]['filename'],
                             img_metas[0].get('flip_direction'),
-                            cls_scores[0][0].sigmoid(),
-                            bbox_preds[0][0])
+                            cls_scores[0][0].sigmoid())
+        if self.visualize_variance_map and self.store_dir and self.iter % self.train_duration == 0:
+            self._save_variance_map(
+                img_metas[0]['filename'],
+                img_metas[0].get('flip_direction'),
+                bbox_preds[0][0])
         self.iter += 1
 
         num_imgs = cls_scores[0].size(0)
 
+        # Flatten predictions, also build per-point stride for coord conversion
         flatten_cls_scores = torch.cat([
             cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
             for cs in cls_scores])
-        flatten_centerness = torch.cat([
-            ct.permute(0, 2, 3, 1).reshape(-1)
-            for ct in centernesses]).sigmoid()
         flatten_bbox_preds = torch.cat([
-            bp.permute(0, 2, 3, 1).reshape(-1, 2)
+            bp.permute(0, 2, 3, 1).reshape(-1, 4)
             for bp in bbox_preds])
         flatten_labels = torch.cat(labels)
+        flatten_gt_ids = torch.cat(gt_ids)
         flatten_points = torch.cat(
             [pts.repeat(num_imgs, 1) for pts in all_level_points])
+
+        # Per-point stride (for converting norm_on_bbox predictions to pixel space)
         flatten_strides = torch.cat([
             bbox_preds[0].new_full((num_imgs * pts.shape[0],), s)
             for pts, s in zip(all_level_points, self.strides)])
 
+        # Which image does each flattened sample belong to?
+        # flatten order: for each level, all images are stacked
+        # i.e. [img0_lvl0..., img1_lvl0..., img0_lvl1..., img1_lvl1...]
         num_pts_per_lvl = [pts.shape[0] for pts in all_level_points]
         img_ids = torch.cat([
             torch.arange(num_imgs, dtype=torch.long,
                          device=bbox_preds[0].device).repeat_interleave(n_pts)
             for n_pts in num_pts_per_lvl])
 
-        # ── Classification loss (unchanged) ──────────────────────────
         bg_class_ind = self.num_classes
         avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
         pos_inds = ((flatten_labels >= 0) &
@@ -372,117 +328,104 @@ class CPMVPDHead(CPMHead):
             len(avail_inds), dtype=torch.float,
             device=bbox_preds[0].device)), 1.0)
 
+        # Classification loss
         loss_cls = self.loss_cls(
             flatten_cls_scores[avail_inds],
             flatten_labels[avail_inds],
             avg_factor=num_avail)
+        loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # ── Dense sigma loss (all points, per-image) ─────────
-        P = flatten_points.shape[0]
-        all_log_sigma = flatten_bbox_preds            # (P, 2)
+        # VPD loss on positive samples
+        if len(pos_inds) == 0:
+            zero = flatten_bbox_preds.sum() * 0.0
+            return dict(
+                loss_cls=loss_cls,
+                loss_vpd=zero,
+                vpd_center=zero.detach(),
+                vpd_kl=zero.detach(),
+                vpd_var=zero.detach())
 
-        # Per-point: nearest GT center and nearest-neighbor distances.
-        # Computed in no_grad to save memory (these are fixed targets)
-        d_nearest = torch.full((P,), float('inf'), device=flatten_points.device)
-        d_second = torch.full((P,), float('inf'), device=flatten_points.device)
+        pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 4)
+        pos_points = flatten_points[pos_inds]           # (Np, 2)
+        pos_img_ids = img_ids[pos_inds]                 # (Np,)
+        pos_gt_ids = flatten_gt_ids[pos_inds]           # (Np,) -- index into per-img gt
+        pos_strides = flatten_strides[pos_inds]         # (Np,)
 
-        with torch.no_grad():
-            for img_id in range(num_imgs):
-                img_mask = (img_ids == img_id)
-                gt_c = gt_bboxes[img_id][:, :2]
-                if gt_c.shape[0] == 0:
-                    continue
-                pts = flatten_points[img_mask]                     # (P_i, 2)
+        bbox_mu = pos_bbox_preds[:, :2]        # (Np, 2)
+        bbox_log_sigma = pos_bbox_preds[:, 2:] # (Np, 2)
 
-                # Chunked cdist to limit peak memory
-                chunk_size = 4096
-                pts_chunks = pts.split(chunk_size, dim=0)
-                idx_start = 0
-                inds = img_mask.nonzero(as_tuple=False).squeeze(1)
+        # Build matched gt_centers per positive sample (image coords)
+        gt_centers_per_pos = torch.zeros(
+            len(pos_inds), 2, device=bbox_preds[0].device)
+        for img_id in range(num_imgs):
+            mask = (pos_img_ids == img_id)
+            if not mask.any():
+                continue
+            gt_center_this = gt_bboxes[img_id][:, :2]  # (num_gt_i, 2)
+            ids_this = pos_gt_ids[mask]
+            gt_centers_per_pos[mask] = gt_center_this[ids_this]
 
-                for pts_c in pts_chunks:
-                    n = pts_c.shape[0]
-                    dists_c = torch.cdist(pts_c, gt_c)        # (n, M_i)
-                    sl = inds[idx_start:idx_start + n]
+        # GT centers list for kNN prior (image coords, one entry per image)
+        gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes]
 
-                    if gt_c.shape[0] >= 2:
-                        top2, _ = dists_c.topk(2, dim=1, largest=False)
-                        d_nearest[sl] = top2[:, 0]
-                        d_second[sl] = top2[:, 1]
-                    else:
-                        d_nearest[sl] = dists_c[:, 0]
+        vpd_losses = self.loss_vpd(
+            bbox_mu=bbox_mu,
+            bbox_log_sigma=bbox_log_sigma,
+            pos_points=pos_points,
+            pos_strides=pos_strides,
+            gt_centers=gt_centers_per_pos,
+            gt_centers_list=gt_centers_list,
+            cur_iter=self.iter,
+        )
 
-                    idx_start += n
-                    del dists_c  # free immediately
-
-        d_norm = d_nearest / flatten_strides                   # (P,)
-        if self.sigma_supervision_mode == 'legacy':
-            # Sigma: distance-based target with boundary ambiguity boost
-            # ambiguity = d_nearest / d_second ∈ [0, 1];  ≈1 at boundary, ≈0 near GT
-            # When d_second is inf (single GT), ambiguity = 0 (no boost)
-            ambiguity = torch.where(
-                d_second.isinf(),
-                torch.zeros_like(d_nearest),
-                (d_nearest / d_second.clamp(min=1e-6)).clamp(max=1.0))
-            sigma_target = d_norm.clamp(min=self.sigma_min_target) \
-                * (1.0 + self.ambiguity_weight * ambiguity)
-            sigma_target = sigma_target.clamp(max=self.sigma_max_target)
-            log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
-
-            # Weight sigma loss: linear decay like mu, but wider radius to cover
-            # the full transition from GT center to background.
-            sigma_radius = self.dense_radius * 1.5  # 12 stride units
-            sigma_weight = (1.0 - d_norm / sigma_radius).clamp(min=0)  # (P,)
-        elif self.sigma_supervision_mode == 'feature_guided':
-            # Geometric mask keeps point-centric prior, feature mask injects
-            # semantic extent from cls/centerness predictions.
-            transition = max(float(self.fg_transition), 1e-6)
-            fg_geo = torch.sigmoid((self.fg_inner_radius - d_norm) / transition)
-
-            cls_prob = flatten_cls_scores.sigmoid().max(dim=1).values
-            fg_feat_score = cls_prob * flatten_centerness
-            if self.fg_detach:
-                fg_feat_score = fg_feat_score.detach()
-            fg_feat = torch.sigmoid(
-                self.fg_logit_scale * (fg_feat_score - self.fg_cls_thr))
-
-            geo_w = float(self.fg_geo_weight)
-            geo_w = min(max(geo_w, 0.0), 1.0)
-            fg_mask = geo_w * fg_geo + (1.0 - geo_w) * fg_feat
-
-            sigma_target = fg_mask * self.sigma_fg_target + \
-                (1.0 - fg_mask) * self.sigma_bg_target
-            sigma_target = sigma_target.clamp(
-                min=self.sigma_min_target, max=self.sigma_max_target)
-            log_sigma_target = sigma_target.log().unsqueeze(1).expand(-1, 2)
-
-            # Keep mild global supervision while emphasizing confident foreground.
-            sigma_weight = 0.5 + 0.5 * fg_mask
-        else:
-            raise ValueError(
-                f'Unsupported sigma_supervision_mode: {self.sigma_supervision_mode}')
-
-        sigma_loss_per_pt = F.smooth_l1_loss(
-            all_log_sigma, log_sigma_target.detach(),
-            reduction='none', beta=1.0)                        # (P, 2)
-        loss_sigma_dense = self.lambda_sigma_dense * \
-            (sigma_loss_per_pt * sigma_weight.unsqueeze(1)).sum() \
-            / max(sigma_weight.sum(), 1.0)
+        loss_vpd = torch.nan_to_num(
+            vpd_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
 
         return dict(
             loss_cls=loss_cls,
-            loss_sigma_dense=loss_sigma_dense,
+            loss_vpd=loss_vpd,
+            vpd_center=vpd_losses['loss_center'].detach(),
+            vpd_kl=vpd_losses['loss_kl'].detach(),
+            vpd_var=vpd_losses['loss_var'].detach(),
         )
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
 
+    def _decode_bbox_from_mu(self, points, bbox_mu, stride):
+        """Decode posterior mean to absolute box (cx, cy, w, h, angle=0).
+
+        bbox_mu = (delta_x, delta_y) in feature-map units.
+        Width/height are set to one stride as a fallback for xy-only heads.
+
+        Returns:
+            Tensor: (N, 5) rotated box (cx, cy, w, h, angle) with angle=0.
+        """
+        dx = bbox_mu[:, 0]
+        dy = bbox_mu[:, 1]
+
+        if self.norm_on_bbox:
+            cx = points[:, 0] + dx * stride
+            cy = points[:, 1] + dy * stride
+        else:
+            cx = points[:, 0] + dx
+            cy = points[:, 1] + dy
+
+        w = torch.full_like(cx, float(stride))
+        h = torch.full_like(cy, float(stride))
+
+        angle = torch.zeros_like(cx)
+        return torch.stack([cx, cy, w, h, angle], dim=1)  # (N, 5)
+
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def get_bboxes(self, cls_scores, bbox_preds, centernesses,
                    img_metas, cfg=None, rescale=None):
-        """Inference: use anchor point as center, apply NMS."""
-        cfg = cfg or self.test_cfg
+        """Inference: decode posterior mean, apply NMS."""
+        cfg = self.test_cfg if cfg is None else cfg
+        if cfg is None:
+            raise ValueError('Test config is missing. Please set model.test_cfg or pass cfg to get_bboxes.')
+
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         num_levels = len(cls_scores)
 
@@ -498,35 +441,59 @@ class CPMVPDHead(CPMHead):
 
             for lvl_idx in range(num_levels):
                 stride = self.strides[lvl_idx]
-                cls_score = cls_scores[lvl_idx][img_id]
+                cls_score = cls_scores[lvl_idx][img_id]  # (C, H, W)
                 bbox_pred = bbox_preds[lvl_idx][img_id]  # (4, H, W)
-                centerness = centernesses[lvl_idx][img_id]
-                points = mlvl_points[lvl_idx]
+                centerness = centernesses[lvl_idx][img_id]  # (1, H, W)
+                points = mlvl_points[lvl_idx]              # (H*W, 2)
 
-                cls_score = cls_score.permute(1, 2, 0).reshape(
-                    -1, self.cls_out_channels)
-                centerness = centerness.reshape(-1).sigmoid()
+                # Flatten
+                bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
+                if self.use_remap_score:
+                    # Remap max class probability by center mean offsets (dx, dy).
+                    # Score at (y, x) reads max prob from (y + dy, x + dx).
+                    cls_prob_map = cls_score.sigmoid()  # (C, H, W)
+                    max_prob_map, _ = cls_prob_map.max(dim=0)  # (H, W)
 
-                scores = cls_score.sigmoid() * centerness[:, None]
+                    dx_map = bbox_preds[lvl_idx][img_id][0]
+                    dy_map = bbox_preds[lvl_idx][img_id][1]
+                    h, w = max_prob_map.shape
+                    yy, xx = torch.meshgrid(
+                        torch.arange(h, device=max_prob_map.device, dtype=dx_map.dtype),
+                        torch.arange(w, device=max_prob_map.device, dtype=dx_map.dtype),
+                        indexing='ij')
+                    new_x = torch.round(xx + dx_map).long().clamp(0, w - 1)
+                    new_y = torch.round(yy + dy_map).long().clamp(0, h - 1)
+                    remapped_max_prob = max_prob_map[new_y, new_x]
 
+                    remap_scale = remapped_max_prob / (max_prob_map + 1e-6)
+                    remap_scale = torch.nan_to_num(remap_scale, nan=0.0, posinf=1e4, neginf=0.0)
+                    score_map = cls_prob_map * remap_scale.unsqueeze(0)
+                    scores = score_map.permute(1, 2, 0).reshape(-1, self.cls_out_channels)
+                else:
+                    cls_score = cls_score.permute(1, 2, 0).reshape(-1, self.cls_out_channels)
+                    centerness = centerness.reshape(-1).sigmoid()
+                    scores = cls_score.sigmoid()
+                    scores = scores * centerness[:, None]
+
+                # Top-k selection
                 nms_pre = cfg.get('nms_pre', 2000) if cfg else 2000
-                nms_pre = min(nms_pre, scores.shape[0])
                 max_scores, _ = scores.max(dim=1)
+                nms_pre = min(nms_pre, scores.shape[0])
                 _, topk_inds = max_scores.topk(nms_pre)
 
                 points = points[topk_inds]
+                bbox_mu = bbox_pred[topk_inds, :2]  # use center mean only
                 scores = scores[topk_inds]
 
-                # Sigma-only head: center equals anchor point.
-                cx = points[:, 0]
-                cy = points[:, 1]
+                # Optionally sample multiple times for refinement
+                if self.use_refinement:
+                    bbox_log_sigma = bbox_pred[topk_inds, 2:]
+                    bbox_std = bbox_log_sigma.exp()
+                    samples = [bbox_mu + bbox_std * torch.randn_like(bbox_mu)
+                               for _ in range(self.num_samples)]
+                    bbox_mu = torch.stack(samples, dim=0).mean(dim=0)
 
-                # Placeholder w/h: use stride as a rough size proxy
-                w = torch.full_like(cx, stride * 4.0)
-                h = torch.full_like(cy, stride * 4.0)
-                angle = torch.zeros_like(cx)
-
-                decoded = torch.stack([cx, cy, w, h, angle], dim=1)
+                decoded = self._decode_bbox_from_mu(points, bbox_mu, stride)
                 mlvl_bboxes.append(decoded)
                 mlvl_scores.append(scores)
 
@@ -546,5 +513,6 @@ class CPMVPDHead(CPMHead):
         return result_list
 
     def get_targets(self, points, gt_bboxes_list, gt_labels_list):
+        """Delegate to parent CPMHead.get_targets (used by base class calls)."""
         return super(CPMVPDHead, self).get_targets(
             points, gt_bboxes_list, gt_labels_list)

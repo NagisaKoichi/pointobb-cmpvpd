@@ -18,7 +18,9 @@ from mmrotate.datasets import build_dataset
 from mmrotate.models import build_detector
 from mmrotate.utils import compat_cfg, get_device, setup_multi_processes
 from segment_variance_map import (build_gt_guided_remap_map,
-                                  build_gt_guided_segmentation_mask)
+                                  build_gt_guided_segmentation_mask,
+                                  _extract_center_and_size,
+                                  _infer_image_shape)
 
 
 def parse_args():
@@ -124,8 +126,8 @@ def parse_args():
         help='local contrast factor beta in p <- max(p - beta*avgpool(p), 0)')
     parser.add_argument(
         '--remap-output-mode',
-        default='variance',
-        choices=['variance', 'mask'],
+        default='gt_guided',
+        # choices=['variance', 'mask'],
         help='output processed variance map or GT-instance segmentation mask')
     parser.add_argument(
         '--gpu-id',
@@ -219,23 +221,24 @@ def _save_maps_for_image(img_path,
                          alpha_uncert,
                          prob_smooth_ksize,
                          prob_local_contrast):
-    # New sigma-only head outputs 2 channels [log_sigma_x, log_sigma_y].
     # Keep compatibility with old 4-channel checkpoints [mu_x, mu_y, log_sx, log_sy].
     num_bbox_channels = int(bbox_pred_lvl.shape[0])
-    if num_bbox_channels == 2:
-        log_sigma = bbox_pred_lvl[0:2]
-    elif num_bbox_channels >= 4:
-        log_sigma = bbox_pred_lvl[2:4]
-    else:
+    if num_bbox_channels < 4:
         raise ValueError(
             f'Unsupported bbox_pred channels: {num_bbox_channels}. '
-            'Expected 2 (sigma-only) or >=4 (legacy format).')
+            'Mu visualization requires the 4-channel VPD output '
+            '[mu_x, mu_y, log_sx, log_sy].')
+
+    bbox_mu = torch.nan_to_num(
+        bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
+    log_sigma = bbox_pred_lvl[2:4]
 
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
     center_lstd = lstd.mean(dim=0)
 
+    center_mu = bbox_mu.mean(dim=0)
+
     std = lstd.exp()
-    center_std = std.mean(dim=0)
 
     cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
     centerness_lvl = torch.nan_to_num(centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -301,33 +304,100 @@ def _save_maps_for_image(img_path,
         base_img = base_img.resize(remapped_img.size)
         remapped_img = Image.blend(base_img, remapped_img, alpha=0.8)
 
+    elif remap_output_mode == 'gt_guided':
+        # Build remap as distance-from-mapped-position-to-nearest-GT using mu.
+        # bbox_mu: [2, H, W] -> mu_x, mu_y offsets in feature-pixel units.
+        with torch.no_grad():
+            p = probmap
+            h, w = p.shape
+            device = p.device
+            dtype = p.dtype
+
+            remapped_max_prob = build_gt_guided_remap_map(
+                p_model=probmap,
+                gt_bboxes=gt_bboxes,
+                img_meta=img_meta,
+                sigma_scale=sigma_scale,
+                min_sigma=min_sigma,
+                max_sigma=max_sigma,
+                score_thr=seg_score_thr,
+                topk=seg_topk,
+                bg_std_scale=bg_std_scale)
+            remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
+                
+    elif remap_output_mode == 'mu_mask':
+        mu = bbox_mu  # shape [2, H, W]
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=device, dtype=dtype),
+            torch.arange(w, device=device, dtype=dtype),
+            indexing='ij')
+
+        # mapped position in feature coordinates
+        mapped_x = xx + mu[0]
+        mapped_y = yy + mu[1]
+
+        cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)
+        if cx is None:
+            # no GT: produce zero map
+            nearest_dist = torch.zeros_like(mapped_x)
+        else:
+            img_h, img_w = _infer_image_shape(img_meta)
+            sx = float(w) / max(float(img_w), 1.0)  # feature-map to image scaling factor
+            sy = float(h) / max(float(img_h), 1.0)
+
+            cx_f = (cx.to(device=device, dtype=dtype) * sx).view(-1, 1, 1)
+            cy_f = (cy.to(device=device, dtype=dtype) * sy).view(-1, 1, 1)
+
+            # distances: shape [n_gt, H, W]
+            dx2 = (mapped_x.unsqueeze(0) - cx_f)**2
+            dy2 = (mapped_y.unsqueeze(0) - cy_f)**2
+            d2 = dx2 + dy2
+            minvals, minidx = d2.min(dim=0)
+            nearest_dist = torch.sqrt(minvals)
+
+        # Post-process: within 10 units => keep (set mask=1), else background.
+        # Assign pixel to nearest GT index for coloring.
+        # Build label map: -1 background, otherwise gt index.
+        thresh = 5.0
+        label_map = torch.full((h, w), -1, dtype=torch.long, device=device)
+        if cx is not None:
+            keep_mask = nearest_dist <= float(thresh)
+            if keep_mask.any():
+                nearest_idx = minidx.to(torch.long)
+                label_map[keep_mask] = nearest_idx[keep_mask]
+
+        remapped_img = _label_to_color_mask(label_map, flip_direction)
+        # Half-transparent overlay of segmentation mask on original image
+        base_img = Image.open(img_path).convert('RGB')
+        base_img = base_img.resize(remapped_img.size)
+        remapped_img = Image.blend(base_img, remapped_img, alpha=0.8)
+    
+    elif remap_output_mode == 'mu':
+        mu = bbox_mu  # shape [2, H, W]
+        w, h = mu.shape[2], mu.shape[1]
+        reprojected_x = torch.arange(w, device=mu.device, dtype=mu.dtype) + mu[0]
+        reprojected_y = torch.arange(h, device=mu.device, dtype=mu.dtype) + mu[1]
+        reprojected_x = reprojected_x.clamp(0, w - 1)
+        reprojected_y = reprojected_y.clamp(0, h - 1)
+        remapped_img = _to_heatmap(reprojected_x, flip_direction)
+        
     else:
-        remapped_max_prob = build_gt_guided_remap_map(
-            p_model=probmap,
-            gt_bboxes=gt_bboxes,
-            img_meta=img_meta,
-            sigma_scale=sigma_scale,
-            min_sigma=min_sigma,
-            max_sigma=max_sigma,
-            score_thr=seg_score_thr,
-            topk=seg_topk,
-            bg_std_scale=bg_std_scale)
-        remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
+        raise ValueError(f'Unsupported remap_output_mode: {remap_output_mode}')
 
     center_lstd_img = _to_heatmap(center_lstd, flip_direction)
-    center_std_img = _to_heatmap(center_std, flip_direction)
+    center_mu_img = _to_heatmap(center_mu, flip_direction)
     centerness_img = _to_heatmap(centerness_prob, flip_direction)
     max_cls_img = _to_heatmap(max_class_prob, flip_direction)
     combined_img = _to_heatmap(combined_score, flip_direction)
 
     base_img = Image.open(img_path).convert('RGB')
-    base_img = base_img.resize((center_std_img.width, center_std_img.height))
+    base_img = base_img.resize((center_mu_img.width, center_mu_img.height))
 
     cell_w, cell_h = base_img.width, base_img.height
     merged = Image.new('RGB', (cell_w * 3, cell_h * 2))
 
     merged.paste(base_img, (0, 0))
-    merged.paste(center_std_img, (cell_w, 0))
+    merged.paste(center_mu_img, (cell_w, 0))
     merged.paste(center_lstd_img, (cell_w * 2, 0))
 
     merged.paste(centerness_img, (0, cell_h))
@@ -338,7 +408,7 @@ def _save_maps_for_image(img_path,
 
     mean_merged = Image.new('RGB', (cell_w * 2, cell_h))
     mean_merged.paste(base_img, (0, 0))
-    mean_merged.paste(center_lstd_img, (cell_w, 0))
+    mean_merged.paste(center_mu_img, (cell_w, 0))
     mean_merged.save(out_mean_path)
 
     remapped_img.save(out_remap_path)
@@ -387,6 +457,37 @@ def _unwrap_tensor_list(data, key, device):
 
     raise TypeError(f'Unsupported payload type in `{key}`: {type(payload)}')
 
+def _get_variance_cscore_scatter_data_image(bbox_pred_lvl, cls_score_lvl, gt_bboxes, img_meta, flip_direction):
+    # get the (variance, cscore) pairs for all gt centers in an image, for scatter plotting
+    device = cls_score_lvl.device
+    dtype = cls_score_lvl.dtype
+    cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)
+    if cx is None:
+        return None, None
+    img_h, img_w = _infer_image_shape(img_meta)
+    sx = float(cls_score_lvl.shape[2]) / max(float(img_w), 1.0)
+    sy = float(cls_score_lvl.shape[1]) / max(float(img_h), 1.0)
+    cx_f = (cx.to(device=device, dtype=dtype) * sx).view(-1)
+    cy_f = (cy.to(device=device, dtype=dtype) * sy).view(-1)
+        
+    # flip gt centers if image flipped
+    # if flip_direction == 'horizontal':
+    #     cx_f = cls_score_lvl.shape[2] - 1 - cx_f
+    # elif flip_direction == 'vertical':
+    #     cy_f = cls_score_lvl.shape[1] - 1 - cy_f
+    # elif flip_direction == 'diagonal':
+    #     cx_f = cls_score_lvl.shape[2] - 1 - cx_f
+    #     cy_f = cls_score_lvl.shape[1] - 1 - cy_f
+    
+    # gt_cls_scores = cls_score_lvl.softmax(dim=0).max(dim=0)[0]
+    gt_cls_scores = cls_score_lvl.sigmoid().max(dim=0)[0]
+    gt_cls_scores_at_centers = gt_cls_scores[cy_f.long(), cx_f.long()]
+    gt_variance_at_centers = bbox_pred_lvl[2:4, cy_f.long(), cx_f.long()].exp().mean(dim=0)
+    gt_lstd_at_centers = gt_variance_at_centers.sqrt().log()
+    # print(cls_score_lvl.max(), cls_score_lvl.min(), cls_score_lvl.mean())
+    # print(cls_score_lvl.sigmoid[:, cy_f.long(), cx_f.long()])
+        
+    return gt_lstd_at_centers.cpu().numpy(), gt_cls_scores_at_centers.cpu().numpy()
 
 def main():
     args = parse_args()
@@ -454,6 +555,9 @@ def main():
 
     max_images = args.max_images if args.max_images > 0 else len(dataset)
     processed = 0
+    
+    # scatter data
+    scatter_data = []
 
     for data in data_loader:
         if processed >= max_images:
@@ -526,9 +630,32 @@ def main():
                 args.alpha_uncert,
                 args.prob_smooth_ksize,
                 args.prob_local_contrast)
+            
+            # save scatter data
+            variance_at_centers, cscore_at_centers = _get_variance_cscore_scatter_data_image(
+                bbox_pred_lvl ,cls_score_lvl, gt_bboxes, meta, flip_direction)
+            if cscore_at_centers is not None and variance_at_centers is not None:
+                for var, cs in zip(variance_at_centers, cscore_at_centers):
+                    scatter_data.append((var, cs))
 
             processed += 1
             progress.update()
+            
+    # plot scatter data
+    if scatter_data:
+        import matplotlib.pyplot as plt
+        scatter_data = np.array(scatter_data)
+        cs = scatter_data[:, 1]
+        lstd = scatter_data[:, 0]
+        plt.figure(figsize=(8, 6))
+        plt.scatter(lstd, cs, alpha=0.9, s=2)
+        plt.ylabel('Classification Scores')
+        plt.xlabel('lstd')
+        plt.title('Variance vs Classification Score')
+        plt.grid(True)
+        scatter_out_path = osp.join(args.out_dir, '_variance_vs_cscore_scatter.png')
+        plt.savefig(scatter_out_path)
+        print(f'Scatter plot saved to: {scatter_out_path}')
 
     hook_handle.remove()
     print(f'Processed {processed} images. Results saved to: {args.out_dir}')
