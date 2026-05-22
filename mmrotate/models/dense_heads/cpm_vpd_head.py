@@ -48,6 +48,7 @@ class CPMVPDHead(CPMHead):
         self.warmup_iters = warmup_iters
         self.num_samples = num_samples
         self.use_refinement = use_refinement
+        self.num_samples_train = 1
         super().__init__(*args, **kwargs)
 
         train_cfg = kwargs.get('train_cfg') or {}
@@ -58,6 +59,8 @@ class CPMVPDHead(CPMHead):
             self.num_samples = test_cfg['num_samples']
         if 'use_refinement' in test_cfg:
             self.use_refinement = test_cfg['use_refinement']
+        if 'num_samples_train' in train_cfg:
+            self.num_samples_train = train_cfg['num_samples_train']
         self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
 
         self.visualize_variance_map = bool(
@@ -68,10 +71,14 @@ class CPMVPDHead(CPMHead):
         self.loss_vpd = build_loss(dict(
             type='PointSupervisedVPDLoss',
             lambda_center=1.0,
+            # lambda_kl=0.1,
+            # lambda_kl_warmup=0.02,
+            # lambda_var=0.01,
+            # lambda_var_warmup=0.002,
             lambda_kl=0.1,
-            lambda_kl_warmup=0.02,
-            lambda_var=0.01,
-            lambda_var_warmup=0.002,
+            lambda_kl_warmup=0.1,
+            lambda_var=0.1,
+            lambda_var_warmup=0.1,
             warmup_iters=self.warmup_iters,
         ))
 
@@ -376,6 +383,8 @@ class CPMVPDHead(CPMHead):
             gt_centers=gt_centers_per_pos,
             gt_centers_list=gt_centers_list,
             cur_iter=self.iter,
+            pos_img_ids=pos_img_ids,
+            num_samples=self.num_samples_train,
         )
 
         loss_vpd = torch.nan_to_num(
@@ -499,6 +508,8 @@ class CPMVPDHead(CPMHead):
 
             mlvl_bboxes = torch.cat(mlvl_bboxes)
             mlvl_scores = torch.cat(mlvl_scores)
+            padding = mlvl_scores.new_zeros(mlvl_scores.size(0), 1)
+            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
 
             if rescale:
                 scale_factor = mlvl_bboxes.new_tensor(

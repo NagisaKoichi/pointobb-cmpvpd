@@ -104,9 +104,10 @@ model = dict(
         store_dir=store_dir,
         cls_weight=20,              # Classification loss weight
         thresh1=8,                  # Positive sample threshold
-        alpha=0.1,                    # Negative sample coefficient
+        alpha=1,                    # Negative sample coefficient
         use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=1.0,              # VPD loss weight (center + uncertainty + KL)
+        js_weight=1.0,              # VPD loss weight (center + uncertainty + KL) UNUSED
+        num_samples_train=1,
 
         # Stage-1 variance-focused setting: mute mu supervision, amplify sigma.
         lambda_mu_dense=0.0,
@@ -142,4 +143,4 @@ lr_config = dict(
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
 checkpoint_config = dict(interval=1, create_symlink=False)
-optimizer = dict(lr=0.004, momentum=0.9, type='SGD', weight_decay=0.0001)
+optimizer = dict(lr=0.002, momentum=0.9, type='SGD', weight_decay=0.0001)
