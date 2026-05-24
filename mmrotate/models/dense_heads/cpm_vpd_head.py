@@ -61,6 +61,10 @@ class CPMVPDHead(CPMHead):
             self.use_refinement = test_cfg['use_refinement']
         if 'num_samples_train' in train_cfg:
             self.num_samples_train = train_cfg['num_samples_train']
+        self.prior_sigma_source = train_cfg.get('prior_sigma_source', 'cpm')
+        self.prior_sigma_min = float(train_cfg.get('prior_sigma_min', 0.5))
+        self.prior_sigma_max = float(train_cfg.get('prior_sigma_max', 16.0))
+        self.prior_sigma_detach = bool(train_cfg.get('prior_sigma_detach', True))
         self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
 
         self.visualize_variance_map = bool(
@@ -75,12 +79,12 @@ class CPMVPDHead(CPMHead):
             # lambda_kl_warmup=0.02,
             # lambda_var=0.01,
             # lambda_var_warmup=0.002,
-            lambda_kl=0.5,
+            lambda_kl=0.1,
             lambda_kl_warmup=0.1,
             lambda_var=0.0,
             lambda_var_warmup=0.0,
             warmup_iters=self.warmup_iters,
-            use_nll=True,
+            use_nll=False,
         ))
 
     def _init_predictor(self):
@@ -376,6 +380,23 @@ class CPMVPDHead(CPMHead):
         # GT centers list for kNN prior (image coords, one entry per image)
         gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes]
 
+        prior_log_sigma = None
+        if self.prior_sigma_source in ('cpm', 'centerness'):
+            if self.prior_sigma_source == 'centerness':
+                flatten_centerness = torch.cat([
+                    ct.permute(0, 2, 3, 1).reshape(-1)
+                    for ct in centernesses])
+                pos_conf = flatten_centerness[pos_inds].sigmoid()
+            else:
+                pos_conf = flatten_cls_scores[pos_inds].sigmoid().max(dim=1)[0]
+            if self.prior_sigma_detach:
+                pos_conf = pos_conf.detach()
+            pos_conf = pos_conf.clamp(min=0.0, max=1.0)
+            prior_sigma = (self.prior_sigma_min
+                           + (self.prior_sigma_max - self.prior_sigma_min)
+                           * (1.0 - pos_conf))
+            prior_log_sigma = prior_sigma.log().unsqueeze(1).expand(-1, 2)
+
         vpd_losses = self.loss_vpd(
             bbox_mu=bbox_mu,
             bbox_log_sigma=bbox_log_sigma,
@@ -386,6 +407,7 @@ class CPMVPDHead(CPMHead):
             cur_iter=self.iter,
             pos_img_ids=pos_img_ids,
             num_samples=self.num_samples_train,
+            prior_log_sigma=prior_log_sigma,
         )
 
         loss_vpd = torch.nan_to_num(

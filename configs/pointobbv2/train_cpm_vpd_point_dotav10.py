@@ -104,10 +104,15 @@ model = dict(
         store_dir=store_dir,
         cls_weight=20,              # Classification loss weight
         thresh1=8,                  # Positive sample threshold
-        alpha=1,                    # Negative sample coefficient
+        alpha=0.1,                    # Negative sample coefficient
         use_point_supervised=True,  # Enable point-supervised mode
         js_weight=1.0,              # VPD loss weight (center + uncertainty + KL) UNUSED
         num_samples_train=1,
+        # Feature-conditioned prior for sigma: 'cpm' or 'centerness'
+        prior_sigma_source='cpm',
+        prior_sigma_min=0.5,
+        prior_sigma_max=16.0,
+        prior_sigma_detach=True,
 
         # Stage-1 variance-focused setting: mute mu supervision, amplify sigma.
         lambda_mu_dense=0.0,

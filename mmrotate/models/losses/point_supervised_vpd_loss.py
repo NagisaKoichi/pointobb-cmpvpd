@@ -139,7 +139,8 @@ class PointSupervisedVPDLoss(nn.Module):
                 gt_centers_list,
                 cur_iter=0,
                 pos_img_ids=None,
-                num_samples=None):
+                num_samples=None,
+                prior_log_sigma=None):
         """Compute point-supervised VPD loss in stride-normalized space.
 
         Args:
@@ -150,6 +151,8 @@ class PointSupervisedVPDLoss(nn.Module):
             pos_strides (Tensor): Stride per positive sample (N,).
             gt_centers (Tensor): Matched GT center in image coords (N, 2).
             gt_centers_list (list[Tensor]): All GT centers per image in image coords.
+            prior_log_sigma (Tensor | None): Optional prior log-std from features,
+                shape (N, 2). If provided, overrides kNN-based prior.
             cur_iter (int): Current training iteration.
 
         Returns:
@@ -197,46 +200,55 @@ class PointSupervisedVPDLoss(nn.Module):
         # --- Build point-conditioned prior in normalized space ---
         eff_lambda_kl, eff_lambda_var = self._curriculum(cur_iter)
 
-        if pos_img_ids is not None:
-            d_i_norm = pos_strides.new_full((N,), self.prior_delta_max)
-            for img_idx, gt_centers_img in enumerate(gt_centers_list):
-                mask = (pos_img_ids == img_idx)
-                if not mask.any():
-                    continue
-                if gt_centers_img.shape[0] <= 1:
-                    d_i_px = gt_centers.new_full(
-                        (int(mask.sum()),),
-                        pos_strides[mask].float().mean() * self.prior_delta_max)
-                else:
-                    dists_px = torch.cdist(gt_centers[mask], gt_centers_img)  # (n_i, m_i)
-                    dists_px = dists_px + (dists_px < 1e-2).float() * 1e8
-                    k = min(self.knn_k, gt_centers_img.shape[0] - 1)
-                    knn_dists_px, _ = dists_px.topk(k, dim=1, largest=False)
-                    d_i_px = knn_dists_px.mean(dim=1)
-                d_i_norm[mask] = (d_i_px / pos_strides[mask].float()).clamp(
-                    min=self.prior_delta_min, max=self.prior_delta_max)
-        else:
-            # Fallback: use batch-level GT centers for kNN
-            all_gt_centers_px = torch.cat(gt_centers_list, dim=0)  # (M, 2)
-            mean_stride = pos_strides.float().mean()
-            if all_gt_centers_px.shape[0] > 1:
-                dists_px = torch.cdist(gt_centers, all_gt_centers_px)  # (N, M)
-                dists_px = dists_px + (dists_px < 1e-2).float() * 1e8
-                k = min(self.knn_k, all_gt_centers_px.shape[0] - 1)
-                knn_dists_px, _ = dists_px.topk(k, dim=1, largest=False)
-                d_i_px = knn_dists_px.mean(dim=1)  # (N,) in pixels
-            else:
-                d_i_px = gt_centers.new_full((N,), mean_stride * self.prior_delta_max)
-            d_i_norm = (d_i_px / pos_strides.float()).clamp(
-                min=self.prior_delta_min, max=self.prior_delta_max)  # (N,)
-
-        # Center prior: mu=0, sigma = sigma_c_coeff * d_i_norm  (in normalized units)
-        prior_sigma = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)  # (N, 2)
         prior_mu = torch.zeros(N, 2, device=bbox_mu.device)
-        
+        if prior_log_sigma is not None:
+            prior_log_sigma = self._sanitize_log_sigma(prior_log_sigma)
+            prior_sigma = prior_log_sigma.exp().clamp(min=1e-6, max=self.sigma_max)
+            if NAN_TO_NUM:
+                prior_sigma = torch.nan_to_num(
+                    prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
+        else:
+            if pos_img_ids is not None:
+                d_i_norm = pos_strides.new_full((N,), self.prior_delta_max)
+                for img_idx, gt_centers_img in enumerate(gt_centers_list):
+                    mask = (pos_img_ids == img_idx)
+                    if not mask.any():
+                        continue
+                    if gt_centers_img.shape[0] <= 1:
+                        d_i_px = gt_centers.new_full(
+                            (int(mask.sum()),),
+                            pos_strides[mask].float().mean() * self.prior_delta_max)
+                    else:
+                        dists_px = torch.cdist(gt_centers[mask], gt_centers_img)  # (n_i, m_i)
+                        dists_px = dists_px + (dists_px < 1e-2).float() * 1e8
+                        k = min(self.knn_k, gt_centers_img.shape[0] - 1)
+                        knn_dists_px, _ = dists_px.topk(k, dim=1, largest=False)
+                        d_i_px = knn_dists_px.mean(dim=1)
+                    d_i_norm[mask] = (d_i_px / pos_strides[mask].float()).clamp(
+                        min=self.prior_delta_min, max=self.prior_delta_max)
+            else:
+                # Fallback: use batch-level GT centers for kNN
+                all_gt_centers_px = torch.cat(gt_centers_list, dim=0)  # (M, 2)
+                mean_stride = pos_strides.float().mean()
+                if all_gt_centers_px.shape[0] > 1:
+                    dists_px = torch.cdist(gt_centers, all_gt_centers_px)  # (N, M)
+                    dists_px = dists_px + (dists_px < 1e-2).float() * 1e8
+                    k = min(self.knn_k, all_gt_centers_px.shape[0] - 1)
+                    knn_dists_px, _ = dists_px.topk(k, dim=1, largest=False)
+                    d_i_px = knn_dists_px.mean(dim=1)  # (N,) in pixels
+                else:
+                    d_i_px = gt_centers.new_full((N,), mean_stride * self.prior_delta_max)
+                d_i_norm = (d_i_px / pos_strides.float()).clamp(
+                    min=self.prior_delta_min, max=self.prior_delta_max)  # (N,)
+
+            # Center prior: mu=0, sigma = sigma_c_coeff * d_i_norm  (in normalized units)
+            prior_sigma = (self.sigma_c_coeff * d_i_norm).unsqueeze(1).expand(-1, 2)  # (N, 2)
+            if NAN_TO_NUM:
+                prior_sigma = torch.nan_to_num(
+                    prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
+
         if NAN_TO_NUM:
             prior_mu = torch.nan_to_num(prior_mu, nan=0.0, posinf=1e4, neginf=-1e4)
-            prior_sigma = torch.nan_to_num(prior_sigma, nan=1.0, posinf=self.sigma_max, neginf=1e-6)
 
         # --- Symmetric KL loss with per-sample clipping to prevent spikes ---
         sigma_p = prior_sigma.clamp(min=1e-6, max=self.sigma_max)
