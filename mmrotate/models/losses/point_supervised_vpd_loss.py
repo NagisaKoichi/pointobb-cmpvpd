@@ -9,9 +9,8 @@ All computations are done in **stride-normalized space**:
 This ensures center loss and KL prior/posterior are all in the same units.
 
 Objective:
-  L = lambda_center * L_center
-        + lambda_kl(t) * SymKL(q_phi, p_psi)
-        + lambda_var(t) * L_var
+    L = lambda_center * L_nll
+                + lambda_kl(t) * SymKL(q_phi, p_psi)
 
 Curriculum:
     Stage A (iter < warmup_iters): lambda_kl = lambda_kl_warmup,
@@ -37,10 +36,12 @@ class PointSupervisedVPDLoss(nn.Module):
         lambda_kl (float): Final KL weight (stage B). Default: 0.1.
         lambda_kl_warmup (float): Initial KL weight (stage A). Default: 0.02.
         lambda_var (float): Final variance regularization weight (stage B).
-            Default: 0.01.
+            Default: 0.01. (Deprecated when use_nll=True)
         lambda_var_warmup (float | None): Initial variance regularization
             weight (stage A). If None, uses lambda_var (no schedule).
-            Default: None.
+            Default: None. (Deprecated when use_nll=True)
+        use_nll (bool): If True, use heteroscedastic Gaussian NLL for
+            reconstruction so sigma learns uncertainty. Default: True.
         knn_k (int): Nearest neighbors for density estimation. Default: 5.
         sigma_c_coeff (float): Center prior sigma = sigma_c_coeff * d_i_norm.
             Default: 0.5.
@@ -59,6 +60,7 @@ class PointSupervisedVPDLoss(nn.Module):
                  lambda_var=0.04,
                  lambda_var_warmup=0.001,
                  num_samples=1,
+                 use_nll=True,
                  knn_k=5,
                  sigma_c_coeff=0.5,
                  warmup_iters=2000,
@@ -74,6 +76,7 @@ class PointSupervisedVPDLoss(nn.Module):
         self.lambda_var_warmup = (
             lambda_var if lambda_var_warmup is None else lambda_var_warmup)
         self.num_samples = max(int(num_samples), 1)
+        self.use_nll = bool(use_nll)
         self.knn_k = knn_k
         self.sigma_c_coeff = sigma_c_coeff
         self.warmup_iters = warmup_iters
@@ -167,19 +170,27 @@ class PointSupervisedVPDLoss(nn.Module):
 
         stride_2d = pos_strides.unsqueeze(1)  # (N, 1)
 
-        # --- Center loss in normalized space ---
+        # --- Reconstruction loss in normalized space ---
         # target: (gt_center - anchor) / stride
         gt_delta_norm = (gt_centers - pos_points) / stride_2d  # (N, 2)
-        num_samples = self.num_samples if num_samples is None else max(int(num_samples), 1)
-        eps = torch.randn(
-            num_samples, N, 2, device=bbox_mu.device, dtype=bbox_mu.dtype)
-        sample_delta_norm = bbox_mu.unsqueeze(0) + sigma_q.unsqueeze(0) * eps
-        target_delta_norm = gt_delta_norm.unsqueeze(0).expand_as(sample_delta_norm)
-        l_center = F.smooth_l1_loss(
-            sample_delta_norm,
-            target_delta_norm,
-            reduction='none',
-            beta=1.0).mean()
+        if self.use_nll:
+            # Gaussian NLL: 0.5 * ((x-mu)^2 / sigma^2 + 2*log(sigma))
+            log_sigma = bbox_log_sigma
+            inv_var = torch.exp(-2.0 * log_sigma)
+            diff = gt_delta_norm - bbox_mu
+            l_center = 0.5 * (diff.pow(2) * inv_var + 2.0 * log_sigma).mean()
+        else:
+            # Monte Carlo estimate of E[recon] with sampled z
+            num_samples = self.num_samples if num_samples is None else max(int(num_samples), 1)
+            eps = torch.randn(
+                num_samples, N, 2, device=bbox_mu.device, dtype=bbox_mu.dtype)
+            sample_delta_norm = bbox_mu.unsqueeze(0) + sigma_q.unsqueeze(0) * eps
+            target_delta_norm = gt_delta_norm.unsqueeze(0).expand_as(sample_delta_norm)
+            l_center = F.smooth_l1_loss(
+                sample_delta_norm,
+                target_delta_norm,
+                reduction='none',
+                beta=1.0).mean()
         if NAN_TO_NUM:
             l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
 
@@ -254,10 +265,13 @@ class PointSupervisedVPDLoss(nn.Module):
         if NAN_TO_NUM:
             l_kl = torch.nan_to_num(l_kl, nan=0.0, posinf=self.kl_clip, neginf=0.0)
 
-        # --- Variance regularization on center dims ---
-        l_var = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean()
-        if NAN_TO_NUM:
-            l_var = torch.nan_to_num(l_var, nan=0.0, posinf=self.sigma_max, neginf=0.0)
+        # --- Variance regularization on center dims (only when not using NLL) ---
+        if self.use_nll:
+            l_var = bbox_mu.sum() * 0.0
+        else:
+            l_var = bbox_log_sigma[:, :2].exp().clamp(max=self.sigma_max).mean()
+            if NAN_TO_NUM:
+                l_var = torch.nan_to_num(l_var, nan=0.0, posinf=self.sigma_max, neginf=0.0)
 
         loss_total = (self.lambda_center * l_center
                       + eff_lambda_kl * l_kl
