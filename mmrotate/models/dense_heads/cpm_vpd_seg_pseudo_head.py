@@ -30,7 +30,7 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
                  sigma_scale=0.5,
                  min_sigma=1.0,
                  max_sigma=20.0,
-                 seg_score_thr=0.04,
+                 seg_score_thr=0.7,
                  seg_topk=0,
                  bg_std_scale=1.5,
                  per_gt_thr_ratio=0.5,
@@ -126,12 +126,18 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
             centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
         log_sigma = torch.nan_to_num(
             bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
+        sigma = log_sigma.exp().sum(dim=0)
 
         max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
-        centerness_prob = centerness_lvl.sigmoid().squeeze(0)
-        combined_score = max_class_prob * centerness_prob
-        std_sigmoid = log_sigma.exp().sigmoid()
-        return (std_sigmoid.mean(dim=0) * combined_score).clamp(min=1e-6, max=1.0)
+        
+        fused_map = (1 - sigma.sigmoid() * (1 - max_class_prob)).sqrt()
+        from scipy.ndimage import minimum_filter
+        fused_np = fused_map.cpu().numpy()
+        fused_np = minimum_filter(fused_np, size=3)
+        fused_map = torch.from_numpy(fused_np).to(fused_map.device).to(fused_map.dtype)
+        
+        return fused_map.clamp(min=1e-6, max=1.0)
+        
 
     def _build_per_gt_maps(self, p_model, gt_bboxes, img_meta):
         p_model = torch.nan_to_num(p_model.float(), nan=0.0, posinf=1.0, neginf=0.0)

@@ -1,9 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""CPMVPDHead: CPM Head with Point-Supervised Variational Inference.
+"""CPMVPDHead: CPM Head with Point-Supervised VPD-style distribution loss.
 
 Latent variable z = (delta_x, delta_y) per anchor point.
 Posterior: q_phi(z|f,p) = N(mu_phi, diag(sigma_phi^2))
-Prior:     p_psi(z|p_i, N_i) = N(mu_psi, diag(sigma_psi^2))  [point-conditioned]
 
 Network output (conv_reg, 4 channels):
     [0:2] = (delta_x, delta_y)  -- posterior mean mu_phi
@@ -28,11 +27,10 @@ INF = 1e8
 
 @ROTATED_HEADS.register_module()
 class CPMVPDHead(CPMHead):
-    """CPM Head with Point-Supervised Variational Inference.
+    """CPM Head with Point-Supervised VPD-style XY distribution supervision.
 
     Predicts a Gaussian posterior q_phi(z|f,p) over the latent proposal state
-    z = (delta_x, delta_y, log_w, log_h), regularized by a point-conditioned
-    prior p_psi(z|p_i, N_i) constructed from GT point annotation geometry.
+    z = (delta_x, delta_y), trained with projected-target JS divergence.
 
     Args:
         warmup_iters (int): Iterations for KL warm-up. Default: 2000.
@@ -61,11 +59,11 @@ class CPMVPDHead(CPMHead):
             self.use_refinement = test_cfg['use_refinement']
         if 'num_samples_train' in train_cfg:
             self.num_samples_train = train_cfg['num_samples_train']
-        self.prior_sigma_source = train_cfg.get('prior_sigma_source', 'cpm')
-        self.prior_sigma_min = float(train_cfg.get('prior_sigma_min', 0.5))
-        self.prior_sigma_max = float(train_cfg.get('prior_sigma_max', 16.0))
-        self.prior_sigma_detach = bool(train_cfg.get('prior_sigma_detach', True))
         self.use_remap_score = bool(test_cfg.get('use_remap_score', False))
+        self.js_weight = float(train_cfg.get('js_weight', 1.0))
+        self.js_project_min = float(train_cfg.get('js_project_min', -16.0))
+        self.js_project_max = float(train_cfg.get('js_project_max', 16.0))
+        self.js_num_bins = int(train_cfg.get('js_num_bins', 33))
 
         self.visualize_variance_map = bool(
             train_cfg.get('visualize_variance_map', False))
@@ -74,17 +72,10 @@ class CPMVPDHead(CPMHead):
 
         self.loss_vpd = build_loss(dict(
             type='PointSupervisedVPDLoss',
-            lambda_center=1.0,
-            # lambda_kl=0.1,
-            # lambda_kl_warmup=0.02,
-            # lambda_var=0.01,
-            # lambda_var_warmup=0.002,
-            lambda_kl=0.1,
-            lambda_kl_warmup=0.1,
-            lambda_var=0.0,
-            lambda_var_warmup=0.0,
-            warmup_iters=self.warmup_iters,
-            use_nll=False,
+            lambda_center=self.js_weight,
+            project_min=self.js_project_min,
+            project_max=self.js_project_max,
+            num_bins=self.js_num_bins,
         ))
 
     def _init_predictor(self):
@@ -380,23 +371,6 @@ class CPMVPDHead(CPMHead):
         # GT centers list for kNN prior (image coords, one entry per image)
         gt_centers_list = [gt_bbox[:, :2] for gt_bbox in gt_bboxes]
 
-        prior_log_sigma = None
-        if self.prior_sigma_source in ('cpm', 'centerness'):
-            if self.prior_sigma_source == 'centerness':
-                flatten_centerness = torch.cat([
-                    ct.permute(0, 2, 3, 1).reshape(-1)
-                    for ct in centernesses])
-                pos_conf = flatten_centerness[pos_inds].sigmoid()
-            else:
-                pos_conf = flatten_cls_scores[pos_inds].sigmoid().max(dim=1)[0]
-            if self.prior_sigma_detach:
-                pos_conf = pos_conf.detach()
-            pos_conf = pos_conf.clamp(min=0.0, max=1.0)
-            prior_sigma = (self.prior_sigma_min
-                           + (self.prior_sigma_max - self.prior_sigma_min)
-                           * (1.0 - pos_conf))
-            prior_log_sigma = prior_sigma.log().unsqueeze(1).expand(-1, 2)
-
         vpd_losses = self.loss_vpd(
             bbox_mu=bbox_mu,
             bbox_log_sigma=bbox_log_sigma,
@@ -407,7 +381,6 @@ class CPMVPDHead(CPMHead):
             cur_iter=self.iter,
             pos_img_ids=pos_img_ids,
             num_samples=self.num_samples_train,
-            prior_log_sigma=prior_log_sigma,
         )
 
         loss_vpd = torch.nan_to_num(

@@ -11,6 +11,7 @@ model = dict(
         remap_edge_thr_ratio=0.35,
         remap_edge_max_len=64,
         remap_size_mix=1.0,
+        pca_map_source='sigma_fuse',  # set to 'sigma_fuse' to use sigma-fused map for PCA
         enable_final_nms=False,
         class_agnostic_nms=False,
         class_agnostic_iou_thr=0.1),

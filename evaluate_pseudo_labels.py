@@ -8,7 +8,8 @@ from mmrotate.datasets.dota import DOTADataset
 def main():
     # 改成你的路径
     gt_dir = "/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/trainval/annfiles"
-    pseudo_dir = "/media/ps/passport2/zlk/results/frozen_vpd_v3/pseudo_labels_pca_ep3"
+    # pseudo_dir = "/media/ps/passport2/zlk/results/0527_xy_vpdstyle_cpmoriginal/vpd_cpm_dotav10/pseudo_labels"
+    pseudo_dir = "/media/ps/passport2/zlk/results/0511_obboriginal/vpd_cpm_dotav10/pseudo_labels"
     version = "le90"
 
     classes = DOTADataset.CLASSES

@@ -102,21 +102,15 @@ model = dict(
     train_cfg=dict(
         visualize=False,
         store_dir=store_dir,
-        cls_weight=20,              # Classification loss weight
-        thresh1=8,                  # Positive sample threshold
-        alpha=0.1,                    # Negative sample coefficient
+        cls_weight=1.0,              # Classification loss weight
+        thresh1=6,                  # Positive sample threshold
+        alpha=1.5,                    # Negative sample coefficient
         use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=1.0,              # VPD loss weight (center + uncertainty + KL) UNUSED
+        js_weight=1.0,              # VPD JS loss weight on XY
+        js_project_min=-16.0,
+        js_project_max=16.0,
+        js_num_bins=21,
         num_samples_train=1,
-        # Feature-conditioned prior for sigma: 'cpm' or 'centerness'
-        prior_sigma_source='cpm',
-        prior_sigma_min=0.5,
-        prior_sigma_max=16.0,
-        prior_sigma_detach=True,
-
-        # Stage-1 variance-focused setting: mute mu supervision, amplify sigma.
-        lambda_mu_dense=0.0,
-        lambda_sigma_dense=2.0,
 
         # sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
         # fg_inner_radius=8.0,        # Inner radius for foreground samples
@@ -148,4 +142,4 @@ lr_config = dict(
     step=[4])
 evaluation = dict(interval=6, metric='mAP')
 checkpoint_config = dict(interval=1, create_symlink=False)
-optimizer = dict(lr=0.001, momentum=0.9, type='SGD', weight_decay=0.0001)
+optimizer = dict(lr=0.05, momentum=0.9, type='SGD', weight_decay=0.0001)

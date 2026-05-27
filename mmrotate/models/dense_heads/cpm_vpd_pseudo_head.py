@@ -81,6 +81,7 @@ class CPMVPDPseudoHead(CPMVPDHead):
                  pca_enable_instance_gate=True,
                  pca_max_center_offset=4.0,
                  pca_min_fill_ratio=0.20,
+                 pca_map_source='sigma_fuse',
                  enable_final_nms=False,
                  class_agnostic_nms=True,
                  class_agnostic_iou_thr=0.1,
@@ -130,6 +131,7 @@ class CPMVPDPseudoHead(CPMVPDHead):
         self.pca_enable_instance_gate = bool(pca_enable_instance_gate)
         self.pca_max_center_offset = float(pca_max_center_offset)
         self.pca_min_fill_ratio = float(pca_min_fill_ratio)
+        self.pca_map_source = str(pca_map_source).lower()
         self.enable_final_nms = bool(enable_final_nms)
         self.class_agnostic_nms = bool(class_agnostic_nms)
         self.class_agnostic_iou_thr = float(class_agnostic_iou_thr)
@@ -351,6 +353,26 @@ class CPMVPDPseudoHead(CPMVPDHead):
         pmax = torch.clamp(probmap.max(), min=1e-6)
         return (probmap / pmax).clamp(min=1e-6, max=1.0)
 
+    def _build_sigma_fuse_map(self, probmap, bbox_pred_lvl):
+        """Fuse CPM score with variance, matching generate_vpd_variance_map.py."""
+        cpm = probmap
+        lstd = torch.nan_to_num(bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
+        std = lstd.exp()
+
+        variance = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
+        variance = torch.nan_to_num(variance, nan=0.0, posinf=1e6, neginf=0.0)
+
+        # fused = (1.0 - (variance.sigmoid() * (1.0 - probmap))).sqrt()
+        # fused = torch.nan_to_num(fused, nan=0.0, posinf=1.0, neginf=0.0)
+        fused = (1 - (variance.sigmoid() * (1 - cpm))).sqrt()
+        
+        # erode
+        from scipy.ndimage import minimum_filter
+        fused_np = fused.cpu().numpy()
+        fused_np = minimum_filter(fused_np, size=5)
+        
+        return fused.clamp(min=1e-6, max=1.0)
+
     def _build_gt_guided_remap_map(self, probmap, gt_bboxes, img_meta):
         if gt_bboxes is None or gt_bboxes.numel() == 0:
             return probmap
@@ -398,6 +420,12 @@ class CPMVPDPseudoHead(CPMVPDHead):
     def _build_remap_map(self, cls_score_lvl, centerness_lvl, bbox_pred_lvl, gt_bboxes, img_meta):
         del centerness_lvl
         probmap = self._build_probmap(cls_score_lvl=cls_score_lvl, bbox_pred_lvl=bbox_pred_lvl)
+        if self.pca_map_source == 'sigma_fuse':
+            probmap = self._build_sigma_fuse_map(probmap=probmap, bbox_pred_lvl=bbox_pred_lvl)
+        elif self.pca_map_source != 'cpm':
+            raise ValueError(
+                f'Unsupported pca_map_source: {self.pca_map_source}. '
+                "Use 'cpm' or 'sigma_fuse'.")
         if self.remap_use_gt_guided:
             return self._build_gt_guided_remap_map(probmap=probmap, gt_bboxes=gt_bboxes, img_meta=img_meta)
         return probmap

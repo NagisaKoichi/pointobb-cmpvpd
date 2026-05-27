@@ -125,9 +125,17 @@ def parse_args():
         default=0.30,
         help='local contrast factor beta in p <- max(p - beta*avgpool(p), 0)')
     parser.add_argument(
+        '--scatter-class',
+        type=int,
+        default=-1,
+        help='only include this class index in scatter plot, -1 means all')
+    parser.add_argument(
+        '--scatter-class-name',
+        default=None,
+        help='only include this class name in scatter plot (overrides --scatter-class)')
+    parser.add_argument(
         '--remap-output-mode',
-        default='gt_guided',
-        # choices=['variance', 'mask'],
+        default='seg',
         help='output processed variance map or GT-instance segmentation mask')
     parser.add_argument(
         '--gpu-id',
@@ -193,6 +201,11 @@ def _label_to_color_mask(label_map, flip_direction):
     elif flip_direction == 'diagonal':
         img = img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
     return img
+
+def _grayscale_erode(mask, kernel_size):
+    # choose the minimum value in the neighborhood defined by the kernel size
+    from scipy.ndimage import minimum_filter
+    return minimum_filter(mask, size=kernel_size)
 
 
 def _save_maps_for_image(img_path,
@@ -287,15 +300,33 @@ def _save_maps_for_image(img_path,
     print(f'std_geo_norm stats - min: {std_geo_norm.min().item():.6f}, max: {std_geo_norm.max().item():.6f}, mean: {std_geo_norm.mean().item():.6f}')
     print(f'probmap stats - min: {probmap.min().item():.6f}, max: {probmap.max().item():.6f}, mean: {probmap.mean().item():.6f}')
 
-    if remap_output_mode == 'mask':
+    if remap_output_mode == 'seg':
+        
+        variance = std_geo  # shape [H, W]
+        cpm = probmap  # shape [H, W]
+        
+        # sigmoid-fuse
+        # sigma_weight = 0.8
+        # fused = sigma_weight * (1 - variance.sigmoid()) + (1 - sigma_weight) * cpm
+        
+        fused = (1 - (variance.sigmoid() * (1 - cpm))).sqrt()
+        # erode
+        fused_np = fused.detach().cpu().numpy()
+        print(fused_np.shape)
+        print(f'Before erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
+        fused_np = _grayscale_erode(fused_np, kernel_size=1)
+        print(f'After erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
+        fused = torch.from_numpy(fused_np).to(fused.device).to(fused.dtype)
+        
         remapped_label_map = build_gt_guided_segmentation_mask(
-            p_model=probmap,
+            p_model=fused,
             gt_bboxes=gt_bboxes,
             img_meta=img_meta,
             sigma_scale=sigma_scale,
             min_sigma=min_sigma,
             max_sigma=max_sigma,
-            score_thr=seg_score_thr,
+            # score_thr=seg_score_thr,
+            score_thr=0.1,
             topk=seg_topk,
             bg_std_scale=bg_std_scale)
         remapped_img = _label_to_color_mask(remapped_label_map, flip_direction)
@@ -326,15 +357,21 @@ def _save_maps_for_image(img_path,
             remapped_img = _to_heatmap(remapped_max_prob, flip_direction)
                 
     elif remap_output_mode == 'mu_mask':
+        mu_scale = 8.0
         mu = bbox_mu  # shape [2, H, W]
+        w, h = mu.shape[2], mu.shape[1]
+        device = mu.device
+        dtype = mu.dtype
         yy, xx = torch.meshgrid(
             torch.arange(h, device=device, dtype=dtype),
             torch.arange(w, device=device, dtype=dtype),
             indexing='ij')
+        
+        print(f'mu stats - min: {mu.min().item():.6f}, max: {mu.max().item():.6f}, mean: {mu.mean().item():.6f}')
 
         # mapped position in feature coordinates
-        mapped_x = xx + mu[0]
-        mapped_y = yy + mu[1]
+        mapped_x = xx + mu[0] * float(mu_scale)
+        mapped_y = yy + mu[1] * float(mu_scale)
 
         cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)
         if cx is None:
@@ -358,6 +395,7 @@ def _save_maps_for_image(img_path,
         # Post-process: within 10 units => keep (set mask=1), else background.
         # Assign pixel to nearest GT index for coloring.
         # Build label map: -1 background, otherwise gt index.
+        
         thresh = 5.0
         label_map = torch.full((h, w), -1, dtype=torch.long, device=device)
         if cx is not None:
@@ -371,15 +409,57 @@ def _save_maps_for_image(img_path,
         base_img = Image.open(img_path).convert('RGB')
         base_img = base_img.resize(remapped_img.size)
         remapped_img = Image.blend(base_img, remapped_img, alpha=0.8)
+        
+        # or a soft mask based on nearest_dist
+        # remapped_img = _to_heatmap(-nearest_dist, flip_direction)  # closer to GT center -> hotter color            
+            
     
     elif remap_output_mode == 'mu':
-        mu = bbox_mu  # shape [2, H, W]
+        mu_scale = 8.0
+        mu = bbox_mu * mu_scale  # shape [2, H, W]
         w, h = mu.shape[2], mu.shape[1]
         reprojected_x = torch.arange(w, device=mu.device, dtype=mu.dtype) + mu[0]
         reprojected_y = torch.arange(h, device=mu.device, dtype=mu.dtype) + mu[1]
         reprojected_x = reprojected_x.clamp(0, w - 1)
         reprojected_y = reprojected_y.clamp(0, h - 1)
         remapped_img = _to_heatmap(reprojected_x, flip_direction)
+        
+    elif remap_output_mode == 'mu_density':
+        # for each pixel, compute the density of reprojected positions from mu, then visualize the density map.
+        mu_scale = 1.0
+        mu = bbox_mu * mu_scale  # shape [2, H, W]
+        w, h = mu.shape[2], mu.shape[1]
+        reprojected_x = torch.arange(w, device=mu.device, dtype=mu.dtype) + mu[0]
+        reprojected_y = torch.arange(h, device=mu.device, dtype=mu.dtype) + mu[1]
+        reprojected_x = reprojected_x.clamp(0, w - 1)
+        reprojected_y = reprojected_y.clamp(0, h - 1)
+        # Compute density simply by +1 for every reprojected position.
+        density = torch.zeros((h, w), device=mu.device, dtype=mu.dtype)
+        for i in range(w):
+            for j in range(h):
+                x = int(reprojected_x[j, i].item())
+                y = int(reprojected_y[j, i].item())
+                density[y, x] += 1.0
+        remapped_img = _to_heatmap(density, flip_direction)
+        
+    elif remap_output_mode == 'sigma_fuse':  # cpm + variance
+        variance = std_geo  # shape [H, W]
+        cpm = probmap  # shape [H, W]
+        
+        # sigmoid-fuse
+        # sigma_weight = 0.8
+        # fused = sigma_weight * (1 - variance.sigmoid()) + (1 - sigma_weight) * cpm
+        
+        fused = (1 - (variance.sigmoid() * (1 - cpm))).sqrt()
+        # erode
+        fused_np = fused.detach().cpu().numpy()
+        print(fused_np.shape)
+        print(f'Before erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
+        fused_np = _grayscale_erode(fused_np, kernel_size=3)
+        print(f'After erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
+        fused = torch.from_numpy(fused_np).to(fused.device).to(fused.dtype)
+        
+        remapped_img = _to_heatmap(fused, flip_direction)
         
     else:
         raise ValueError(f'Unsupported remap_output_mode: {remap_output_mode}')
@@ -457,13 +537,19 @@ def _unwrap_tensor_list(data, key, device):
 
     raise TypeError(f'Unsupported payload type in `{key}`: {type(payload)}')
 
-def _get_variance_cscore_scatter_data_image(bbox_pred_lvl, cls_score_lvl, gt_bboxes, img_meta, flip_direction):
+def _get_variance_cscore_scatter_data_image(
+        bbox_pred_lvl,
+        cls_score_lvl,
+        gt_bboxes,
+        gt_labels,
+        img_meta,
+        flip_direction):
     # get the (variance, cscore) pairs for all gt centers in an image, for scatter plotting
     device = cls_score_lvl.device
     dtype = cls_score_lvl.dtype
     cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)
     if cx is None:
-        return None, None
+        return None, None, None
     img_h, img_w = _infer_image_shape(img_meta)
     sx = float(cls_score_lvl.shape[2]) / max(float(img_w), 1.0)
     sy = float(cls_score_lvl.shape[1]) / max(float(img_h), 1.0)
@@ -487,7 +573,13 @@ def _get_variance_cscore_scatter_data_image(bbox_pred_lvl, cls_score_lvl, gt_bbo
     # print(cls_score_lvl.max(), cls_score_lvl.min(), cls_score_lvl.mean())
     # print(cls_score_lvl.sigmoid[:, cy_f.long(), cx_f.long()])
         
-    return gt_lstd_at_centers.cpu().numpy(), gt_cls_scores_at_centers.cpu().numpy()
+    labels_np = None
+    if gt_labels is not None:
+        labels_np = gt_labels.detach().cpu().numpy().astype(np.int64)
+
+    return (gt_lstd_at_centers.cpu().numpy(),
+            gt_cls_scores_at_centers.cpu().numpy(),
+            labels_np)
 
 def main():
     args = parse_args()
@@ -533,6 +625,23 @@ def main():
     model = model.to(device)
     model.eval()
 
+    scatter_class_idx = None
+    scatter_class_name = None
+    if args.scatter_class_name:
+        if not hasattr(dataset, 'CLASSES') or dataset.CLASSES is None:
+            raise ValueError('Dataset has no CLASSES attribute for name lookup.')
+        if args.scatter_class_name not in dataset.CLASSES:
+            raise ValueError(
+                f'Unknown class name: {args.scatter_class_name}. '
+                f'Available: {dataset.CLASSES}')
+        scatter_class_name = args.scatter_class_name
+        scatter_class_idx = int(list(dataset.CLASSES).index(args.scatter_class_name))
+    elif args.scatter_class is not None and int(args.scatter_class) >= 0:
+        scatter_class_idx = int(args.scatter_class)
+        if hasattr(dataset, 'CLASSES') and dataset.CLASSES is not None:
+            if scatter_class_idx < len(dataset.CLASSES):
+                scatter_class_name = dataset.CLASSES[scatter_class_idx]
+
     captured = {}
 
     def _hook_fn(_module, _inputs, outputs):
@@ -572,6 +681,7 @@ def main():
         img_metas = data['img_metas'].data[0]
         batch_size = len(img_metas)
         gt_bboxes_list = _unwrap_tensor_list(data, 'gt_bboxes', device)
+        gt_labels_list = _unwrap_tensor_list(data, 'gt_labels', device)
 
         if ('bbox_preds' not in captured or 'cls_scores' not in captured
                 or 'centernesses' not in captured):
@@ -595,6 +705,7 @@ def main():
             cls_score_lvl = cls_scores[args.feat_level][b]
             centerness_lvl = centernesses[args.feat_level][b]
             gt_bboxes = None if gt_bboxes_list is None else gt_bboxes_list[b]
+            gt_labels = None if gt_labels_list is None else gt_labels_list[b]
 
             stem = osp.splitext(osp.basename(img_path))[0]
             out_name = f'{processed:06d}_{stem}_lstd.jpg'
@@ -632,11 +743,25 @@ def main():
                 args.prob_local_contrast)
             
             # save scatter data
-            variance_at_centers, cscore_at_centers = _get_variance_cscore_scatter_data_image(
-                bbox_pred_lvl ,cls_score_lvl, gt_bboxes, meta, flip_direction)
+            variance_at_centers, cscore_at_centers, labels_at_centers = _get_variance_cscore_scatter_data_image(
+                bbox_pred_lvl,
+                cls_score_lvl,
+                gt_bboxes,
+                gt_labels,
+                meta,
+                flip_direction)
             if cscore_at_centers is not None and variance_at_centers is not None:
-                for var, cs in zip(variance_at_centers, cscore_at_centers):
-                    scatter_data.append((var, cs))
+                if scatter_class_idx is not None:
+                    if labels_at_centers is None:
+                        pass
+                    else:
+                        keep = labels_at_centers == scatter_class_idx
+                        if np.any(keep):
+                            for var, cs in zip(variance_at_centers[keep], cscore_at_centers[keep]):
+                                scatter_data.append((var, cs))
+                else:
+                    for var, cs in zip(variance_at_centers, cscore_at_centers):
+                        scatter_data.append((var, cs))
 
             processed += 1
             progress.update()
@@ -651,7 +776,13 @@ def main():
         plt.scatter(lstd, cs, alpha=0.9, s=2)
         plt.ylabel('Classification Scores')
         plt.xlabel('lstd')
-        plt.title('Variance vs Classification Score')
+        title = 'Variance vs Classification Score'
+        if scatter_class_idx is not None:
+            if scatter_class_name:
+                title += f' (class: {scatter_class_name})'
+            else:
+                title += f' (class idx: {scatter_class_idx})'
+        plt.title(title)
         plt.grid(True)
         scatter_out_path = osp.join(args.out_dir, '_variance_vs_cscore_scatter.png')
         plt.savefig(scatter_out_path)
