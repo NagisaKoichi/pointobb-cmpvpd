@@ -48,7 +48,7 @@ data = dict(
         img_prefix=data_root + 'test/images/',
         version=angle_version,
         classes=classes,
-        samples_per_gpu=4))
+        samples_per_gpu=1))
 
 # model settings - CPM with Point-Supervised VPD
 model = dict(
@@ -106,7 +106,7 @@ model = dict(
         thresh1=6,                  # Positive sample threshold
         alpha=1.5,                    # Negative sample coefficient
         use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=1.0,              # VPD JS loss weight on XY
+        js_weight=0.5,              # VPD JS loss weight on XY
         js_project_min=-16.0,
         js_project_max=16.0,
         js_num_bins=21,

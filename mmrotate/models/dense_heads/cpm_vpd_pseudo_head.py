@@ -1,145 +1,84 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-"""CPMVPD pseudo-label head based on 4-channel regression outputs.
+"""CPMVPD pseudo-label head using variance-modulated CPM prob map.
 
-This head reuses CPMVPD inference outputs:
-    [0:2] posterior mean  (dx, dy)
-    [2:4] posterior lstd  (log_sx, log_sy)
-
-Pseudo generation pipeline:
-1) Build remap score map from cls-score map using mean offsets (dx, dy).
-2) Use point-supervised targets (GT centers) as query points.
-3) Search local peak around each query point on remap map.
-4) Decode one pseudo box from the selected pixel's mean/lstd.
-5) Apply multiclass rotated NMS to all pseudo boxes.
+Pipeline:
+1) Build class-wise prob map from CPM classification score and centerness.
+2) Modulate the map by variance confidence from VPD lstd channels.
+3) Decode pseudo boxes with the original PseudoLabelHead flow:
+   center-factor -> rectangle extraction -> PCA axis -> boundary walk.
 """
 
 import os
 import torch
 import torch.nn.functional as F
-from mmcv.runner import force_fp32
 from mmcv.ops import nms_rotated
+from mmcv.runner import force_fp32
 
 from mmrotate.core import multiclass_nms_rotated
 from ..builder import ROTATED_HEADS
 from .cpm_vpd_head import CPMVPDHead
 
+INF = 1e8
+
 
 @ROTATED_HEADS.register_module()
 class CPMVPDPseudoHead(CPMVPDHead):
-    """Point-supervised pseudo-box generator using CPMVPD 4-channel output.
-
-    Args:
-        point_search_radius (int): Local search radius (feature pixels)
-            around each target point on remap map.
-        use_lstd_for_size (bool): Whether to inject lstd into size decoding.
-        lstd_size_factor (float): Size correction factor for lstd.
-    """
 
     def __init__(self,
                  *args,
-                 point_search_radius=3,
-                 use_lstd_for_size=True,
-                 lstd_size_factor=0.5,
-                 use_remap_size=True,
-                 remap_edge_thr_ratio=0.35,
-                 remap_edge_max_len=64,
-                 remap_size_mix=1.0,
-                 remap_use_gt_guided=True,
-                 remap_cls_floor=0.05,
-                 remap_cls_gamma=1.0,
                  remap_uncert_q_lo=0.01,
                  remap_uncert_q_hi=0.20,
                  remap_uncert_gamma=1.0,
-                 remap_alpha_cls=0.9,
-                 remap_alpha_uncert=0.0,
                  remap_prob_smooth_ksize=3,
                  remap_prob_local_contrast=0.30,
-                 remap_sigma_scale=0.5,
-                 remap_min_sigma=1.0,
-                 remap_max_sigma=20.0,
-                 remap_score_thr=0.2,
-                 remap_topk=0,
-                 remap_bg_std_scale=1.5,
-                 use_pca_decode=True,
-                 pca_window_radius=6,
-                 pca_use_adaptive_radius=True,
-                 pca_radius_scale=0.30,
-                 pca_radius_min=3,
-                 pca_radius_max=14,
-                 pca_thr_ratio=0.45,
-                 pca_weight_gamma=2.0,
-                 pca_min_pixels=6,
-                 pca_size_factor=1.8,
-                 pca_center_mix=0.0,
-                 pca_size_mix=0.4,
-                 pca_angle_mix=0.7,
-                 pca_component_select='peak',
-                 pca_connectivity=4,
-                 pca_use_aniso_gate=True,
-                 pca_aniso_thr=0.35,
-                 pca_peak_dist_penalty=0.20,
-                 pca_enable_instance_gate=True,
-                 pca_max_center_offset=4.0,
-                 pca_min_fill_ratio=0.20,
-                 pca_map_source='sigma_fuse',
                  enable_final_nms=False,
                  class_agnostic_nms=True,
                  class_agnostic_iou_thr=0.1,
+                 use_cpm_directly=True,
                  **kwargs):
+        # Backward compatibility: swallow legacy kwargs from older remap decoder.
+        legacy_keys = [
+            'point_search_radius', 'use_lstd_for_size', 'lstd_size_factor',
+            'use_remap_size', 'remap_edge_thr_ratio', 'remap_edge_max_len',
+            'remap_size_mix', 'remap_use_gt_guided', 'remap_cls_floor',
+            'remap_cls_gamma', 'remap_alpha_cls', 'remap_alpha_uncert',
+            'remap_sigma_scale', 'remap_min_sigma', 'remap_max_sigma',
+            'remap_score_thr', 'remap_topk', 'remap_bg_std_scale',
+            'use_pca_decode', 'pca_window_radius', 'pca_use_adaptive_radius',
+            'pca_radius_scale', 'pca_radius_min', 'pca_radius_max',
+            'pca_thr_ratio', 'pca_weight_gamma', 'pca_min_pixels',
+            'pca_size_factor', 'pca_center_mix', 'pca_size_mix',
+            'pca_angle_mix', 'pca_component_select', 'pca_connectivity',
+            'pca_use_aniso_gate', 'pca_aniso_thr', 'pca_peak_dist_penalty',
+            'pca_enable_instance_gate', 'pca_max_center_offset',
+            'pca_min_fill_ratio', 'pca_map_source', 'use_cpm_generated_boxes'
+        ]
+        for key in legacy_keys:
+            kwargs.pop(key, None)
+
         super().__init__(*args, **kwargs)
-        self.point_search_radius = int(point_search_radius)
-        self.use_lstd_for_size = bool(use_lstd_for_size)
-        self.lstd_size_factor = float(lstd_size_factor)
-        self.use_remap_size = bool(use_remap_size)
-        self.remap_edge_thr_ratio = float(remap_edge_thr_ratio)
-        self.remap_edge_max_len = int(remap_edge_max_len)
-        self.remap_size_mix = float(remap_size_mix)
-        self.remap_use_gt_guided = bool(remap_use_gt_guided)
-        self.remap_cls_floor = float(remap_cls_floor)
-        self.remap_cls_gamma = float(remap_cls_gamma)
+
         self.remap_uncert_q_lo = float(remap_uncert_q_lo)
         self.remap_uncert_q_hi = float(remap_uncert_q_hi)
         self.remap_uncert_gamma = float(remap_uncert_gamma)
-        self.remap_alpha_cls = float(remap_alpha_cls)
-        self.remap_alpha_uncert = float(remap_alpha_uncert)
         self.remap_prob_smooth_ksize = int(remap_prob_smooth_ksize)
         self.remap_prob_local_contrast = float(remap_prob_local_contrast)
-        self.remap_sigma_scale = float(remap_sigma_scale)
-        self.remap_min_sigma = float(remap_min_sigma)
-        self.remap_max_sigma = float(remap_max_sigma)
-        self.remap_score_thr = float(remap_score_thr)
-        self.remap_topk = int(remap_topk)
-        self.remap_bg_std_scale = float(remap_bg_std_scale)
-        self.use_pca_decode = bool(use_pca_decode)
-        self.pca_window_radius = int(pca_window_radius)
-        self.pca_use_adaptive_radius = bool(pca_use_adaptive_radius)
-        self.pca_radius_scale = float(pca_radius_scale)
-        self.pca_radius_min = int(pca_radius_min)
-        self.pca_radius_max = int(pca_radius_max)
-        self.pca_thr_ratio = float(pca_thr_ratio)
-        self.pca_weight_gamma = float(pca_weight_gamma)
-        self.pca_min_pixels = int(pca_min_pixels)
-        self.pca_size_factor = float(pca_size_factor)
-        self.pca_center_mix = float(pca_center_mix)
-        self.pca_size_mix = float(pca_size_mix)
-        self.pca_angle_mix = float(pca_angle_mix)
-        self.pca_component_select = str(pca_component_select)
-        self.pca_connectivity = int(pca_connectivity)
-        self.pca_use_aniso_gate = bool(pca_use_aniso_gate)
-        self.pca_aniso_thr = float(pca_aniso_thr)
-        self.pca_peak_dist_penalty = float(pca_peak_dist_penalty)
-        self.pca_enable_instance_gate = bool(pca_enable_instance_gate)
-        self.pca_max_center_offset = float(pca_max_center_offset)
-        self.pca_min_fill_ratio = float(pca_min_fill_ratio)
-        self.pca_map_source = str(pca_map_source).lower()
         self.enable_final_nms = bool(enable_final_nms)
         self.class_agnostic_nms = bool(class_agnostic_nms)
         self.class_agnostic_iou_thr = float(class_agnostic_iou_thr)
+        self.use_cpm_directly = bool(use_cpm_directly)
 
         train_cfg = kwargs.get('train_cfg', {}) or {}
         self.store_ann_dir = train_cfg.get('store_ann_dir', None)
         if self.store_ann_dir is not None:
             os.makedirs(self.store_ann_dir, exist_ok=True)
+
+        self.thresh3 = train_cfg.get('thresh3', [0.1] * self.num_classes)
+        if isinstance(self.thresh3, (int, float)):
+            self.thresh3 = [float(self.thresh3)] * self.num_classes
+        self.pca_length = int(train_cfg.get('pca_length', 28))
+        self.multiple_factor = float(train_cfg.get('multiple_factor', 1 / 16))
+        assert len(self.thresh3) == self.num_classes
 
         self.default_classes = (
             'plane', 'baseball-diamond', 'bridge', 'ground-track-field',
@@ -228,6 +167,428 @@ class CPMVPDPseudoHead(CPMVPDHead):
                 else:
                     f.write('')
 
+    def _build_probmap(self, cls_score_lvl, bbox_pred_lvl, centerness_lvl):
+        cls_score_lvl = torch.nan_to_num(
+            cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
+        centerness_lvl = torch.nan_to_num(
+            centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
+        lstd = torch.nan_to_num(
+            bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
+        std = lstd.exp()
+
+        cls_prob = cls_score_lvl.sigmoid()
+        centerness_prob = centerness_lvl.sigmoid().squeeze(0)
+
+        std_geo = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
+        std_geo = torch.nan_to_num(std_geo, nan=0.0, posinf=1e6, neginf=0.0)
+        q_lo = torch.quantile(std_geo, self.remap_uncert_q_lo)
+        q_hi = torch.quantile(std_geo, self.remap_uncert_q_hi)
+        denom = torch.clamp(q_hi - q_lo, min=1e-6)
+        std_geo_norm = ((std_geo - q_lo) / denom).clamp(0.0, 1.0)
+        var_conf = torch.pow(
+            torch.clamp(1.0 - std_geo_norm, min=1e-6), self.remap_uncert_gamma)
+
+        probmap = cls_prob * var_conf.unsqueeze(0)
+
+        if self.remap_prob_smooth_ksize > 1:
+            k = int(self.remap_prob_smooth_ksize)
+            if k % 2 == 0:
+                k += 1
+            pad = k // 2
+            probmap = F.avg_pool2d(
+                probmap.unsqueeze(0), kernel_size=k, stride=1,
+                padding=pad).squeeze(0)
+
+        beta = float(self.remap_prob_local_contrast)
+        if beta > 0.0:
+            local_avg = F.avg_pool2d(
+                probmap.unsqueeze(0), kernel_size=3, stride=1,
+                padding=1).squeeze(0)
+            probmap = (probmap - beta * local_avg).clamp(min=0.0)
+
+        pmax = torch.clamp(probmap.max(), min=1e-6)
+        return (probmap / pmax).clamp(min=1e-6, max=1.0)
+
+    def get_rectangle_cls_prob(self, prob_map, stride, center_factor,
+                               gt_ctr, pca_length, mode='near'):
+        assert mode in ['near', 'bilinear'], "mode must be either 'near' or 'bilinear'"
+
+        gt_ctr_lvl = gt_ctr / stride
+        length_lvl = pca_length / stride
+        rect_length = 2 * int((length_lvl - 1) / 2) + 1
+        padding = (10, 10, 10, 10)
+        padded_prob_map = F.pad(prob_map, padding, mode='constant', value=0)
+        padded_center_factor = F.pad(center_factor, padding, mode='constant', value=0)
+        gt_ctr_based_rect = torch.zeros(
+            gt_ctr_lvl.shape[0], prob_map.shape[0], rect_length, rect_length,
+            device=prob_map.device)
+
+        gt_ctr_lvl = gt_ctr_lvl + 10
+
+        if mode == 'near':
+            gt_ctr_lvl = gt_ctr_lvl.round().long()
+            x_min = gt_ctr_lvl[:, 0] - int((length_lvl - 1) / 2)
+            y_min = gt_ctr_lvl[:, 1] - int((length_lvl - 1) / 2)
+            for i in range(gt_ctr_lvl.shape[0]):
+                center_factor_i = padded_center_factor[
+                    i,
+                    int(y_min[i]):int(y_min[i] + length_lvl),
+                    int(x_min[i]):int(x_min[i] + length_lvl)
+                ]
+                gt_ctr_based_rect[i] = padded_prob_map[:,
+                    int(y_min[i]):int(y_min[i] + length_lvl),
+                    int(x_min[i]):int(x_min[i] + length_lvl)
+                ] * center_factor_i.unsqueeze(0)
+        else:
+            x_max = gt_ctr_lvl[:, 0] + (length_lvl - 1) / 2
+            x_min = gt_ctr_lvl[:, 0] - (length_lvl - 1) / 2
+            y_max = gt_ctr_lvl[:, 1] + (length_lvl - 1) / 2
+            y_min = gt_ctr_lvl[:, 1] - (length_lvl - 1) / 2
+            for i in range(gt_ctr_lvl.shape[0]):
+                x_max_i = int(x_max[i])
+                x_min_i = int(x_min[i])
+                y_max_i = int(y_max[i])
+                y_min_i = int(y_min[i])
+                x_max_weight = x_max[i] - x_max_i
+                x_min_weight = 1 - x_max_weight
+                y_max_weight = y_max[i] - y_max_i
+                y_min_weight = 1 - y_max_weight
+                gt_ctr_based_rect[i] = (
+                    padded_prob_map[:, y_min_i, x_min_i] * x_min_weight * y_min_weight
+                    + padded_prob_map[:, y_min_i, x_max_i] * x_max_weight * y_min_weight
+                    + padded_prob_map[:, y_max_i, x_min_i] * x_min_weight * y_max_weight
+                    + padded_prob_map[:, y_max_i, x_max_i] * x_max_weight * y_max_weight
+                )
+        return gt_ctr_based_rect
+
+    def get_center_factor(self, center_point_gt, gt_labels, prob_map_lvl0):
+        num_gts = center_point_gt.shape[0]
+        _, H, W = prob_map_lvl0.shape
+        unique_labels = gt_labels.unique()
+
+        center_factors = []
+        for label in unique_labels:
+            mask = (gt_labels == label)
+            gt_ctrs = center_point_gt[mask]
+            center_factor_i = self.get_center_factor_cls(gt_ctrs, H, W)
+            center_factors.append(center_factor_i)
+
+        final_center_factors = torch.zeros(
+            (num_gts, H, W),
+            dtype=center_factors[0].dtype,
+            device=center_factors[0].device)
+        for label, center_factor_i in zip(unique_labels, center_factors):
+            if center_factor_i is None:
+                continue
+            mask = (gt_labels == label)
+            final_center_factors[mask] = center_factor_i
+
+        return final_center_factors
+
+    def get_center_factor_cls(self, gt_ctrs, H, W):
+        num_gts_cls = gt_ctrs.shape[0]
+        if num_gts_cls == 0:
+            return None
+        if num_gts_cls == 1:
+            return torch.ones((1, H, W), dtype=torch.float32, device=gt_ctrs.device)
+
+        points_rect_x = torch.arange(
+            0, W * self.strides[0], self.strides[0], device=gt_ctrs.device).float()
+        points_rect_y = torch.arange(
+            0, H * self.strides[0], self.strides[0], device=gt_ctrs.device).float()
+        points_rect_xy = torch.stack(
+            torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2)
+        each_gt_factor = torch.cdist(points_rect_xy, gt_ctrs)
+        each_gt_factor = each_gt_factor.transpose(0, 1).reshape(num_gts_cls, H, W)
+        each_gt_factor = each_gt_factor.transpose(1, 2)
+        each_gt_factor_exp = torch.exp(-each_gt_factor * self.multiple_factor) + 1e-6
+        sum_factor = each_gt_factor_exp.sum(dim=0).unsqueeze(0)
+        return each_gt_factor_exp / sum_factor
+
+    def get_closest_gt_first_axis(self, gt_labels, eigvec_first,
+                                  center_point_gt, angle_threshold):
+        num_gts = center_point_gt.shape[0]
+        unique_labels = gt_labels.unique()
+
+        first_axis_range = []
+        for label in unique_labels:
+            mask = (gt_labels == label)
+            gt_ctrs = center_point_gt[mask]
+            eigvec_first_cls = eigvec_first[mask]
+            first_axis_range_i = self.get_closest_gt_first_axis_cls(
+                gt_ctrs, eigvec_first_cls, angle_threshold)
+            first_axis_range.append(first_axis_range_i)
+
+        final_first_axis_range = torch.zeros(
+            (num_gts,), dtype=first_axis_range[0].dtype,
+            device=first_axis_range[0].device)
+        for label, first_axis_range_i in zip(unique_labels, first_axis_range):
+            if first_axis_range_i is None:
+                continue
+            mask = (gt_labels == label)
+            final_first_axis_range[mask] = first_axis_range_i
+
+        return torch.abs(final_first_axis_range)
+
+    def get_closest_gt_first_axis_cls(self, gt_ctrs, eigvec_first,
+                                      angle_threshold=0.866):
+        num_gts_cls = gt_ctrs.shape[0]
+        if num_gts_cls == 0:
+            return None
+        if num_gts_cls == 1:
+            return 512 * torch.ones((1,), dtype=torch.float32, device=gt_ctrs.device)
+
+        first_eigvec_range = torch.zeros(
+            (num_gts_cls,), dtype=torch.float32, device=gt_ctrs.device)
+        eigvec_first_norm = eigvec_first / torch.norm(eigvec_first, dim=1, keepdim=True)
+        gt_and_gt_vector = gt_ctrs - gt_ctrs.unsqueeze(1)
+        gt_vec_proj = torch.abs(
+            (gt_and_gt_vector * eigvec_first_norm.unsqueeze(1)).sum(dim=-1))
+        gt_and_gt_norm_cos_angle = gt_vec_proj / torch.norm(gt_and_gt_vector, dim=-1)
+        mask_valid_angle = gt_and_gt_norm_cos_angle > angle_threshold
+        for i in range(num_gts_cls):
+            mask_valid_angle_i = mask_valid_angle[i]
+            if mask_valid_angle_i.sum() == 0:
+                first_eigvec_range[i] = 512
+                continue
+            gt_proj = gt_vec_proj[i, mask_valid_angle_i]
+            first_eigvec_range[i] = torch.min(gt_proj)
+        return first_eigvec_range
+
+    def get_edge_boundary_simple(self, gt_labels, eigvec, center_point_gt,
+                                 prob_map_lvl0, is_secondary=False,
+                                 is_nearest_same_class=None, nearest_gt_point=None,
+                                 first_axis_range=None, default_max_length=128):
+        num_gts = center_point_gt.shape[0]
+        center_point_gt = center_point_gt / self.strides[0]
+
+        eigvec_norm = eigvec / torch.norm(eigvec, dim=1, keepdim=True)
+        top_bottom = torch.zeros(num_gts, 2, device=center_point_gt.device)
+        H, W = prob_map_lvl0.shape[1], prob_map_lvl0.shape[2]
+        if first_axis_range is not None:
+            first_axis_range = first_axis_range / self.strides[0]
+
+        for i in range(num_gts):
+            ctr = center_point_gt[i]
+            eigvec_i = eigvec_norm[i]
+            is_same_class = is_nearest_same_class[i]
+            nearest_gt_point_i = nearest_gt_point[i] / self.strides[0]
+            direction = nearest_gt_point_i - ctr
+            direction_norm = direction / torch.norm(direction)
+            distance = torch.abs((direction * eigvec_i).sum())
+            if not is_secondary:
+                valid_dup_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.866
+            else:
+                valid_dup_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.5
+
+            for j in range(default_max_length):
+                point = (ctr + j * eigvec_i).round().long()
+                if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
+                    top_bottom[i, 0] = j
+                    break
+                if prob_map_lvl0[gt_labels[i], point[1], point[0]] < self.thresh3[gt_labels[i]]:
+                    top_bottom[i, 0] = j
+                    break
+                if valid_dup_remove and is_same_class and j > 0.5 * distance:
+                    top_bottom[i, 0] = j
+                    break
+                if first_axis_range is not None and j > 0.6 * first_axis_range[i]:
+                    top_bottom[i, 0] = j
+                    break
+
+            for j in range(default_max_length):
+                point = (ctr - j * eigvec_i).round().long()
+                if point[0] < 0 or point[0] >= W or point[1] < 0 or point[1] >= H:
+                    top_bottom[i, 1] = j
+                    break
+                if prob_map_lvl0[gt_labels[i], point[1], point[0]] < self.thresh3[gt_labels[i]]:
+                    top_bottom[i, 1] = j
+                    break
+                if is_secondary and valid_dup_remove and is_same_class and j > 0.5 * distance:
+                    top_bottom[i, 0] = j - 1
+                    break
+                if first_axis_range is not None and j > 0.6 * first_axis_range[i]:
+                    top_bottom[i, 0] = j
+                    break
+
+        return top_bottom[:, 0], top_bottom[:, 1]
+
+    def _pseudo_boxes_from_probmap(self, gt_bboxes, gt_labels, prob_map_lvl0):
+        num_gts = gt_labels.size(0)
+        if num_gts == 0:
+            return None, None
+
+        center_point_gt = gt_bboxes[:, :2]
+        stride0 = self.strides[0]
+
+        center_factor = self.get_center_factor(
+            center_point_gt, gt_labels, prob_map_lvl0)
+        gt_ctr_rect = self.get_rectangle_cls_prob(
+            prob_map_lvl0, stride0, center_factor, center_point_gt,
+            self.pca_length, mode='near')
+        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :]
+
+        gt_rect_ctr2edge = gt_ctr_rect_label.shape[-1] // 2
+        points_rect_x = torch.arange(
+            -gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1, device=gt_ctr_rect.device)
+        points_rect_y = torch.arange(
+            -gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1, device=gt_ctr_rect.device)
+        points_rect_xy = torch.stack(
+            torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2)
+        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1)
+        points_rect_xy_adapt = (
+            points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1)
+            * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1))
+        points_cov_matrix = (
+            torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt)
+            / (gt_ctr_rect_label.shape[-1] ** 2 - 1))
+        
+        # Add a small epsilon to the diagonal to prevent ill-conditioned matrix errors in PCA
+        points_cov_matrix = points_cov_matrix + torch.eye(2, device=points_cov_matrix.device) * 1e-6
+        eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
+
+        larger_eigvals_index = (eigvals[:, 1] > eigvals[:, 0]).int()
+        eigvec_first = (
+            eigvecs[:, 0, :] * (1 - larger_eigvals_index).unsqueeze(1).repeat(1, 2)
+            + eigvecs[:, 1, :] * larger_eigvals_index.unsqueeze(1).repeat(1, 2))
+        mask_eigvec = (eigvec_first[:, 1] > 0).int()
+        epsilon = mask_eigvec * 1e-6 + (1 - mask_eigvec) * -1e-6
+
+        angle_targets = -torch.atan(
+            eigvec_first[:, 0] / (eigvec_first[:, 1] + epsilon)).unsqueeze(-1)
+        eigvec_second = torch.stack([-eigvec_first[:, 1], eigvec_first[:, 0]], -1)
+
+        dist_gt_and_gt = (
+            torch.cdist(center_point_gt, center_point_gt)
+            + torch.eye(num_gts, device=center_point_gt.device) * INF)
+        _, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
+        is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels)
+
+        first_axis_range = self.get_closest_gt_first_axis(
+            gt_labels, eigvec_first, center_point_gt, angle_threshold=0.866)
+
+        top_simple, bottom_simple = self.get_edge_boundary_simple(
+            gt_labels, eigvec_first, center_point_gt, prob_map_lvl0,
+            is_secondary=False, is_nearest_same_class=is_nearest_same_class,
+            nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index],
+            first_axis_range=first_axis_range)
+        left_simple, right_simple = self.get_edge_boundary_simple(
+            gt_labels, eigvec_second, center_point_gt, prob_map_lvl0,
+            is_secondary=True, is_nearest_same_class=is_nearest_same_class,
+            nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index],
+            first_axis_range=None)
+
+        top_simple = top_simple * stride0 + 1
+        bottom_simple = bottom_simple * stride0 + 1
+        left_simple = left_simple * stride0 + 1
+        right_simple = right_simple * stride0 + 1
+
+        pseudo_gt_bboxes = torch.cat([
+            center_point_gt,
+            (left_simple + right_simple).unsqueeze(-1),
+            (top_simple + bottom_simple).unsqueeze(-1),
+            angle_targets
+        ], -1).detach()
+
+        H, W = prob_map_lvl0.shape[1], prob_map_lvl0.shape[2]
+        center_feat = (center_point_gt / stride0).round().long()
+        center_feat[:, 0].clamp_(0, W - 1)
+        center_feat[:, 1].clamp_(0, H - 1)
+        label_idx = gt_labels.long()
+        scores = prob_map_lvl0[label_idx, center_feat[:, 1], center_feat[:, 0]]
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+
+        return pseudo_gt_bboxes, scores
+
+    @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
+    def get_pseudo_bboxes(self,
+                          cls_scores,
+                          bbox_preds,
+                          centernesses,
+                          gt_bboxes,
+                          gt_labels,
+                          img_metas,
+                          cfg=None,
+                          rescale=None):
+        cfg = self.test_cfg if cfg is None else cfg
+        if cfg is None:
+            raise ValueError('Test config is missing for pseudo generation.')
+
+        assert len(cls_scores) == len(bbox_preds) == len(centernesses)
+        num_imgs = cls_scores[0].shape[0]
+        result_list = []
+
+        for img_id in range(num_imgs):
+            gt_boxes_this = gt_bboxes[img_id] if len(gt_bboxes[img_id]) > 0 else None
+            labels_this = gt_labels[img_id] if len(gt_labels[img_id]) > 0 else None
+
+            if gt_boxes_this is None or gt_boxes_this.numel() == 0:
+                empty_bboxes = bbox_preds[0].new_zeros((0, 6))
+                empty_labels = gt_labels[img_id].new_zeros((0,), dtype=torch.long)
+                result_list.append((empty_bboxes, empty_labels))
+                continue
+
+            prob_map_lvl0 = self._build_probmap(
+                cls_scores[0][img_id], bbox_preds[0][img_id], centernesses[0][img_id])
+            pseudo_bboxes, pseudo_scores = self._pseudo_boxes_from_probmap(
+                gt_boxes_this, labels_this, prob_map_lvl0)
+
+            if pseudo_bboxes is None or pseudo_bboxes.numel() == 0:
+                empty_bboxes = bbox_preds[0].new_zeros((0, 6))
+                empty_labels = gt_labels[img_id].new_zeros((0,), dtype=torch.long)
+                result_list.append((empty_bboxes, empty_labels))
+                continue
+
+            mlvl_bboxes = pseudo_bboxes
+            mlvl_scores = mlvl_bboxes.new_zeros((mlvl_bboxes.shape[0], self.num_classes))
+            mlvl_scores[
+                torch.arange(mlvl_scores.shape[0], device=mlvl_scores.device),
+                labels_this.long()] = pseudo_scores
+
+            if rescale:
+                scale_factor = mlvl_bboxes.new_tensor(
+                    img_metas[img_id]['scale_factor'][:2]).repeat(2)
+                mlvl_bboxes[:, :4] /= scale_factor
+
+            if self.enable_final_nms:
+                det_bboxes, det_labels = multiclass_nms_rotated(
+                    mlvl_bboxes,
+                    mlvl_scores,
+                    cfg.get('score_thr', 0.05),
+                    cfg.get('nms', dict(type='nms_rotated', iou_thr=0.1)),
+                    cfg.get('max_per_img', 2000))
+
+                if self.class_agnostic_nms and det_bboxes.shape[0] > 0:
+                    keep_iou_thr = cfg.get(
+                        'class_agnostic_iou_thr', self.class_agnostic_iou_thr)
+                    _, keep_inds = nms_rotated(
+                        det_bboxes[:, :5], det_bboxes[:, 5], keep_iou_thr)
+                    det_bboxes = det_bboxes[keep_inds]
+                    det_labels = det_labels[keep_inds]
+            else:
+                score_thr = cfg.get('score_thr', 0.05)
+                max_per_img = cfg.get('max_per_img', 2000)
+                max_scores, labels = mlvl_scores.max(dim=1)
+                valid = max_scores >= score_thr
+                if valid.any():
+                    det_labels = labels[valid]
+                    det_scores = max_scores[valid]
+                    det_boxes5 = mlvl_bboxes[valid]
+                    if det_scores.shape[0] > max_per_img:
+                        _, order = det_scores.sort(descending=True)
+                        order = order[:max_per_img]
+                        det_labels = det_labels[order]
+                        det_scores = det_scores[order]
+                        det_boxes5 = det_boxes5[order]
+                    det_bboxes = torch.cat([det_boxes5, det_scores[:, None]], dim=1)
+                else:
+                    det_bboxes = mlvl_bboxes.new_zeros((0, 6))
+                    det_labels = mlvl_bboxes.new_zeros((0,), dtype=torch.long)
+
+            result_list.append((det_bboxes, det_labels))
+
+        return result_list
+
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
     def loss(self,
              cls_scores,
@@ -260,670 +621,3 @@ class CPMVPDPseudoHead(CPMVPDHead):
                 self._export_pseudo_txt(bbox_list, img_metas)
 
         return losses
-
-    @staticmethod
-    def _infer_image_shape(img_meta):
-        for key in ('img_shape', 'pad_shape', 'ori_shape'):
-            shape = img_meta.get(key, None)
-            if shape is not None and len(shape) >= 2:
-                return float(shape[0]), float(shape[1])
-        raise KeyError('img_meta must contain one of img_shape/pad_shape/ori_shape.')
-
-    @staticmethod
-    def _extract_center_and_size(gt_bboxes):
-        if gt_bboxes is None or gt_bboxes.numel() == 0:
-            return None, None, None, None
-
-        boxes = gt_bboxes.float()
-        if boxes.dim() == 1:
-            boxes = boxes.unsqueeze(0)
-
-        if boxes.size(1) >= 8:
-            xs = boxes[:, 0:8:2]
-            ys = boxes[:, 1:8:2]
-            cx = xs.mean(dim=1)
-            cy = ys.mean(dim=1)
-            bw = (xs.max(dim=1)[0] - xs.min(dim=1)[0]).clamp(min=1e-3)
-            bh = (ys.max(dim=1)[0] - ys.min(dim=1)[0]).clamp(min=1e-3)
-        elif boxes.size(1) >= 5:
-            cx = boxes[:, 0]
-            cy = boxes[:, 1]
-            bw = boxes[:, 2].abs().clamp(min=1e-3)
-            bh = boxes[:, 3].abs().clamp(min=1e-3)
-        elif boxes.size(1) >= 4:
-            x1 = boxes[:, 0]
-            y1 = boxes[:, 1]
-            x2 = boxes[:, 2]
-            y2 = boxes[:, 3]
-            cx = 0.5 * (x1 + x2)
-            cy = 0.5 * (y1 + y2)
-            bw = (x2 - x1).abs().clamp(min=1e-3)
-            bh = (y2 - y1).abs().clamp(min=1e-3)
-        else:
-            raise ValueError(f'Unsupported gt bbox shape: {tuple(boxes.shape)}')
-
-        return cx, cy, bw, bh
-
-    @staticmethod
-    def _gaussian_priors(h, w, cx, cy, sigma):
-        yy, xx = torch.meshgrid(
-            torch.arange(h, device=cx.device, dtype=torch.float32),
-            torch.arange(w, device=cx.device, dtype=torch.float32),
-            indexing='ij')
-        dx2 = (xx.unsqueeze(0) - cx.view(-1, 1, 1))**2
-        dy2 = (yy.unsqueeze(0) - cy.view(-1, 1, 1))**2
-        denom = 2.0 * sigma.view(-1, 1, 1)**2 + 1e-6
-        return torch.exp(-(dx2 + dy2) / denom)
-
-    def _build_probmap(self, cls_score_lvl, bbox_pred_lvl):
-        cls_score_lvl = torch.nan_to_num(cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
-        lstd = torch.nan_to_num(bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
-        std = lstd.exp()
-
-        max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
-
-        std_geo = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
-        std_geo = torch.nan_to_num(std_geo, nan=0.0, posinf=1e6, neginf=0.0)
-        q_lo = torch.quantile(std_geo, self.remap_uncert_q_lo)
-        q_hi = torch.quantile(std_geo, self.remap_uncert_q_hi)
-        denom = torch.clamp(q_hi - q_lo, min=1e-6)
-        std_geo_norm = ((std_geo - q_lo) / denom).clamp(0.0, 1.0)
-        uncert_weight = torch.pow((1.0 - std_geo_norm).clamp(0.0, 1.0), self.remap_uncert_gamma)
-
-        cls_stretch = ((max_class_prob - self.remap_cls_floor) /
-                       max(1.0 - self.remap_cls_floor, 1e-6)).clamp(0.0, 1.0)
-        cls_weight = torch.pow(torch.clamp(cls_stretch, min=1e-6), self.remap_cls_gamma)
-
-        probmap = (
-            torch.pow(torch.clamp(cls_weight, min=1e-6), self.remap_alpha_cls) *
-            torch.pow(torch.clamp(uncert_weight, min=1e-6), self.remap_alpha_uncert))
-
-        if self.remap_prob_smooth_ksize > 1:
-            k = int(self.remap_prob_smooth_ksize)
-            if k % 2 == 0:
-                k += 1
-            pad = k // 2
-            probmap = F.avg_pool2d(probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
-
-        beta = float(self.remap_prob_local_contrast)
-        if beta > 0.0:
-            local_avg = F.avg_pool2d(probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
-            probmap = (probmap - beta * local_avg).clamp(min=0.0)
-
-        pmax = torch.clamp(probmap.max(), min=1e-6)
-        return (probmap / pmax).clamp(min=1e-6, max=1.0)
-
-    def _build_sigma_fuse_map(self, probmap, bbox_pred_lvl):
-        """Fuse CPM score with variance, matching generate_vpd_variance_map.py."""
-        cpm = probmap
-        lstd = torch.nan_to_num(bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
-        std = lstd.exp()
-
-        variance = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
-        variance = torch.nan_to_num(variance, nan=0.0, posinf=1e6, neginf=0.0)
-
-        # fused = (1.0 - (variance.sigmoid() * (1.0 - probmap))).sqrt()
-        # fused = torch.nan_to_num(fused, nan=0.0, posinf=1.0, neginf=0.0)
-        fused = (1 - (variance.sigmoid() * (1 - cpm))).sqrt()
-        
-        # erode
-        from scipy.ndimage import minimum_filter
-        fused_np = fused.cpu().numpy()
-        fused_np = minimum_filter(fused_np, size=5)
-        
-        return fused.clamp(min=1e-6, max=1.0)
-
-    def _build_gt_guided_remap_map(self, probmap, gt_bboxes, img_meta):
-        if gt_bboxes is None or gt_bboxes.numel() == 0:
-            return probmap
-
-        h, w = probmap.shape
-        cx, cy, bw, bh = self._extract_center_and_size(gt_bboxes)
-        if cx is None:
-            return probmap
-
-        img_h, img_w = self._infer_image_shape(img_meta)
-        sx = float(w) / max(float(img_w), 1.0)
-        sy = float(h) / max(float(img_h), 1.0)
-        cx_f = cx * sx
-        cy_f = cy * sy
-        bw_f = bw * sx
-        bh_f = bh * sy
-
-        sigma = self.remap_sigma_scale * torch.sqrt((bw_f * bh_f).clamp(min=1e-6))
-        sigma = torch.clamp(sigma, min=self.remap_min_sigma, max=self.remap_max_sigma)
-
-        priors = self._gaussian_priors(h=h, w=w, cx=cx_f, cy=cy_f, sigma=sigma)
-        ownership = priors / torch.clamp(priors.sum(dim=0, keepdim=True), min=1e-8)
-        per_obj = probmap.unsqueeze(0) * ownership
-
-        if self.remap_score_thr > 0.0:
-            per_obj = per_obj * (per_obj >= self.remap_score_thr).to(per_obj.dtype)
-
-        if self.remap_topk > 0:
-            n_obj = per_obj.shape[0]
-            flat = per_obj.view(n_obj, -1)
-            k = min(int(self.remap_topk), flat.shape[1])
-            if k > 0:
-                kth = torch.topk(flat, k, dim=1)[0][:, -1].view(n_obj, 1, 1)
-                per_obj = per_obj * (per_obj >= kth).to(per_obj.dtype)
-
-        fused = per_obj.sum(dim=0)
-        if self.remap_bg_std_scale is not None:
-            mu = fused.mean()
-            std = fused.std(unbiased=False)
-            fg_mask = fused >= (mu + self.remap_bg_std_scale * std)
-            fused = fused * fg_mask.to(fused.dtype)
-
-        return fused.clamp(min=0.0, max=1.0)
-
-    def _build_remap_map(self, cls_score_lvl, centerness_lvl, bbox_pred_lvl, gt_bboxes, img_meta):
-        del centerness_lvl
-        probmap = self._build_probmap(cls_score_lvl=cls_score_lvl, bbox_pred_lvl=bbox_pred_lvl)
-        if self.pca_map_source == 'sigma_fuse':
-            probmap = self._build_sigma_fuse_map(probmap=probmap, bbox_pred_lvl=bbox_pred_lvl)
-        elif self.pca_map_source != 'cpm':
-            raise ValueError(
-                f'Unsupported pca_map_source: {self.pca_map_source}. '
-                "Use 'cpm' or 'sigma_fuse'.")
-        if self.remap_use_gt_guided:
-            return self._build_gt_guided_remap_map(probmap=probmap, gt_bboxes=gt_bboxes, img_meta=img_meta)
-        return probmap
-
-    def _decode_from_stats(self, point, stride, mu, lstd):
-        """Decode one rotated box from a selected pixel stats."""
-        dx, dy = mu
-
-        if self.norm_on_bbox:
-            cx = point[0] + dx * stride
-            cy = point[1] + dy * stride
-        else:
-            cx = point[0] + dx
-            cy = point[1] + dy
-
-        # xy-only head has no direct size logits; start from stride-sized box.
-        wh_scale = 1.0
-        if self.use_lstd_for_size:
-            wh_scale = torch.exp(self.lstd_size_factor * lstd.mean())
-        w = point.new_tensor(float(stride)) * wh_scale
-        h = point.new_tensor(float(stride)) * wh_scale
-
-        angle = cx.new_zeros(())
-        return torch.stack([cx, cy, w, h, angle], dim=0)
-
-    def _pick_peak_from_remap(self, remap_map, target_xy_feat, radius):
-        """Pick local peak around a target point on remap map."""
-        h, w = remap_map.shape
-        tx = int(torch.round(target_xy_feat[0]).item())
-        ty = int(torch.round(target_xy_feat[1]).item())
-
-        x0 = max(0, tx - radius)
-        x1 = min(w - 1, tx + radius)
-        y0 = max(0, ty - radius)
-        y1 = min(h - 1, ty + radius)
-        if x1 < x0 or y1 < y0:
-            return None
-
-        window = remap_map[y0:y1 + 1, x0:x1 + 1]
-        if window.numel() == 0:
-            return None
-
-        yy, xx = torch.meshgrid(
-            torch.arange(y0, y1 + 1, device=window.device, dtype=torch.float32),
-            torch.arange(x0, x1 + 1, device=window.device, dtype=torch.float32),
-            indexing='ij')
-        dx2 = (xx - float(target_xy_feat[0].item()))**2
-        dy2 = (yy - float(target_xy_feat[1].item()))**2
-        dist2_norm = (dx2 + dy2) / max(float(radius * radius), 1.0)
-        penalized = window - self.pca_peak_dist_penalty * dist2_norm
-
-        flat_idx = torch.argmax(penalized).item()
-        win_w = window.shape[1]
-        dy = flat_idx // win_w
-        dx = flat_idx % win_w
-        py = y0 + dy
-        px = x0 + dx
-        score = window[dy, dx]
-        return py, px, score
-
-    def _estimate_wh_from_remap_peak(self, remap_map, py, px, stride):
-        """Estimate w/h from remap responses around local peak."""
-        h, w = remap_map.shape
-        peak = float(remap_map[py, px].item())
-        thr = max(peak * self.remap_edge_thr_ratio, 1e-6)
-
-        def walk(dx, dy):
-            dist = 0
-            for step in range(1, self.remap_edge_max_len + 1):
-                x = px + dx * step
-                y = py + dy * step
-                if x < 0 or x >= w or y < 0 or y >= h:
-                    break
-                if float(remap_map[y, x].item()) < thr:
-                    break
-                dist = step
-            return dist
-
-        left = walk(-1, 0)
-        right = walk(1, 0)
-        up = walk(0, -1)
-        down = walk(0, 1)
-        est_w = max(float((left + right + 1) * stride), float(stride))
-        est_h = max(float((up + down + 1) * stride), float(stride))
-        return remap_map.new_tensor([est_w, est_h])
-
-    @staticmethod
-    def _blend_angle(base_angle, pca_angle, mix):
-        mix = float(min(max(mix, 0.0), 1.0))
-        if mix <= 0.0:
-            return base_angle
-        if mix >= 1.0:
-            return pca_angle
-        sin_v = (1.0 - mix) * torch.sin(base_angle) + mix * torch.sin(pca_angle)
-        cos_v = (1.0 - mix) * torch.cos(base_angle) + mix * torch.cos(pca_angle)
-        return torch.atan2(sin_v, cos_v)
-
-    def _resolve_pca_radius(self, stride, base_wh):
-        if (not self.pca_use_adaptive_radius) or (base_wh is None):
-            return max(int(self.pca_window_radius), 0)
-        wf = float(base_wh[0].item()) / max(float(stride), 1e-6)
-        hf = float(base_wh[1].item()) / max(float(stride), 1e-6)
-        approx = self.pca_radius_scale * max((wf * hf)**0.5, 1.0)
-        radius = int(round(approx))
-        radius = max(self.pca_radius_min, radius)
-        radius = min(self.pca_radius_max, radius)
-        return max(radius, 0)
-
-    def _component_offsets(self):
-        if self.pca_connectivity == 8:
-            return [
-                (-1, -1), (-1, 0), (-1, 1),
-                (0, -1),           (0, 1),
-                (1, -1),  (1, 0),  (1, 1)
-            ]
-        return [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
-    def _flood_fill_component(self, mask_cpu, seed_y, seed_x):
-        h, w = mask_cpu.shape
-        if seed_y < 0 or seed_y >= h or seed_x < 0 or seed_x >= w:
-            return None
-        if not bool(mask_cpu[seed_y, seed_x].item()):
-            return None
-        visited = torch.zeros((h, w), dtype=torch.bool)
-        queue = [(seed_y, seed_x)]
-        visited[seed_y, seed_x] = True
-        comp = []
-        offsets = self._component_offsets()
-        while queue:
-            y, x = queue.pop()
-            comp.append((y, x))
-            for dy, dx in offsets:
-                ny = y + dy
-                nx = x + dx
-                if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                    continue
-                if visited[ny, nx] or (not bool(mask_cpu[ny, nx].item())):
-                    continue
-                visited[ny, nx] = True
-                queue.append((ny, nx))
-        return comp
-
-    def _all_components(self, mask_cpu):
-        h, w = mask_cpu.shape
-        visited = torch.zeros((h, w), dtype=torch.bool)
-        offsets = self._component_offsets()
-        components = []
-        points = torch.nonzero(mask_cpu, as_tuple=False)
-        for p in points:
-            y0 = int(p[0].item())
-            x0 = int(p[1].item())
-            if visited[y0, x0]:
-                continue
-            queue = [(y0, x0)]
-            visited[y0, x0] = True
-            comp = []
-            while queue:
-                y, x = queue.pop()
-                comp.append((y, x))
-                for dy, dx in offsets:
-                    ny = y + dy
-                    nx = x + dx
-                    if ny < 0 or ny >= h or nx < 0 or nx >= w:
-                        continue
-                    if visited[ny, nx] or (not bool(mask_cpu[ny, nx].item())):
-                        continue
-                    visited[ny, nx] = True
-                    queue.append((ny, nx))
-            components.append(comp)
-        return components
-
-    def _select_component_mask(self, mask, seed_y, seed_x, target_xy_window):
-        if int(mask.sum().item()) == 0:
-            return None
-        mask_cpu = mask.detach().to(device='cpu', dtype=torch.bool)
-        mode = self.pca_component_select.lower()
-
-        best_comp = None
-        if mode == 'peak':
-            best_comp = self._flood_fill_component(mask_cpu, seed_y, seed_x)
-        else:
-            comps = self._all_components(mask_cpu)
-            if len(comps) == 0:
-                return None
-            tx = float(target_xy_window[0].item())
-            ty = float(target_xy_window[1].item())
-            best_d2 = None
-            for comp in comps:
-                xs = torch.tensor([p[1] for p in comp], dtype=torch.float32)
-                ys = torch.tensor([p[0] for p in comp], dtype=torch.float32)
-                cx = float(xs.mean().item())
-                cy = float(ys.mean().item())
-                d2 = (cx - tx)**2 + (cy - ty)**2
-                if best_d2 is None or d2 < best_d2:
-                    best_d2 = d2
-                    best_comp = comp
-
-        if best_comp is None:
-            return None
-
-        out_cpu = torch.zeros_like(mask_cpu)
-        ys = [p[0] for p in best_comp]
-        xs = [p[1] for p in best_comp]
-        out_cpu[ys, xs] = True
-        return out_cpu.to(device=mask.device)
-
-    def _decode_from_local_weighted_pca(self,
-                                        remap_map,
-                                        py,
-                                        px,
-                                        stride,
-                                        target_xy_feat,
-                                        base_wh=None):
-        h, w = remap_map.shape
-        radius = self._resolve_pca_radius(stride=stride, base_wh=base_wh)
-        x0 = max(0, int(px) - radius)
-        x1 = min(w - 1, int(px) + radius)
-        y0 = max(0, int(py) - radius)
-        y1 = min(h - 1, int(py) + radius)
-        if x1 < x0 or y1 < y0:
-            return None
-
-        window = remap_map[y0:y1 + 1, x0:x1 + 1]
-        if window.numel() == 0:
-            return None
-
-        peak = float(remap_map[py, px].item())
-        thr = max(peak * self.pca_thr_ratio, 1e-6)
-        raw_mask = window >= thr
-
-        seed_y = int(py - y0)
-        seed_x = int(px - x0)
-        target_xy_window = target_xy_feat.new_tensor([
-            float(target_xy_feat[0].item()) - float(x0),
-            float(target_xy_feat[1].item()) - float(y0)
-        ])
-        mask = self._select_component_mask(raw_mask, seed_y, seed_x, target_xy_window)
-        if mask is None:
-            return None
-        if int(mask.sum().item()) < int(self.pca_min_pixels):
-            return None
-
-        ys, xs = torch.nonzero(mask, as_tuple=True)
-        vals = window[ys, xs]
-        weights = torch.pow(torch.clamp(vals, min=1e-6), self.pca_weight_gamma)
-        weights = torch.clamp(weights, min=1e-6)
-
-        xs_abs = xs.float() + float(x0)
-        ys_abs = ys.float() + float(y0)
-        pts = torch.stack([xs_abs, ys_abs], dim=1)
-
-        wsum = torch.clamp(weights.sum(), min=1e-6)
-        mean = (pts * weights[:, None]).sum(dim=0) / wsum
-        centered = pts - mean
-
-        cov = centered.t().matmul(centered * weights[:, None]) / wsum
-        eigvals, eigvecs = torch.linalg.eigh(cov)
-        major = eigvecs[:, 1]
-        if float(eigvals[1].item()) < 1e-8:
-            major = pts.new_tensor([1.0, 0.0])
-        major = major / torch.clamp(torch.norm(major), min=1e-6)
-        minor = torch.stack([-major[1], major[0]])
-
-        proj_u = centered.matmul(major)
-        proj_v = centered.matmul(minor)
-        umin, umax = proj_u.min(), proj_u.max()
-        vmin, vmax = proj_v.min(), proj_v.max()
-
-        width_feat = torch.clamp((umax - umin + 1.0) * self.pca_size_factor, min=1.0)
-        height_feat = torch.clamp((vmax - vmin + 1.0) * self.pca_size_factor, min=1.0)
-
-        cx = mean[0] * float(stride)
-        cy = mean[1] * float(stride)
-        w_box = width_feat * float(stride)
-        h_box = height_feat * float(stride)
-        angle = torch.atan2(major[1], major[0])
-
-        l1 = torch.clamp(eigvals[1], min=0.0)
-        l2 = torch.clamp(eigvals[0], min=0.0)
-        aniso = (l1 - l2) / torch.clamp(l1 + l2, min=1e-6)
-
-        xmin = float(xs.min().item())
-        xmax = float(xs.max().item())
-        ymin = float(ys.min().item())
-        ymax = float(ys.max().item())
-        box_area = max((xmax - xmin + 1.0) * (ymax - ymin + 1.0), 1.0)
-        fill_ratio = float(mask.sum().item()) / box_area
-        center_offset = torch.sqrt(
-            (mean[0] - float(target_xy_feat[0].item()))**2 +
-            (mean[1] - float(target_xy_feat[1].item()))**2)
-        instance_ok = True
-        if self.pca_enable_instance_gate:
-            instance_ok = bool(
-                (float(center_offset.item()) <= self.pca_max_center_offset) and
-                (fill_ratio >= self.pca_min_fill_ratio))
-
-        return remap_map.new_tensor([cx, cy, w_box, h_box, angle]), aniso, instance_ok
-
-    @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
-    def get_pseudo_bboxes(self,
-                          cls_scores,
-                          bbox_preds,
-                          centernesses,
-                          gt_bboxes,
-                          gt_labels,
-                          img_metas,
-                          cfg=None,
-                          rescale=None):
-        """Generate pseudo boxes from point-supervised targets and remap peaks.
-
-        Args:
-            cls_scores (list[Tensor]): Per-level cls logits, shape [B, C, H, W].
-            bbox_preds (list[Tensor]): Per-level 4-ch regression, shape [B, 4, H, W].
-            centernesses (list[Tensor]): Per-level centerness logits, shape [B, 1, H, W].
-            gt_bboxes (list[Tensor]): Point-supervised GT boxes (center in first 2 dims).
-            gt_labels (list[Tensor]): GT labels aligned with gt_bboxes.
-            img_metas (list[dict]): Image meta info.
-            cfg (ConfigDict | None): Test config for NMS.
-            rescale (bool | None): Whether to rescale to original image.
-
-        Returns:
-            list[tuple[Tensor, Tensor]]: per-image (det_bboxes, det_labels).
-        """
-        cfg = self.test_cfg if cfg is None else cfg
-        if cfg is None:
-            raise ValueError('Test config is missing for pseudo generation.')
-
-        assert len(cls_scores) == len(bbox_preds) == len(centernesses)
-        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
-        mlvl_points = self.prior_generator.grid_priors(
-            featmap_sizes,
-            dtype=bbox_preds[0].dtype,
-            device=bbox_preds[0].device)
-
-        num_levels = len(cls_scores)
-        num_imgs = cls_scores[0].shape[0]
-        result_list = []
-
-        for img_id in range(num_imgs):
-            gt_boxes_this = gt_bboxes[img_id] if len(gt_bboxes[img_id]) > 0 else None
-            points_this = gt_bboxes[img_id][:, :2] if len(gt_bboxes[img_id]) > 0 else None
-            labels_this = gt_labels[img_id] if len(gt_labels[img_id]) > 0 else None
-
-            if points_this is None or points_this.numel() == 0:
-                empty_bboxes = bbox_preds[0].new_zeros((0, 6))
-                empty_labels = gt_labels[img_id].new_zeros((0,), dtype=torch.long)
-                result_list.append((empty_bboxes, empty_labels))
-                continue
-
-            per_gt_bboxes = []
-            per_gt_scores = []
-            per_gt_labels = []
-
-            per_lvl_remap_maps = []
-            for lvl_idx in range(num_levels):
-                per_lvl_remap_maps.append(self._build_remap_map(
-                    cls_score_lvl=cls_scores[lvl_idx][img_id],
-                    centerness_lvl=centernesses[lvl_idx][img_id],
-                    bbox_pred_lvl=bbox_preds[lvl_idx][img_id],
-                    gt_bboxes=gt_boxes_this,
-                    img_meta=img_metas[img_id]))
-
-            for gt_idx in range(points_this.shape[0]):
-                center_xy = points_this[gt_idx]
-                cls_id = labels_this[gt_idx].long()
-
-                best = None
-                best_score = None
-
-                for lvl_idx in range(num_levels):
-                    stride = self.strides[lvl_idx]
-                    bbox_pred_lvl = bbox_preds[lvl_idx][img_id]
-                    remap_map = per_lvl_remap_maps[lvl_idx]
-
-                    target_xy_feat = center_xy / float(stride)
-                    peak = self._pick_peak_from_remap(
-                        remap_map, target_xy_feat, self.point_search_radius)
-                    if peak is None:
-                        continue
-
-                    py, px, score = peak
-                    h, w = remap_map.shape
-                    pt_idx = py * w + px
-                    anchor_point = mlvl_points[lvl_idx][pt_idx]
-
-                    stats = bbox_pred_lvl[:, py, px]
-                    mu = torch.nan_to_num(stats[:2], nan=0.0, posinf=1e4, neginf=-1e4)
-                    lstd = torch.nan_to_num(stats[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
-
-                    box = self._decode_from_stats(anchor_point, stride, mu, lstd)
-                    wh_remap = None
-                    if self.use_remap_size or self.use_pca_decode:
-                        wh_remap = self._estimate_wh_from_remap_peak(
-                            remap_map, py, px, stride)
-
-                    if self.use_remap_size:
-                        mix = min(max(self.remap_size_mix, 0.0), 1.0)
-                        box[2] = box[2] * (1.0 - mix) + wh_remap[0] * mix
-                        box[3] = box[3] * (1.0 - mix) + wh_remap[1] * mix
-
-                    if self.use_pca_decode:
-                        pca_out = self._decode_from_local_weighted_pca(
-                            remap_map=remap_map,
-                            py=py,
-                            px=px,
-                            stride=stride,
-                            target_xy_feat=target_xy_feat,
-                            base_wh=wh_remap)
-                        if pca_out is not None:
-                            pca_box, pca_aniso, instance_ok = pca_out
-                            if instance_ok:
-                                center_mix = min(max(self.pca_center_mix, 0.0), 1.0)
-                                size_mix = min(max(self.pca_size_mix, 0.0), 1.0)
-                                angle_mix = min(max(self.pca_angle_mix, 0.0), 1.0)
-
-                                box[0] = box[0] * (1.0 - center_mix) + pca_box[0] * center_mix
-                                box[1] = box[1] * (1.0 - center_mix) + pca_box[1] * center_mix
-                                box[2] = box[2] * (1.0 - size_mix) + pca_box[2] * size_mix
-                                box[3] = box[3] * (1.0 - size_mix) + pca_box[3] * size_mix
-
-                                if (not self.pca_use_aniso_gate) or (float(pca_aniso.item()) >= self.pca_aniso_thr):
-                                    box[4] = self._blend_angle(box[4], pca_box[4], angle_mix)
-                    score = torch.nan_to_num(score, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
-
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best = (box, cls_id)
-
-                if best is not None:
-                    box, cls_id = best
-                    per_gt_bboxes.append(box)
-                    per_gt_scores.append(best_score)
-                    per_gt_labels.append(cls_id)
-
-            if len(per_gt_bboxes) == 0:
-                empty_bboxes = bbox_preds[0].new_zeros((0, 6))
-                empty_labels = gt_labels[img_id].new_zeros((0,), dtype=torch.long)
-                result_list.append((empty_bboxes, empty_labels))
-                continue
-
-            mlvl_bboxes = torch.stack(per_gt_bboxes, dim=0)
-            mlvl_scores = mlvl_bboxes.new_zeros((mlvl_bboxes.shape[0], self.num_classes))
-            label_tensor = torch.stack(per_gt_labels, dim=0)
-            score_tensor = torch.stack(per_gt_scores, dim=0)
-            mlvl_scores[torch.arange(mlvl_scores.shape[0], device=mlvl_scores.device),
-                        label_tensor] = score_tensor
-
-            if rescale:
-                scale_factor = mlvl_bboxes.new_tensor(
-                    img_metas[img_id]['scale_factor'][:2]).repeat(2)
-                mlvl_bboxes[:, :4] /= scale_factor
-
-            if self.enable_final_nms:
-                det_bboxes, det_labels = multiclass_nms_rotated(
-                    mlvl_bboxes,
-                    mlvl_scores,
-                    cfg.get('score_thr', 0.05),
-                    cfg.get('nms', dict(type='nms_rotated', iou_thr=0.1)),
-                    cfg.get('max_per_img', 2000))
-
-                # Optional second-stage class-agnostic suppression to reduce
-                # heavy overlaps across different categories.
-                if self.class_agnostic_nms and det_bboxes.shape[0] > 0:
-                    keep_iou_thr = cfg.get(
-                        'class_agnostic_iou_thr', self.class_agnostic_iou_thr)
-                    _, keep_inds = nms_rotated(
-                        det_bboxes[:, :5],
-                        det_bboxes[:, 5],
-                        keep_iou_thr)
-                    det_bboxes = det_bboxes[keep_inds]
-                    det_labels = det_labels[keep_inds]
-
-                    max_per_img = cfg.get('max_per_img', 2000)
-                    if det_bboxes.shape[0] > max_per_img:
-                        _, order = det_bboxes[:, 5].sort(descending=True)
-                        order = order[:max_per_img]
-                        det_bboxes = det_bboxes[order]
-                        det_labels = det_labels[order]
-            else:
-                score_thr = cfg.get('score_thr', 0.05)
-                max_per_img = cfg.get('max_per_img', 2000)
-                max_scores, labels = mlvl_scores.max(dim=1)
-                valid = max_scores >= score_thr
-                if valid.any():
-                    det_labels = labels[valid]
-                    det_scores = max_scores[valid]
-                    det_boxes5 = mlvl_bboxes[valid]
-                    if det_scores.shape[0] > max_per_img:
-                        _, order = det_scores.sort(descending=True)
-                        order = order[:max_per_img]
-                        det_labels = det_labels[order]
-                        det_scores = det_scores[order]
-                        det_boxes5 = det_boxes5[order]
-                    det_bboxes = torch.cat([det_boxes5, det_scores[:, None]], dim=1)
-                else:
-                    det_bboxes = mlvl_bboxes.new_zeros((0, 6))
-                    det_labels = mlvl_bboxes.new_zeros((0,), dtype=torch.long)
-
-            result_list.append((det_bboxes, det_labels))
-
-        return result_list
