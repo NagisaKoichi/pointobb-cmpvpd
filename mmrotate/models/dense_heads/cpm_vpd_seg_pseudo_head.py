@@ -13,6 +13,7 @@ box is decoded from segmentation masks built with the same rule as
 """
 
 import torch
+import torch.nn.functional as F
 import os
 from mmcv.ops import nms_rotated
 from mmcv.runner import force_fp32
@@ -21,23 +22,45 @@ from mmrotate.core import multiclass_nms_rotated
 from ..builder import ROTATED_HEADS
 from .cpm_vpd_head import CPMVPDHead
 
+try:
+    # Preferred import when running from repository root.
+    from tools.analysis_tools.segment_variance_map import (
+        build_gt_guided_segmentation_mask,
+        _decode_obb_from_probmap,
+    )
+except Exception:
+    # Fallback for environments where tools is already on PYTHONPATH.
+    from segment_variance_map import (  # type: ignore
+        build_gt_guided_segmentation_mask,
+        _decode_obb_from_probmap,
+    )
 
 @ROTATED_HEADS.register_module()
 class CPMVPDSegPseudoHead(CPMVPDHead):
 
     def __init__(self,
                  *args,
-                 sigma_scale=0.5,
-                 min_sigma=1.0,
+                 sigma_scale=0.2,
+                 min_sigma=0.7,
                  max_sigma=20.0,
-                 seg_score_thr=0.7,
+                 seg_score_thr=0.05,
                  seg_topk=0,
-                 bg_std_scale=1.5,
+                 bg_std_scale=1.0,
                  per_gt_thr_ratio=0.5,
                  mask_min_pixels=6,
                  enable_final_nms=False,
                  class_agnostic_nms=True,
                  class_agnostic_iou_thr=0.1,
+                 # probmap / uncertainty fusion params (match generate_vpd_variance_map)
+                 cls_floor=0.7,
+                 cls_gamma=0.5,
+                 uncert_q_lo=0.01,
+                 uncert_q_hi=0.40,
+                 uncert_gamma=0.5,
+                 alpha_cls=0.5,
+                 alpha_uncert=0.5,
+                 prob_smooth_ksize=3,
+                 prob_local_contrast=0.30,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.sigma_scale = float(sigma_scale)
@@ -48,6 +71,17 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
         self.bg_std_scale = None if bg_std_scale is None else float(bg_std_scale)
         self.per_gt_thr_ratio = float(per_gt_thr_ratio)
         self.mask_min_pixels = int(mask_min_pixels)
+
+        # store probmap params
+        self.cls_floor = float(cls_floor)
+        self.cls_gamma = float(cls_gamma)
+        self.uncert_q_lo = float(uncert_q_lo)
+        self.uncert_q_hi = float(uncert_q_hi)
+        self.uncert_gamma = float(uncert_gamma)
+        self.alpha_cls = float(alpha_cls)
+        self.alpha_uncert = float(alpha_uncert)
+        self.prob_smooth_ksize = int(prob_smooth_ksize)
+        self.prob_local_contrast = float(prob_local_contrast)
 
         self.enable_final_nms = bool(enable_final_nms)
         self.class_agnostic_nms = bool(class_agnostic_nms)
@@ -118,28 +152,114 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
         denom = 2.0 * sigma.view(-1, 1, 1)**2 + 1e-6
         return torch.exp(-(dx2 + dy2) / denom)
 
-    @staticmethod
-    def _build_prob_map(cls_score_lvl, centerness_lvl, bbox_pred_lvl):
+    def _build_prob_map(self, cls_score_lvl, centerness_lvl, bbox_pred_lvl):
+        # Implement the same probmap computation as generate_vpd_variance_map.remap_output_mode='seg'
         cls_score_lvl = torch.nan_to_num(
             cls_score_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
-        centerness_lvl = torch.nan_to_num(
-            centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
         log_sigma = torch.nan_to_num(
             bbox_pred_lvl[2:4], nan=0.0, posinf=1e4, neginf=-1e4)
-        sigma = log_sigma.exp().sum(dim=0)
 
+        # geometric std from two sigma channels
+        std = log_sigma.exp()
+        std_geo = torch.sqrt(torch.clamp(std[0] * std[1], min=1e-12))
+
+        # classification branch: max class prob per-pixel
         max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
+
+        # quantiles controlled by self.uncert_q_lo / _hi
+        q_lo = torch.quantile(std_geo, self.uncert_q_lo)
+        q_hi = torch.quantile(std_geo, self.uncert_q_hi)
+        denom = float(max(q_hi - q_lo, 1e-6))
+        std_geo_norm = ((std_geo - float(q_lo)) / denom).clamp(0.0, 1.0)
+        uncert_weight = torch.pow((1.0 - std_geo_norm).clamp(0.0, 1.0), self.uncert_gamma)
+
+        # classification weight stretch and gamma
+        cls_stretch = ((max_class_prob - float(self.cls_floor)) / max(1.0 - float(self.cls_floor), 1e-6)).clamp(0.0, 1.0)
+        cls_weight = torch.pow(torch.clamp(cls_stretch, min=1e-6), float(self.cls_gamma))
+
+        # linear fusion controlled by alpha params
+        probmap = float(self.alpha_cls) * cls_weight + float(self.alpha_uncert) * uncert_weight
+
+        # smoothing
+        k = int(self.prob_smooth_ksize)
+        if k % 2 == 0:
+            k += 1
+        if k > 1:
+            pad = k // 2
+            probmap = F.avg_pool2d(probmap[None, None], kernel_size=k, stride=1, padding=pad)[0, 0]
+
+        # local contrast
+        beta = float(self.prob_local_contrast)
+        if beta > 0.0:
+            local_avg = F.avg_pool2d(probmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+            probmap = (probmap - beta * local_avg).clamp(min=0.0)
+
+        pmax = torch.clamp(probmap.max(), min=1e-6)
+        probmap = (probmap / pmax).clamp(min=1e-6, max=1.0)
         
-        fused_map = (1 - sigma.sigmoid() * (1 - max_class_prob)).sqrt()
-        from scipy.ndimage import minimum_filter
-        fused_np = fused_map.cpu().numpy()
-        fused_np = minimum_filter(fused_np, size=3)
-        fused_map = torch.from_numpy(fused_np).to(fused_map.device).to(fused_map.dtype)
-        
-        return fused_map.clamp(min=1e-6, max=1.0)
+        return probmap
+
+    def _decode_min_rect_from_probmap(self, per_gt_map, fg_mask, stride):
+        # per_gt_map: float tensor [H, W], fg_mask: bool tensor [H, W]
+        mask = (per_gt_map > 0) & fg_mask
+        ys, xs = torch.nonzero(mask, as_tuple=True)
+        if ys.numel() == 0:
+            return None
+
+        weights = per_gt_map[ys, xs].float()
+        sum_w = float(weights.sum().item())
+        if sum_w <= 0:
+            return None
+        if ys.numel() < self.mask_min_pixels:
+            return None
+
+        pts = torch.stack([xs.float(), ys.float()], dim=1)
+        # weighted mean
+        mean = (weights.view(-1, 1) * pts).sum(dim=0) / weights.sum()
+        centered = pts - mean
+
+        # weighted covariance
+        w = weights.view(-1, 1)
+        cov = (centered * w).t().matmul(centered) / weights.sum()
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        major = eigvecs[:, 1]
+        if float(eigvals[1].item()) < 1e-8:
+            major = pts.new_tensor([1.0, 0.0])
+        major = major / torch.clamp(torch.norm(major), min=1e-6)
+        minor = torch.stack([-major[1], major[0]])
+
+        proj_u = centered.matmul(major)
+        proj_v = centered.matmul(minor)
+
+        # approximate length from weighted variance assuming uniform-like support: L = sqrt(12 * var)
+        mean_u = (weights * proj_u).sum() / weights.sum()
+        mean_v = (weights * proj_v).sum() / weights.sum()
+        var_u = (weights * (proj_u - mean_u)**2).sum() / weights.sum()
+        var_v = (weights * (proj_v - mean_v)**2).sum() / weights.sum()
+
+        width_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_u, min=0.0)), min=1.0)
+        height_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_v, min=0.0)), min=1.0)
+
+        center_feat = mean
+
+        cx = center_feat[0] * float(stride)
+        cy = center_feat[1] * float(stride)
+        w = width_feat * float(stride)
+        h = height_feat * float(stride)
+        angle = torch.atan2(major[1], major[0])
+        return torch.stack([cx, cy, w, h, angle], dim=0)
         
 
     def _build_per_gt_maps(self, p_model, gt_bboxes, img_meta):
+        # Follow the GT-guided remap/segmentation logic used in
+        # tools/analysis_tools/segment_variance_map.py:
+        # 1) compute ownership priors per GT
+        # 2) per_obj = p_model * ownership
+        # 3) apply per-object score threshold and top-k
+        # 4) fused = sum per_obj -> fg_mask via bg_std_scale
+        # 5) label_map = argmax per_obj where fg_mask & max_vals>0
+        # 6) build per_gt maps by masking the original probmap with label_map
+
         p_model = torch.nan_to_num(p_model.float(), nan=0.0, posinf=1.0, neginf=0.0)
         h, w = p_model.shape
 
@@ -163,28 +283,56 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
         sigma = torch.clamp(sigma, min=self.min_sigma, max=self.max_sigma)
 
         priors = self._gaussian_priors(h=h, w=w, cx=cx_f, cy=cy_f, sigma=sigma)
-        ownership = priors / torch.clamp(priors.sum(dim=0, keepdim=True), min=1e-8)
+        priors_sum = priors.sum(dim=0, keepdim=True)
+        priors_sum = torch.clamp(priors_sum, min=1e-8)
+        ownership = priors / priors_sum
 
-        per_gt = p_model.unsqueeze(0) * ownership
+        # ownership-weighted per-object maps (used for determining label_map)
+        per_obj = p_model.unsqueeze(0) * ownership
 
+        # apply per-object score floor threshold (per-object values below score_thr -> 0)
         if self.seg_score_thr > 0.0:
-            per_gt = per_gt * (per_gt >= self.seg_score_thr).to(per_gt.dtype)
+            per_obj = per_obj * (per_obj >= float(self.seg_score_thr)).to(per_obj.dtype)
 
+        # optional top-k keep per object (keeps only top-k pixels per object)
         if self.seg_topk > 0:
-            n_obj = per_gt.shape[0]
-            flat = per_gt.view(n_obj, -1)
-            k = min(self.seg_topk, flat.shape[1])
+            n_obj = per_obj.shape[0]
+            flat = per_obj.view(n_obj, -1)
+            k = min(int(self.seg_topk), flat.shape[1])
             if k > 0:
                 kth = torch.topk(flat, k, dim=1)[0][:, -1].view(n_obj, 1, 1)
-                per_gt = per_gt * (per_gt >= kth).to(per_gt.dtype)
+                per_obj = per_obj * (per_obj >= kth).to(per_obj.dtype)
 
-        fused = per_gt.sum(dim=0)
+        fused = per_obj.sum(dim=0)
+
         if self.bg_std_scale is not None:
             mu = fused.mean()
             std = fused.std(unbiased=False)
-            fg_mask = fused >= (mu + self.bg_std_scale * std)
+            fg_mask = fused >= (mu + float(self.bg_std_scale) * std)
         else:
             fg_mask = fused > 0
+
+        # Compute label map using ownership-weighted per_obj (same as script)
+        max_vals, max_ids = per_obj.max(dim=0)
+        label_map = torch.full((h, w), -1, dtype=torch.long, device=p_model.device)
+        valid = fg_mask & (max_vals > 0)
+        label_map[valid] = max_ids[valid]
+
+        # Build per-GT probmaps using the original probmap values masked by label_map
+        n_obj = int(gt_bboxes.shape[0])
+        if n_obj == 0:
+            return None, None
+
+        device = p_model.device
+        dtype = p_model.dtype
+        per_gt = p_model.new_zeros((n_obj, h, w))
+        for i in range(n_obj):
+            mask_i = (label_map == i)
+            if mask_i.any():
+                per_gt[i] = p_model * mask_i.to(dtype)
+            else:
+                # keep zeros where no pixels assigned
+                per_gt[i] = per_gt[i]
 
         return per_gt, fg_mask
 
@@ -370,6 +518,8 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
         num_levels = len(cls_scores)
         num_imgs = cls_scores[0].shape[0]
+        feat_level = int(cfg.get('feat_level', 0))
+        feat_level = max(0, min(feat_level, num_levels - 1))
 
         result_list = []
         for img_id in range(num_imgs):
@@ -386,48 +536,54 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
             per_gt_scores = []
             per_gt_labels = []
 
+            # Build single-level probmap and GT-guided label map once per image.
+            stride = self.strides[feat_level]
+            bbox_pred_lvl = bbox_preds[feat_level][img_id]
+            cls_score_lvl = cls_scores[feat_level][img_id]
+            centerness_lvl = centernesses[feat_level][img_id]
+
+            probmap = self._build_prob_map(
+                cls_score_lvl=cls_score_lvl,
+                centerness_lvl=centerness_lvl,
+                bbox_pred_lvl=bbox_pred_lvl)
+
+            label_map = build_gt_guided_segmentation_mask(
+                p_model=probmap,
+                gt_bboxes=gt_boxes_this,
+                img_meta=img_metas[img_id],
+                sigma_scale=self.sigma_scale,
+                min_sigma=self.min_sigma,
+                max_sigma=self.max_sigma,
+                score_thr=self.seg_score_thr,
+                topk=self.seg_topk,
+                bg_std_scale=self.bg_std_scale)
+            fg_mask = (label_map != -1)
+
             for gt_idx in range(gt_boxes_this.shape[0]):
                 cls_id = labels_this[gt_idx].long()
-                best_box = None
-                best_score = None
+                # Use the same per-GT map construction as visualization script.
+                per_gt_map = probmap * (label_map == gt_idx).to(probmap.dtype)
 
-                for lvl_idx in range(num_levels):
-                    stride = self.strides[lvl_idx]
-                    bbox_pred_lvl = bbox_preds[lvl_idx][img_id]
-                    cls_score_lvl = cls_scores[lvl_idx][img_id]
-                    centerness_lvl = centernesses[lvl_idx][img_id]
+                # Decode from weighted per-pixel probmap (same as visualization script).
+                box = _decode_obb_from_probmap(
+                    per_gt_map=per_gt_map,
+                    fg_mask=fg_mask,
+                    stride=float(stride),
+                    mask_min_pixels=self.mask_min_pixels)
+                if box is None:
+                    continue
 
-                    probmap = self._build_prob_map(
-                        cls_score_lvl=cls_score_lvl,
-                        centerness_lvl=centerness_lvl,
-                        bbox_pred_lvl=bbox_pred_lvl)
-                    per_gt_maps, fg_mask = self._build_per_gt_maps(
-                        p_model=probmap,
-                        gt_bboxes=gt_boxes_this,
-                        img_meta=img_metas[img_id])
-                    if per_gt_maps is None:
-                        continue
+                mask_for_score = (per_gt_map > 0) & fg_mask
+                if mask_for_score.any():
+                    score = probmap[mask_for_score].mean()
+                else:
+                    score = probmap.new_tensor(0.0)
+                score = torch.nan_to_num(
+                    score, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
 
-                    # Directly use GT's original component map (index == gt_idx).
-                    mask = self._mask_from_per_gt(per_gt_maps[gt_idx], fg_mask)
-                    if mask is None:
-                        continue
-
-                    box = self._decode_min_rect_from_mask(mask=mask, stride=stride)
-                    if box is None:
-                        continue
-
-                    score = probmap[mask].mean()
-                    score = torch.nan_to_num(
-                        score, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
-                    if best_score is None or score > best_score:
-                        best_score = score
-                        best_box = box
-
-                if best_box is not None:
-                    per_gt_bboxes.append(best_box)
-                    per_gt_scores.append(best_score)
-                    per_gt_labels.append(cls_id)
+                per_gt_bboxes.append(box)
+                per_gt_scores.append(score)
+                per_gt_labels.append(cls_id)
 
             if len(per_gt_bboxes) == 0:
                 empty_bboxes = bbox_preds[0].new_zeros((0, 6))
@@ -495,3 +651,5 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
             result_list.append((det_bboxes, det_labels))
 
         return result_list
+
+

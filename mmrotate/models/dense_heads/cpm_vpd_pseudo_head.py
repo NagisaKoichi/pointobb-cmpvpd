@@ -188,7 +188,9 @@ class CPMVPDPseudoHead(CPMVPDHead):
         var_conf = torch.pow(
             torch.clamp(1.0 - std_geo_norm, min=1e-6), self.remap_uncert_gamma)
 
-        probmap = cls_prob * var_conf.unsqueeze(0)
+        # cls_prob = torch.ones_like(cls_prob)
+        # probmap = cls_prob * var_conf.unsqueeze(0)
+        probmap = cls_prob
 
         if self.remap_prob_smooth_ksize > 1:
             k = int(self.remap_prob_smooth_ksize)

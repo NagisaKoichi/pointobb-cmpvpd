@@ -185,3 +185,58 @@ def build_gt_guided_segmentation_mask(p_model,
 		h, w = p_model.shape
 		label_map = torch.full((h, w), -1, dtype=torch.long, device=p_model.device)
 	return label_map
+
+
+def _decode_obb_from_probmap(per_gt_map, fg_mask, stride, mask_min_pixels=6):
+    """
+    Decode an oriented bounding box from a per-GT-object probability map, 
+    using a weighted covariance method similar to the CPM seg head target generation.
+    Args:
+        per_gt_map (Tensor): shape [H, W], probability map for a single GT object (non-zero only within the GT mask).
+        fg_mask (Tensor): shape [H, W], boolean mask of valid foreground pixels (e.g. from GT-guided segmentation).
+        stride (float): feature map stride in pixels, used to scale the output box.
+        mask_min_pixels (int): minimum number of pixels required in the masked region to produce a valid box.
+    Returns:
+        Tensor: shape [5], (cx, cy, w, h, angle) of the decoded oriented bounding box in image pixel coordinates, or None if decoding fails.
+    """
+    
+    mask = (per_gt_map > 0) & fg_mask  # gt_mask
+    ys, xs = torch.nonzero(mask, as_tuple=True)
+    if ys.numel() < mask_min_pixels:
+        return None
+
+    weights = per_gt_map[ys, xs].float()
+    if float(weights.sum().item()) <= 0:
+        return None
+
+    pts = torch.stack([xs.float(), ys.float()], dim=1)
+    mean = (weights.view(-1, 1) * pts).sum(dim=0) / weights.sum()  # this should be replaced by gt center
+    centered = pts - mean
+
+    w = weights.view(-1, 1)
+    cov = (centered * w).t().matmul(centered) / weights.sum()
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    major = eigvecs[:, 1]
+    if float(eigvals[1].item()) < 1e-8:
+        major = pts.new_tensor([1.0, 0.0])
+    major = major / torch.clamp(torch.norm(major), min=1e-6)
+    minor = torch.stack([-major[1], major[0]])
+
+    proj_u = centered.matmul(major)
+    proj_v = centered.matmul(minor)
+    mean_u = (weights * proj_u).sum() / weights.sum()
+    mean_v = (weights * proj_v).sum() / weights.sum()
+    var_u = (weights * (proj_u - mean_u)**2).sum() / weights.sum()
+    var_v = (weights * (proj_v - mean_v)**2).sum() / weights.sum()
+
+    # Same heuristic as the seg head: map weighted variance to rectangle side length.
+    width_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_u, min=0.0)), min=1.0)
+    height_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_v, min=0.0)), min=1.0)
+    center_feat = mean
+
+    cx = center_feat[0] * float(stride)
+    cy = center_feat[1] * float(stride)
+    w = width_feat * float(stride)
+    h = height_feat * float(stride)
+    angle = torch.atan2(major[1], major[0])
+    return torch.stack([cx, cy, w, h, angle], dim=0)

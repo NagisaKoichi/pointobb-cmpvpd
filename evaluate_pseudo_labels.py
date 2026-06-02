@@ -6,10 +6,10 @@ from mmrotate.core import poly2obb_np, eval_rbbox_map
 from mmrotate.datasets.dota import DOTADataset
 
 def main():
-    # 改成你的路径
     gt_dir = "/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/trainval/annfiles"
-    # pseudo_dir = "/media/ps/passport2/zlk/results/0527_xy_vpdstyle_cpmoriginal/vpd_cpm_dotav10/pseudo_labels"
-    pseudo_dir = "/media/ps/passport2/zlk/results/0511_obboriginal/vpd_cpm_dotav10/pseudo_labels"
+    pseudo_dir = "/media/ps/passport2/zlk/results/0527_xy_vpdstyle_cpmoriginal_clsw1_l5e-2/vpd_cpm_dotav10/pseudo_labels"
+    # pseudo_dir = "/media/ps/passport2/zlk/results/0511_obboriginal/vpd_cpm_dotav10/pseudo_labels"
+    # pseudo_dir = "/media/ps/passport2/zlk/results/0529_xy_vpdstyle_cpmoriginal_clsw1_l5e-2_lkl0p5/vpd_cpm_dotav10/pseudo_labels_legacy"
     version = "le90"
 
     classes = DOTADataset.CLASSES

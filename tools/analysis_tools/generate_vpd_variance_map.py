@@ -8,7 +8,7 @@ import mmcv
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from mmcv import Config, DictAction
 from mmcv.parallel import DataContainer
 from mmcv.runner import load_checkpoint, wrap_fp16_model
@@ -20,7 +20,8 @@ from mmrotate.utils import compat_cfg, get_device, setup_multi_processes
 from segment_variance_map import (build_gt_guided_remap_map,
                                   build_gt_guided_segmentation_mask,
                                   _extract_center_and_size,
-                                  _infer_image_shape)
+                                  _infer_image_shape,
+                                  _decode_obb_from_probmap)
 
 
 def parse_args():
@@ -52,7 +53,7 @@ def parse_args():
     parser.add_argument(
         '--seg-score-thr',
         type=float,
-        default=0.04,
+        default=0.05,
         help='optional per-object score threshold for GT-guided segmentation')
     parser.add_argument(
         '--seg-topk',
@@ -62,12 +63,12 @@ def parse_args():
     parser.add_argument(
         '--sigma-scale',
         type=float,
-        default=0.5,
+        default=0.2,
         help='adaptive sigma scale: sigma_i = sigma_scale * sqrt(w_i * h_i)')
     parser.add_argument(
         '--min-sigma',
         type=float,
-        default=1.0,
+        default=0.7,
         help='lower bound of adaptive sigma in feature-map coordinates')
     parser.add_argument(
         '--max-sigma',
@@ -77,12 +78,12 @@ def parse_args():
     parser.add_argument(
         '--bg-std-scale',
         type=float,
-        default=1.5,
+        default=1.0,
         help='background suppression threshold: mean + bg_std_scale * std')
     parser.add_argument(
         '--cls-floor',
         type=float,
-        default=0.05,
+        default=0.7,
         help='classification floor before contrast stretching')
     parser.add_argument(
         '--cls-gamma',
@@ -97,12 +98,12 @@ def parse_args():
     parser.add_argument(
         '--uncert-q-hi',
         type=float,
-        default=0.20,
+        default=0.40,
         help='upper quantile for uncertainty normalization')
     parser.add_argument(
         '--uncert-gamma',
         type=float,
-        default=0.7,
+        default=0.5,
         help='power applied to uncertainty confidence weight')
     parser.add_argument(
         '--alpha-cls',
@@ -200,6 +201,118 @@ def _label_to_color_mask(label_map, flip_direction):
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
     elif flip_direction == 'diagonal':
         img = img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
+    return img
+
+
+def _obb_to_poly8(obb):
+    cx, cy, w, h, angle = obb
+    c = torch.cos(angle)
+    s = torch.sin(angle)
+    hw = 0.5 * w
+    hh = 0.5 * h
+
+    corners = obb.new_tensor([
+        [-hw, -hh],
+        [hw, -hh],
+        [hw, hh],
+        [-hw, hh],
+    ])
+    rot = obb.new_tensor([[c, -s], [s, c]])
+    pts = corners.matmul(rot.t()) + obb.new_tensor([cx, cy])
+    return pts.reshape(-1)
+
+
+# def _decode_obb_from_probmap(per_gt_map, fg_mask, stride, mask_min_pixels=6):
+#     """
+#     Decode an oriented bounding box from a per-GT-object probability map, 
+#     using a weighted covariance method similar to the CPM seg head target generation.
+#     Args:
+#         per_gt_map (Tensor): shape [H, W], probability map for a single GT object (non-zero only within the GT mask).
+#         fg_mask (Tensor): shape [H, W], boolean mask of valid foreground pixels (e.g. from GT-guided segmentation).
+#         stride (float): feature map stride in pixels, used to scale the output box.
+#         mask_min_pixels (int): minimum number of pixels required in the masked region to produce a valid box.
+#     Returns:
+#         Tensor: shape [5], (cx, cy, w, h, angle) of the decoded oriented bounding box in image pixel coordinates, or None if decoding fails.
+#     """
+    
+#     mask = (per_gt_map > 0) & fg_mask  # gt_mask
+#     ys, xs = torch.nonzero(mask, as_tuple=True)
+#     if ys.numel() < mask_min_pixels:
+#         return None
+
+#     weights = per_gt_map[ys, xs].float()
+#     if float(weights.sum().item()) <= 0:
+#         return None
+
+#     pts = torch.stack([xs.float(), ys.float()], dim=1)
+#     mean = (weights.view(-1, 1) * pts).sum(dim=0) / weights.sum()  # this should be replaced by gt center
+#     centered = pts - mean
+
+#     w = weights.view(-1, 1)
+#     cov = (centered * w).t().matmul(centered) / weights.sum()
+#     eigvals, eigvecs = torch.linalg.eigh(cov)
+#     major = eigvecs[:, 1]
+#     if float(eigvals[1].item()) < 1e-8:
+#         major = pts.new_tensor([1.0, 0.0])
+#     major = major / torch.clamp(torch.norm(major), min=1e-6)
+#     minor = torch.stack([-major[1], major[0]])
+
+#     proj_u = centered.matmul(major)
+#     proj_v = centered.matmul(minor)
+#     mean_u = (weights * proj_u).sum() / weights.sum()
+#     mean_v = (weights * proj_v).sum() / weights.sum()
+#     var_u = (weights * (proj_u - mean_u)**2).sum() / weights.sum()
+#     var_v = (weights * (proj_v - mean_v)**2).sum() / weights.sum()
+
+#     # Same heuristic as the seg head: map weighted variance to rectangle side length.
+#     width_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_u, min=0.0)), min=1.0)
+#     height_feat = torch.clamp(torch.sqrt(torch.clamp(12.0 * var_v, min=0.0)), min=1.0)
+#     center_feat = mean
+
+#     cx = center_feat[0] * float(stride)
+#     cy = center_feat[1] * float(stride)
+#     w = width_feat * float(stride)
+#     h = height_feat * float(stride)
+#     angle = torch.atan2(major[1], major[0])
+#     return torch.stack([cx, cy, w, h, angle], dim=0)
+
+
+def _draw_boxes_on_image(img, boxes5, color=(255, 0, 0), width=2):
+    if boxes5 is None or len(boxes5) == 0:
+        return img
+
+    draw = ImageDraw.Draw(img)
+    for obb in boxes5:
+        poly8 = _obb_to_poly8(obb)
+        pts = [(float(poly8[i].item()), float(poly8[i + 1].item())) for i in range(0, 8, 2)]
+        draw.line(pts + [pts[0]], fill=color, width=width)
+    return img
+
+
+def _flip_rboxes_for_display(boxes5, img_w, img_h, flip_direction):
+    if boxes5 is None or len(boxes5) == 0 or not flip_direction:
+        return boxes5
+
+    out = boxes5.clone()
+    if flip_direction == 'horizontal':
+        out[:, 0] = float(img_w) - out[:, 0]
+        out[:, 4] = -out[:, 4]
+    elif flip_direction == 'vertical':
+        out[:, 1] = float(img_h) - out[:, 1]
+        out[:, 4] = -out[:, 4]
+    elif flip_direction == 'diagonal':
+        out[:, 0] = float(img_w) - out[:, 0]
+        out[:, 1] = float(img_h) - out[:, 1]
+    return out
+
+
+def _flip_pil_image(img, flip_direction):
+    if flip_direction == 'horizontal':
+        return img.transpose(Image.FLIP_LEFT_RIGHT)
+    elif flip_direction == 'vertical':
+        return img.transpose(Image.FLIP_TOP_BOTTOM)
+    elif flip_direction == 'diagonal':
+        return img.transpose(Image.FLIP_TOP_BOTTOM).transpose(Image.FLIP_LEFT_RIGHT)
     return img
 
 def _grayscale_erode(mask, kernel_size):
@@ -301,39 +414,54 @@ def _save_maps_for_image(img_path,
     print(f'probmap stats - min: {probmap.min().item():.6f}, max: {probmap.max().item():.6f}, mean: {probmap.mean().item():.6f}')
 
     if remap_output_mode == 'seg':
-        
-        variance = std_geo  # shape [H, W]
-        cpm = probmap  # shape [H, W]
-        
-        # sigmoid-fuse
-        # sigma_weight = 0.8
-        # fused = sigma_weight * (1 - variance.sigmoid()) + (1 - sigma_weight) * cpm
-        
-        fused = (1 - (variance.sigmoid() * (1 - cpm))).sqrt()
-        # erode
-        fused_np = fused.detach().cpu().numpy()
-        print(fused_np.shape)
-        print(f'Before erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
-        fused_np = _grayscale_erode(fused_np, kernel_size=1)
-        print(f'After erosion - fused stats: min: {fused_np.min():.6f}, max: {fused_np.max():.6f}, mean: {fused_np.mean():.6f}')
-        fused = torch.from_numpy(fused_np).to(fused.device).to(fused.dtype)
+        # probmap_np = probmap.detach().cpu().numpy()
+        # probmap_np = _grayscale_erode(probmap_np, kernel_size=3)
+        # probmap = torch.from_numpy(probmap_np).to(probmap.device).to(probmap.dtype)
         
         remapped_label_map = build_gt_guided_segmentation_mask(
-            p_model=fused,
+            p_model=probmap,
             gt_bboxes=gt_bboxes,
             img_meta=img_meta,
             sigma_scale=sigma_scale,
             min_sigma=min_sigma,
             max_sigma=max_sigma,
-            # score_thr=seg_score_thr,
-            score_thr=0.1,
+            score_thr=seg_score_thr,
             topk=seg_topk,
             bg_std_scale=bg_std_scale)
         remapped_img = _label_to_color_mask(remapped_label_map, flip_direction)
+
+        # Generate pseudo boxes from the same per-GT probmap logic used by the seg head.
+        pseudo_boxes = []
+        if gt_bboxes is not None and gt_bboxes.numel() > 0:
+            n_obj = gt_bboxes.shape[0]
+            for gt_idx in range(n_obj):
+                per_gt_map = probmap * (remapped_label_map == gt_idx).to(probmap.dtype)
+                obb = _decode_obb_from_probmap(
+                    per_gt_map=per_gt_map,
+                    fg_mask=(remapped_label_map != -1),
+                    stride=1.0,
+                    mask_min_pixels=6)
+                if obb is not None:
+                    pseudo_boxes.append(obb)
+
         # half-transparent overlay of segmentation mask on original image
         base_img = Image.open(img_path).convert('RGB')
         base_img = base_img.resize(remapped_img.size)
         remapped_img = Image.blend(base_img, remapped_img, alpha=0.8)
+
+        # draw pseudo boxes directly on top of the blended visualization
+        if pseudo_boxes:
+            overlay = remapped_img.copy()
+            pseudo_boxes = _flip_rboxes_for_display(
+                torch.stack(pseudo_boxes, dim=0),
+                img_w=overlay.width,
+                img_h=overlay.height,
+                flip_direction=flip_direction)
+            overlay = _draw_boxes_on_image(overlay, pseudo_boxes, color=(255, 64, 0), width=2)
+            remapped_img = overlay
+        
+        # temporarily save the probmap
+        # remapped_img = _to_heatmap(probmap, flip_direction)
 
     elif remap_output_mode == 'gt_guided':
         # Build remap as distance-from-mapped-position-to-nearest-GT using mu.
