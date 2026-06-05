@@ -7,9 +7,11 @@ from mmrotate.datasets.dota import DOTADataset
 
 def main():
     gt_dir = "/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/trainval/annfiles"
-    pseudo_dir = "/media/ps/passport2/zlk/results/0527_xy_vpdstyle_cpmoriginal_clsw1_l5e-2/vpd_cpm_dotav10/pseudo_labels"
+    # gt_dir = "/media/ps/passport2/zlk/results/0601_xy_vpdstyle_clsw1_l5e-2_lkl0p5_onlylr/vpd_cpm_dotav10/pseudo_labels_seg"
+    # pseudo_dir = "/media/ps/passport2/zlk/results/0601_xy_vpdstyle_clsw1_l5e-2_lkl0p5_onlylr/vpd_cpm_dotav10/pseudo_labels"
     # pseudo_dir = "/media/ps/passport2/zlk/results/0511_obboriginal/vpd_cpm_dotav10/pseudo_labels"
     # pseudo_dir = "/media/ps/passport2/zlk/results/0529_xy_vpdstyle_cpmoriginal_clsw1_l5e-2_lkl0p5/vpd_cpm_dotav10/pseudo_labels_legacy"
+    pseudo_dir = "/media/ps/passport2/zlk/results/0605_xy_vpdstyle_clsw1_l5e-2_lkl0p5_onlylr_alpha/vpd_cpm_dotav10/pseudo_labels_fused"
     version = "le90"
 
     classes = DOTADataset.CLASSES
@@ -55,7 +57,7 @@ def main():
             else:
                 per_cls_np.append(np.array(arr, dtype=np.float32))
         det_results.append(per_cls_np)
-
+        
     mAP50, _ = eval_rbbox_map(
         det_results,
         annotations,
@@ -64,6 +66,34 @@ def main():
         nproc=4
     )
     print({"pseudo_mAP50": float(mAP50)})
+    
+    if False:
+        bins = 10    
+        # draw a histogram
+        iou_thrs = np.linspace(1/bins, 1.0, bins)
+        mAPs = []
+        for iou_thr in iou_thrs:
+            mAP, _ = eval_rbbox_map(
+                det_results,
+                annotations,
+                iou_thr=iou_thr,
+                dataset=classes,
+                nproc=4
+            )
+            mAPs.append(float(mAP))
+        # mAP_bins = np.array(mAPs)  # cumulative -> bin_specific
+        # mAP_bins = np.diff(np.concatenate(([0], mAP_bins)))  # 转换为每个 IoU 阈值对应的增量 mAP
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(8, 4))
+        plt.plot(iou_thrs, mAPs, marker='o')
+        plt.title("mAP vs IoU Threshold for Pseudo Labels")
+        plt.xlabel("IoU Threshold")
+        plt.ylabel("mAP")
+        plt.grid()
+        plt.savefig("pseudo_label_map_curve.png")
+        plt.show()
+    
+    
 
 
 if __name__ == '__main__':

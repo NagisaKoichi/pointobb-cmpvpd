@@ -57,8 +57,8 @@ class CPMVPDSegPseudoHead(CPMVPDHead):
                  uncert_q_lo=0.01,
                  uncert_q_hi=0.40,
                  uncert_gamma=0.5,
-                 alpha_cls=0.5,
-                 alpha_uncert=0.5,
+                 alpha_cls=0.66,
+                 alpha_uncert=0.33,
                  prob_smooth_ksize=3,
                  prob_local_contrast=0.30,
                  **kwargs):

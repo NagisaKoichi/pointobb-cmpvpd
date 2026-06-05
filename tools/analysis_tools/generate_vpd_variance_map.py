@@ -108,12 +108,12 @@ def parse_args():
     parser.add_argument(
         '--alpha-cls',
         type=float,
-        default=0.5,
+        default=0.25,
         help='fusion exponent for classification branch')
     parser.add_argument(
         '--alpha-uncert',
         type=float,
-        default=0.5,
+        default=0.75,
         help='fusion exponent for uncertainty branch')
     parser.add_argument(
         '--prob-smooth-ksize',
