@@ -166,6 +166,20 @@ def main():
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
+    
+    # ------------ freeze fpn ------------
+    # if hasattr(model, 'neck') and model.neck is not None:
+    #     for param in model.neck.parameters():
+    #         param.requires_grad = False
+    #     print('FPN parameters have been frozen.')
+        
+    #     # chance the BN layer in FPN to eval mode
+    #     for m in model.neck.modules():
+    #         if isinstance(m, torch.nn.BatchNorm2d):
+    #             m.eval()
+    #             print('FPN BatchNorm layers have been set to eval mode.')
+                
+    # -----------------------------------
 
     datasets = [build_dataset(cfg.data.train)]
     if len(cfg.workflow) == 2:

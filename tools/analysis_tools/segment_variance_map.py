@@ -44,6 +44,9 @@ def _extract_center_and_size(gt_bboxes):
 	return cx, cy, bw, bh
 
 
+# def _get_gt_xy_knndist(gt_bboxes, img_meta, k=4):
+
+
 def _gaussian_priors(h, w, cx, cy, sigma):
 	yy, xx = torch.meshgrid(
 		torch.arange(h, device=cx.device, dtype=torch.float32),
@@ -72,7 +75,7 @@ def _compute_gt_guided_maps(p_model,
 	if gt_bboxes is None or gt_bboxes.numel() == 0:
 		return p_model, None
 
-	cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)
+	cx, cy, bw, bh = _extract_center_and_size(gt_bboxes)  # each one is [n_gt]
 	if cx is None:
 		return p_model, None
 
