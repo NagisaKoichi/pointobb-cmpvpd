@@ -26,6 +26,7 @@ from .pseudo_label_head import PseudoLabelHead
 from .vpd_pseudo_label_head import VPDPseudoLabelHead
 
 from .cpm_vpd_fused_pseudo_head import CPMVPDFusedPseudoHead
+from .cpm_vi_head import CPMVIHead
 
 __all__ = [
     'RotatedAnchorHead', 'RotatedRetinaHead', 'RotatedRPNHead',
@@ -37,5 +38,5 @@ __all__ = [
     'CPMRegHead', 'CPMVPDHead', 'CPMVPDPseudoHead', 'PseudoLabelHead',
     'CPMVPDSegPseudoHead', 'VPDPseudoLabelHead',
     
-    'CPMVPDFusedPseudoHead'
+    'CPMVPDFusedPseudoHead', 'CPMVIHead'
 ]

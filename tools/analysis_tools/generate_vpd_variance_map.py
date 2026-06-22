@@ -136,7 +136,7 @@ def parse_args():
         help='only include this class name in scatter plot (overrides --scatter-class)')
     parser.add_argument(
         '--remap-output-mode',
-        default='seg',
+        default='cpm_variance',
         help='output processed variance map or GT-instance segmentation mask')
     parser.add_argument(
         '--gpu-id',
@@ -324,9 +324,12 @@ def _grayscale_erode(mask, kernel_size):
 def _save_maps_for_image(img_path,
                          img_meta,
                          flip_direction,
-                         bbox_pred_lvl,
-                         cls_score_lvl,
-                         centerness_lvl,
+                        #  bbox_pred_lvl,
+                        #  cls_score_lvl,
+                        #  centerness_lvl,
+                         bbox_preds,
+                         cls_scores,
+                         centernesses,
                          gt_bboxes,
                          out_path,
                          out_mean_path,
@@ -348,16 +351,24 @@ def _save_maps_for_image(img_path,
                          prob_smooth_ksize,
                          prob_local_contrast):
     # Keep compatibility with old 4-channel checkpoints [mu_x, mu_y, log_sx, log_sy].
-    num_bbox_channels = int(bbox_pred_lvl.shape[0])
-    if num_bbox_channels < 4:
-        raise ValueError(
-            f'Unsupported bbox_pred channels: {num_bbox_channels}. '
-            'Mu visualization requires the 4-channel VPD output '
-            '[mu_x, mu_y, log_sx, log_sy].')
+    # num_bbox_channels = int(bbox_pred_lvl.shape[0])
+    # if num_bbox_channels < 4:
+    #     raise ValueError(
+    #         f'Unsupported bbox_pred channels: {num_bbox_channels}. '
+    #         'Mu visualization requires the 4-channel VPD output '
+    #         '[mu_x, mu_y, log_sx, log_sy].')
+    
+        
+    bbox_pred_lvl = bbox_preds[0]
+    cls_score_lvl = cls_scores[0]
+    centerness_lvl = centernesses[0]
 
     bbox_mu = torch.nan_to_num(
         bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
     log_sigma = bbox_pred_lvl[2:4]
+    
+        
+    # print(bbox_mu.mean(), bbox_mu.min(), bbox_mu.max())
 
     lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
     center_lstd = lstd.mean(dim=0)
@@ -370,7 +381,8 @@ def _save_maps_for_image(img_path,
     centerness_lvl = torch.nan_to_num(centerness_lvl, nan=0.0, posinf=50.0, neginf=-50.0)
 
     max_class_prob = cls_score_lvl.sigmoid().max(dim=0)[0]
-    centerness_prob = centerness_lvl.sigmoid().squeeze(0)
+    # centerness_prob = centerness_lvl.sigmoid().squeeze(0)
+    centerness_prob = centerness_lvl.squeeze(0)
     combined_score = max_class_prob
 
     # Use geometric uncertainty from two sigma channels, avoiding channel mean.
@@ -543,18 +555,78 @@ def _save_maps_for_image(img_path,
             
     
     elif remap_output_mode == 'mu':
-        mu_scale = 8.0
+        mu_scale = 1.0
         mu = bbox_mu * mu_scale  # shape [2, H, W]
         w, h = mu.shape[2], mu.shape[1]
         reprojected_x = torch.arange(w, device=mu.device, dtype=mu.dtype) + mu[0]
-        reprojected_y = torch.arange(h, device=mu.device, dtype=mu.dtype) + mu[1]
+        # print(reprojected_x.shape, mu.shape)
+        # print(mu.mean())
+        # print(torch.Tensor([1, 2]) + torch.Tensor([[0.1, 0.2], [0.3, 0.4]]))
+        # print(xxx)
+        reprojected_y = (torch.arange(h, device=mu.device, dtype=mu.dtype) + mu[1].T).T
         reprojected_x = reprojected_x.clamp(0, w - 1)
         reprojected_y = reprojected_y.clamp(0, h - 1)
-        remapped_img = _to_heatmap(reprojected_x, flip_direction)
+        
+        # reprojected_xx, reprojected_yy = torch.meshgrid(reprojected_x, reprojected_y, indexing='ij')
+        # reprojected_xx = reprojected_xx.clamp(0, w - 1)
+        # reprojected_yy = reprojected_yy.clamp(0, h - 1)
+        # reprojected_xy = torch.stack([reprojected_xx, reprojected_yy], dim=0)
+        
+        # reprojected_xy = torch.stack([reprojected_x, reprojected_y], dim=0)
+        
+        # for each reprojected position, add 1 to the corresponding pixel in the remapped image, then visualize the remapped image as a heatmap.
+        heatmap = torch.zeros((h, w), device=mu.device, dtype=mu.dtype)
+        for i in range(w):
+            for j in range(h):
+                x = int(reprojected_x[j, i].item())
+                y = int(reprojected_y[j, i].item())
+                # reprojected_max_cls = center_lstd[y, x]
+                # heatmap[j, i] = reprojected_max_cls  # or just set to 1.0 for binary mask
+                heatmap[y, x] = 1.0
+        
+        # remapped_img = _to_heatmap(reprojected_x, flip_direction)
+        
+        # fill the region contains the gt_center (like the magic wand tool in photoshop)
+        def flood_fill(x, y, target_x, target_y, visited):
+            if x < 0 or x >= w or y < 0 or y >= h:
+                return
+            if visited[y, x]:
+                return
+            visited[y, x] = True
+            heatmap[y, x] = 1.0
+            if abs(x - target_x) <= 1 and abs(y - target_y) <= 1:
+                # If the current pixel is close enough to the GT center, stop filling further.
+                return
+            # Recursively fill neighboring pixels.
+            flood_fill(x + 1, y, target_x, target_y, visited)
+            flood_fill(x - 1, y, target_x, target_y, visited)
+            flood_fill(x, y + 1, target_x, target_y, visited)
+            flood_fill(x, y - 1, target_x, target_y, visited)
+            
+        # use gt_centers as the initial seed points for flood fill to create a filled segmentation mask.
+        cx, cy, _, _ = _extract_center_and_size(gt_bboxes)
+        if cx is not None:
+            img_h, img_w = _infer_image_shape(img_meta)
+            sx = float(w) / max(float(img_w), 1.0)  # feature-map to image scaling factor
+            sy = float(h) / max(float(img_h), 1.0)
+
+            cx_f = (cx.to(device=mu.device, dtype=mu.dtype) * sx).to(torch.int64)
+            cy_f = (cy.to(device=mu.device, dtype=mu.dtype) * sy).to(torch.int64)
+
+            visited = torch.zeros((h, w), dtype=torch.bool, device=mu.device)
+            for gt_idx in range(cx_f.shape[0]):
+                target_x = int(cx_f[gt_idx].item())
+                target_y = int(cy_f[gt_idx].item())
+                if 0 <= target_x < w and 0 <= target_y < h:
+                    flood_fill(target_x, target_y, target_x, target_y, visited)
+                    
+                
+        remapped_img = _to_heatmap(heatmap, flip_direction)
+        # remapped_img = _to_heatmap(heatmap, flip_direction)
         
     elif remap_output_mode == 'mu_density':
         # for each pixel, compute the density of reprojected positions from mu, then visualize the density map.
-        mu_scale = 1.0
+        mu_scale = 10.0
         mu = bbox_mu * mu_scale  # shape [2, H, W]
         w, h = mu.shape[2], mu.shape[1]
         reprojected_x = torch.arange(w, device=mu.device, dtype=mu.dtype) + mu[0]
@@ -589,6 +661,74 @@ def _save_maps_for_image(img_path,
         
         remapped_img = _to_heatmap(fused, flip_direction)
         
+    elif remap_output_mode == 'cpm_variance':
+        # for every pixel, compute the variance across all types.
+        cpm_per_type = cls_score_lvl  # shape [num_classes, H, W]
+        # cpm_std = torch.std(cpm_per_type, dim=0)  # shape [H, W]
+        cpm_std = cpm_per_type[1]
+        remapped_img = _to_heatmap(cpm_std, flip_direction)
+        
+    elif remap_output_mode == 'variance_multilayer':
+        # visualize all layers of FPN variance side by side for comparison.
+        remapped_img_all = []
+        for lvl in range(len(bbox_preds)):
+            bbox_pred_lvl = bbox_preds[lvl]
+            bbox_mu = torch.nan_to_num(
+                bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
+            log_sigma = bbox_pred_lvl[2:4]
+            lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+            c_lstd = lstd.mean(dim=0)
+            # resize: each layer is downsampled by 2x from the previous, so upsample back to the original size for fair comparison.
+            if lvl > 0:
+                c_lstd = F.interpolate(c_lstd[None, None], scale_factor=2**lvl, mode='bilinear', align_corners=False)[0, 0]
+            
+            remapped_img = _to_heatmap(c_lstd, flip_direction)
+            remapped_img_all.append(remapped_img)
+            # remapped_img = _to_heatmap(c_lstd, flip_direction)
+            # remapped_img.save(osp.join(out_path, f'variance_fpn_layer{lvl}.png'))
+            
+        remapped_img = Image.new('RGB', (remapped_img_all[0].width * len(remapped_img_all), remapped_img_all[0].height))
+        for i, img in enumerate(remapped_img_all):
+            remapped_img.paste(img, (i * img.width, 0))
+            
+    elif remap_output_mode == 'variance_mlvlmean':
+        # multilayer mean
+        lstd_all = []
+        for lvl in range(len(bbox_preds)):
+            bbox_pred_lvl = bbox_preds[lvl]
+            bbox_mu = torch.nan_to_num(
+                bbox_pred_lvl[0:2], nan=0.0, posinf=1e4, neginf=-1e4)
+            log_sigma = bbox_pred_lvl[2:4]
+            lstd = torch.nan_to_num(log_sigma, nan=0.0, posinf=1e4, neginf=-1e4)
+            c_lstd = lstd.mean(dim=0)
+            # resize: each layer is downsampled by 2x from the previous, so upsample back to the original size for fair comparison.
+            if lvl > 0:
+                c_lstd = F.interpolate(c_lstd[None, None], scale_factor=2**lvl, mode='bilinear', align_corners=False)[0, 0]
+            lstd_all.append(c_lstd)
+            
+        # normalize
+        lstd_all = [torch.clamp((l - lstd_all[0].min()) / (lstd_all[0].max() - lstd_all[0].min() + 1e-6), 0.0, 1.0) for l in lstd_all]
+        
+        # total 6 layers
+        # decay_coeff = 0.7
+        # combined_lstd = None
+        # for i, lstd_layer in enumerate(lstd_all):
+        #     if combined_lstd is None:
+        #         combined_lstd = lstd_layer
+        #     else:
+        #         combined_lstd = combined_lstd * (1 - decay_coeff) + lstd_layer * decay_coeff
+        #         decay_coeff *= 0.5
+        # or directly use weights
+        weights = [0.5, 0.0, 0.5, 0.0, 0.0, 0.0]
+        combined_lstd = sum(w * l for w, l in zip(weights, lstd_all))
+        # normalize
+        combined_lstd = torch.clamp((combined_lstd - combined_lstd.min()) / (combined_lstd.max() - combined_lstd.min() + 1e-6), 0.0, 1.0)
+        
+        thresh = 0.75
+        combined_lstd = (combined_lstd < thresh).float() * combined_lstd  # only keep high-variance areas
+                
+        remapped_img = _to_heatmap(combined_lstd, flip_direction)
+
     else:
         raise ValueError(f'Unsupported remap_output_mode: {remap_output_mode}')
 
@@ -775,15 +915,25 @@ def main():
     def _hook_fn(_module, _inputs, outputs):
         if not isinstance(outputs, (list, tuple)):
             raise RuntimeError('Unexpected bbox_head output type.')
+        print("len_outputs", len(outputs))
         if len(outputs) == 3:
             cls_scores, bbox_preds, centernesses = outputs
         elif len(outputs) == 4:
-            cls_scores, bbox_preds, _, centernesses = outputs
+            # cls_scores, bbox_preds, _, centernesses = outputs
+            cls_scores, bbox_preds, centernesses, _= outputs
+        elif len(outputs) == 5:
+            cls_scores, _, angle_preds, centernesses, bbox_preds = outputs
+            # captured['vi_preds'] = vi_preds  # 捕获 VI 预测
         else:
             raise RuntimeError(f'Unexpected bbox_head output length: {len(outputs)}')
         captured['cls_scores'] = cls_scores
         captured['bbox_preds'] = bbox_preds
         captured['centernesses'] = centernesses
+        print("types: cls_scores:", type(cls_scores), "bbox_preds:", type(bbox_preds), "centernesses:", type(centernesses))
+        print("shapes: cls_scores:", cls_scores[0].shape, "bbox_preds:", bbox_preds[0].shape, "centernesses:", centernesses[0].shape)
+        # if 'vi_preds' in captured:
+        #     print("shapes: vi_preds:", captured['vi_preds'][0].shape)
+
 
     hook_handle = model.bbox_head.register_forward_hook(_hook_fn)
 
@@ -832,6 +982,12 @@ def main():
             bbox_pred_lvl = bbox_preds[args.feat_level][b]
             cls_score_lvl = cls_scores[args.feat_level][b]
             centerness_lvl = centernesses[args.feat_level][b]
+            
+            # multilevel
+            bbox_pred_mlvl = [lvl[b] for lvl in bbox_preds]
+            cls_score_mlvl = [lvl[b] for lvl in cls_scores]
+            centerness_mlvl = [lvl[b] for lvl in centernesses]
+            
             gt_bboxes = None if gt_bboxes_list is None else gt_bboxes_list[b]
             gt_labels = None if gt_labels_list is None else gt_labels_list[b]
 
@@ -846,9 +1002,12 @@ def main():
                 img_path,
                 meta,
                 flip_direction,
-                bbox_pred_lvl,
-                cls_score_lvl,
-                centerness_lvl,
+                # bbox_pred_lvl,
+                # cls_score_lvl,
+                # centerness_lvl,
+                bbox_pred_mlvl,
+                cls_score_mlvl,
+                centerness_mlvl,
                 gt_bboxes,
                 out_path,
                 out_mean_path,

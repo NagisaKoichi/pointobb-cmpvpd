@@ -73,7 +73,7 @@ model = dict(
         num_outs=6,
         relu_before_extra_convs=True),
     bbox_head=dict(
-        type='CPMVPDHead',  # CPM with Point-Supervised VPD
+        type='CPMVIHead',  # CPM with Point-Supervised VPD
         num_classes=len(classes),
         in_channels=256,
         stacked_convs=4,
@@ -101,35 +101,27 @@ model = dict(
     # training and testing settings
     train_cfg=dict(
         visualize=False,
-        store_dir=store_dir,
-        cls_weight=1.0,              # Classification loss weight
-        thresh1=6,                  # Positive sample threshold
-        alpha=1.5,                    # Negative sample coefficient
-        use_point_supervised=True,  # Enable point-supervised mode
-        js_weight=0.5,              # VPD JS loss weight on XY
-        js_project_min=-16.0,
-        js_project_max=16.0,
-        js_num_bins=21,
-        num_samples_train=1,
-
-        # sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
-        # fg_inner_radius=8.0,        # Inner radius for foreground samples
-        # fg_transition=1.5,          # Transition parameter for foreground samples
-        # fg_cls_thr=0.2,             # Classification score threshold for foreground samples
-        # fg_logit_scale=12.0,        # Logit scaling factor for foreground samples in VPD loss
-        # fg_geo_weight=0.2,          # Balance geometry and feature guidance
-        # fg_detach=True,             # Keep cls branch stable while sigma learns
-        # sigma_fg_target=1.0,        # Target sigma value for foreground samples in VPD loss
-        # sigma_bg_target=4.0,        # Target sigma value for background samples in VPD loss
-        ),
-
+        cls_weight=1.0,
+        thresh1=6,
+        alpha=1.5,
+        # VI分支配置
+        vi_weight=1.0,
+        vi_kl_weight=0.01,
+        vi_num_bins=21,
+        vi_soft_label_sigma=0.4,
+    ),
     test_cfg=dict(
-        store_dir=store_dir,
         nms_pre=2000,
         min_bbox_size=0,
         score_thr=0.05,
-        nms=dict(iou_thr=0.1),
-        max_per_img=2000))
+        nms=dict(type='nms_rotated', iou_thr=0.1),
+        max_per_img=2000,
+        # VI推理配置
+        use_vi_score=True,
+        vi_score_mode='multiply',  # or 'replace', 'filter'
+        vi_thr=0.5,
+    ),
+    )
 
 find_unused_parameters = True
 runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=6)

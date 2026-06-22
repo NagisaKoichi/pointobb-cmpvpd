@@ -87,7 +87,7 @@ class CPMVPDHead(CPMHead):
         super()._init_predictor()
         # Replace conv_reg with 4-channel version:
         # (delta_x, delta_y, log_sx, log_sy)
-        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)  # dimensions:[prob_pos_mu, prob_neg_mu, prob_pos_lstd, prob_neg_lstd]
+        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)
 
     def forward_single(self, x, scale, stride):
         """Forward for a single FPN level. Returns (cls_score, bbox_pred, centerness).
@@ -263,22 +263,6 @@ class CPMVPDHead(CPMHead):
                 torch.cat([gt_ids[i] for gt_ids in gt_ids_list]))
 
         return concat_lvl_labels, concat_lvl_gt_ids
-    
-    def get_target_variational(self, points, gt_bboxes_list, gt_labels_list, sample_preds):
-        """
-        Like get_targets_vpd, but use sample_preds to assign pos and neg samples.
-        Args:
-            points (list[Tensor]): Per-level anchor points.
-            gt_bboxes_list (list[Tensor]): Per-image GT bboxes. (use to extract center only)
-            gt_labels_list (list[Tensor]): Per-image GT labels.
-            sample_preds (Tensor): (N, num_samples, 4) sampled bbox predictions in
-        Returns:
-            concat_lvl_labels (list[Tensor]): Per-level class labels.
-            concat_lvl_gt_ids (list[Tensor]): Per-level GT instance index (-1=ignore/neg).
-        """
-        
-        
-        return 
 
     # ------------------------------------------------------------------
     # Loss

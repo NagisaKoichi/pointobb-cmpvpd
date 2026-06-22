@@ -23,7 +23,7 @@ from .cpm_head import CPMHead
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
 
 INF = 1e8
-
+USE_CLS_VAR = True
 
 @ROTATED_HEADS.register_module()
 class CPMVPDHead(CPMHead):
@@ -77,6 +77,11 @@ class CPMVPDHead(CPMHead):
             project_max=self.js_project_max,
             num_bins=self.js_num_bins,
         ))
+        
+        self.loss_cls_var = build_loss(dict(
+            type='VariationalClassificationLoss',
+            # num_classes=self.cls_out_channels,
+        ))
 
     def _init_predictor(self):
         """Override predictor: conv_reg outputs 4 channels (2 mu + 2 log_sigma).
@@ -87,7 +92,9 @@ class CPMVPDHead(CPMHead):
         super()._init_predictor()
         # Replace conv_reg with 4-channel version:
         # (delta_x, delta_y, log_sx, log_sy)
-        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)  # dimensions:[prob_pos_mu, prob_neg_mu, prob_pos_lstd, prob_neg_lstd]
+        self.conv_reg = nn.Conv2d(self.feat_channels, 4, 3, padding=1)
+        
+        self.conv_cls_var = nn.Conv2d(self.feat_channels, 1, 3, padding=1)
 
     def forward_single(self, x, scale, stride):
         """Forward for a single FPN level. Returns (cls_score, bbox_pred, centerness).
@@ -111,7 +118,12 @@ class CPMVPDHead(CPMHead):
         bbox_log_sigma = bbox_dist[:, 2:]   # (N, 2, H, W)
 
         bbox_pred_full = torch.cat([bbox_mu, bbox_log_sigma], dim=1)  # (N, 4, H, W)
-        return cls_score, bbox_pred_full, centerness
+        
+        cls_var = self.conv_cls_var(cls_feat).float()  # (N, 1, H, W)
+        
+        cls_score = torch.cat([cls_score, cls_var], dim=1)  # (N, C+1, H, W)
+        
+        return cls_score, bbox_pred_full, centerness, cls_var
 
     def _save_variance_map(self, img_path, flip_direction, bbox_pred_lvl):
         """Visualize and save center/scale lstd maps from predicted log-std."""
@@ -263,32 +275,27 @@ class CPMVPDHead(CPMHead):
                 torch.cat([gt_ids[i] for gt_ids in gt_ids_list]))
 
         return concat_lvl_labels, concat_lvl_gt_ids
-    
-    def get_target_variational(self, points, gt_bboxes_list, gt_labels_list, sample_preds):
-        """
-        Like get_targets_vpd, but use sample_preds to assign pos and neg samples.
-        Args:
-            points (list[Tensor]): Per-level anchor points.
-            gt_bboxes_list (list[Tensor]): Per-image GT bboxes. (use to extract center only)
-            gt_labels_list (list[Tensor]): Per-image GT labels.
-            sample_preds (Tensor): (N, num_samples, 4) sampled bbox predictions in
-        Returns:
-            concat_lvl_labels (list[Tensor]): Per-level class labels.
-            concat_lvl_gt_ids (list[Tensor]): Per-level GT instance index (-1=ignore/neg).
-        """
-        
-        
-        return 
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'centernesses'))
-    def loss(self, cls_scores, bbox_preds, centernesses,
+    def loss(self, cls_scores, bbox_preds, centernesses, cls_var, 
              gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
-        """Compute ELBO loss for point-supervised VPD."""
+        """
+        Compute ELBO loss for point-supervised VPD.
+        """
         assert len(cls_scores) == len(bbox_preds) == len(centernesses)
+        
+        # cls_scores is list[tensor], each (N, C+1, H, W)
+        # we want to split into cls_score list[tensor(N, C, H, W)] and cls_var list[tensor(N, 1, H, W)]
+        cls_score_list = [cs[:, :self.cls_out_channels] for cs in cls_scores]
+        cls_var_list = [cs[:, self.cls_out_channels:] for cs in cls_scores]
+        cls_scores = cls_score_list
+        cls_var = cls_var_list
+        # print(cls_scores[0].shape, cls_var[0].shape)
+            
 
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
@@ -348,22 +355,41 @@ class CPMVPDHead(CPMHead):
             device=bbox_preds[0].device)), 1.0)
 
         # Classification loss
-        loss_cls = self.loss_cls(
+        loss_cls = self.loss_cls(  # focal loss
             flatten_cls_scores[avail_inds],
             flatten_labels[avail_inds],
             avg_factor=num_avail)
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
+        
+        
+        # variational version of classification loss
+        # gaussian sampling for reparameterization
+        flatten_cls_logvars = torch.cat(
+            [logvar.permute(0, 2, 3, 1).reshape(-1, 1) for logvar in cls_var])
+        
+        flatten_labels = torch.cat(labels)
+        
+        # ==========================================
+        # 计算 分类 Variance Loss
+        # ==========================================
+                
+        loss_cls_var = self.loss_cls_var(
+            flatten_cls_scores[avail_inds],
+            flatten_cls_logvars[avail_inds],
+            flatten_labels[avail_inds],
+        ) * 0.001
 
         # VPD loss on positive samples
         if len(pos_inds) == 0:
             zero = flatten_bbox_preds.sum() * 0.0
             return dict(
                 loss_cls=loss_cls,
+                loss_cls_var=loss_cls_var,
                 loss_vpd=zero,
                 vpd_center=zero.detach(),
                 vpd_kl=zero.detach(),
                 vpd_var=zero.detach())
-
+            
         pos_bbox_preds = flatten_bbox_preds[pos_inds]   # (Np, 4)
         pos_points = flatten_points[pos_inds]           # (Np, 2)
         pos_img_ids = img_ids[pos_inds]                 # (Np,)
@@ -404,6 +430,7 @@ class CPMVPDHead(CPMHead):
 
         return dict(
             loss_cls=loss_cls,
+            loss_cls_var=loss_cls_var,
             loss_vpd=loss_vpd,
             vpd_center=vpd_losses['loss_center'].detach(),
             vpd_kl=vpd_losses['loss_kl'].detach(),

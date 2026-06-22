@@ -9,9 +9,11 @@ from .point_supervised_vpd_loss import PointSupervisedVPDLoss
 from .rotated_iou_loss import RotatedIoULoss
 from .smooth_focal_loss import SmoothFocalLoss
 from .spatial_border_loss import SpatialBorderLoss
+from .variational_cls_loss import VariationalClassificationLoss
+from .vi_pos_neg_loss import VIPosNegLoss
 
 __all__ = [
     'GDLoss', 'GDLoss_v1', 'KFLoss', 'ConvexGIoULoss', 'BCConvexGIoULoss',
     'KLDRepPointsLoss', 'SmoothFocalLoss', 'RotatedIoULoss',
-    'SpatialBorderLoss', 'JSLoss', 'PointSupervisedVPDLoss'
+    'SpatialBorderLoss', 'JSLoss', 'PointSupervisedVPDLoss', 'VIPosNegLoss'
 ]

@@ -372,6 +372,10 @@ class PseudoLabelHead(RotatedFCOSHead):
             cls_scores_all (list[Tensor]): feature map scores on each point for each scale level, 
                 len(cls_scores_all) = num_levels, cls_scores_all[i].size() = (num_classes, w, h)
         """
+        # replace cls_scores_all[0] with the variance of cpm
+        cls_scores_var_first = torch.var(cls_scores_all[0], dim=0)  # shape [w, h]
+        cls_scores_all[0] = cls_scores_var_first.unsqueeze(0).repeat(self.num_classes, 1, 1)  # shape [num_classes, w, h]
+        
         alpha = alpha
         thresh3 = self.thresh3
         pca_length = self.pca_length

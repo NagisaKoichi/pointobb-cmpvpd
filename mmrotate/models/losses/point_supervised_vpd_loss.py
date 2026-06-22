@@ -122,6 +122,18 @@ class PointSupervisedVPDLoss(nn.Module):
         kl_pm = (p * (torch.log(p) - torch.log(m))).sum(dim=1)
         kl_qm = (q * (torch.log(q) - torch.log(m))).sum(dim=1)
         return 0.5 * (kl_pm + kl_qm)
+    
+    def _kl_divergence(self, p, q):
+        """KL divergence D_KL(p || q) for row-wise distributions."""
+        kl = (p * (torch.log(p) - torch.log(q))).sum(dim=1)
+        return kl
+    
+    def _wasserstein_distance(self, p, q):
+        """1D Wasserstein distance for row-wise distributions."""
+        cdf_p = torch.cumsum(p, dim=1)
+        cdf_q = torch.cumsum(q, dim=1)
+        wasserstein = torch.sum(torch.abs(cdf_p - cdf_q) * self.bin_width, dim=1)
+        return wasserstein
 
     def forward(self,
                 bbox_mu,
@@ -176,10 +188,14 @@ class PointSupervisedVPDLoss(nn.Module):
 
         js_x = self._js_divergence(target_x, pred_x)
         js_y = self._js_divergence(target_y, pred_y)
+        # js_x = self._kl_divergence(target_x, pred_x)
+        # js_y = self._kl_divergence(target_y, pred_y)
         l_center = 0.5 * (js_x + js_y).mean()
+                
         if NAN_TO_NUM:
             l_center = torch.nan_to_num(l_center, nan=0.0, posinf=1e4, neginf=0.0)
-
+        
+   
         # VPD mode: no explicit prior/KL branch.
         l_kl = bbox_mu.sum() * 0.0
         l_var = bbox_mu.sum() * 0.0
