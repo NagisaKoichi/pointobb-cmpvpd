@@ -691,6 +691,22 @@ def _save_maps_for_image(img_path,
         for i, img in enumerate(remapped_img_all):
             remapped_img.paste(img, (i * img.width, 0))
             
+    elif remap_output_mode == 'cpm_multilayer':
+        # visualize all layers of FPN cpm side by side for comparison.
+        remapped_img_all = []
+        for lvl in range(len(cls_scores)):
+            cls_score_lvl = cls_scores[lvl]
+            max_cls_score_lvl = cls_score_lvl.sigmoid().max(dim=0)[0]
+            if lvl > 0:
+                max_cls_score_lvl = F.interpolate(max_cls_score_lvl[None, None], scale_factor=2**lvl, mode='bilinear', align_corners=False)[0, 0]
+            remapped_img = _to_heatmap(max_cls_score_lvl, flip_direction)
+            remapped_img_all.append(remapped_img)
+
+            
+        remapped_img = Image.new('RGB', (remapped_img_all[0].width * len(remapped_img_all), remapped_img_all[0].height))
+        for i, img in enumerate(remapped_img_all):
+            remapped_img.paste(img, (i * img.width, 0))
+            
     elif remap_output_mode == 'variance_mlvlmean':
         # multilayer mean
         lstd_all = []

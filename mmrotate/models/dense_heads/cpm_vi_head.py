@@ -52,9 +52,9 @@ class CPMVIHead(CPMHead):
     """
 
     def __init__(self, *args, vi_weight=1.0, vi_num_bins=21,
-                 vi_soft_label_sigma=0.4, use_vi_score=False,
+                 vi_soft_label_sigma=1.28, use_vi_score=False,
                  vi_score_mode='multiply', vi_thr=0.5,
-                 warmup_iters=30000, temp_start=1.0, temp_end=0.1, temp_decay_iters=20000,
+                 warmup_iters=2000, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
                  **kwargs):
         super(CPMVIHead, self).__init__(*args, **kwargs)
         train_cfg = kwargs.get('train_cfg') or {}
@@ -272,6 +272,30 @@ class CPMVIHead(CPMHead):
             return self.temp_start * (1 - alpha) + self.temp_end * alpha
         else:
             return self.temp_end
+        
+    def _visualize_vi_predictions(self, vi_preds, save_path):
+        """Visualize VI predictions.
+
+        Args:
+            vi_preds (Tensor): VI predictions (2, H_feat, W_feat).
+            save_path (str): Path to save the visualization.
+        """
+        mu_logit = vi_preds[0].cpu().numpy()
+        log_kappa = vi_preds[1].cpu().numpy()
+        mu = 1 / (1 + np.exp(-mu_logit))  # Sigmoid
+        kappa = np.exp(log_kappa)
+
+        # Create a visualization image
+        H, W = mu.shape
+        vis_img = np.zeros((H, W*2, 3), dtype=np.uint8)
+        # vis_img[..., 0] = (mu * 255).astype(np.uint8)  # Red channel: P(positive)
+        # vis_img[..., 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
+        # vis_img[..., 2] = 0  # Blue channel unused
+
+        vis_img[..., :W, 0] = (mu * 255).astype(np.uint8)  # Red channel: P(positive)
+        vis_img[..., W:, 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
+
+        Image.fromarray(vis_img).save(save_path)
 
 
     # ------------------------------------------------------------------
@@ -281,6 +305,9 @@ class CPMVIHead(CPMHead):
     def loss(self, cls_scores, bbox_preds, angle_preds, centernesses, vi_preds,
              gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses) == len(vi_preds)
+        
+        # visualize vi_preds
+        # self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
         
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
@@ -304,24 +331,27 @@ class CPMVIHead(CPMHead):
         bg_class_ind = self.num_classes
         avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
         
-        # 1. 计算当前 Temperature
+        # 1. Get current Temperature
         temperature = self._get_current_temperature(cur_iter)
-        
-        # 2. 计算 VI Loss
+
+        # 2. Compute VI Loss
         is_ignored = (flatten_labels < 0)
         flatten_dists = torch.where(torch.isinf(flatten_dists), torch.full_like(flatten_dists, 1e4), flatten_dists)
         
         vi_mu_logit = flatten_vi_preds[:, 0]
-        vi_log_kappa = flatten_vi_preds[:, 1]
-        
+        vi_log_sigma = flatten_vi_preds[:, 1]  # Changed variable name for clarity
+                
+        # Pass parameters to VIPosNegLoss
         vi_losses = self.loss_vi(
             vi_mu_logit=vi_mu_logit,
-            vi_log_kappa=vi_log_kappa,
+            vi_log_sigma=vi_log_sigma,       # Pass log_sigma instead of log_kappa
             dist_to_gt=flatten_dists,
             pos_thresh=flatten_threshs.clamp(min=1.0),
             is_ignored=is_ignored,
-            temperature=temperature  # 传入动态 T
+            temperature=temperature,
+            iter=self.iter
         )
+        
         loss_vi = torch.nan_to_num(vi_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
 
         # 3. 动态计算分类 Loss
@@ -341,8 +371,12 @@ class CPMVIHead(CPMHead):
             
             # 构造软权重：正样本权重为 P(positive)，负样本权重为 1 - P(positive)
             weight = torch.ones(len(avail_inds), device=bbox_preds[0].device)
-            pos_mask = (flatten_labels[avail_inds] < bg_class_ind)
-            neg_mask = (flatten_labels[avail_inds] == bg_class_ind)
+            # pos_mask = (flatten_labels[avail_inds] < bg_class_ind)
+            # neg_mask = (flatten_labels[avail_inds] == bg_class_ind)
+            
+            # 或者正负样本通过 VI 概率进行分配：
+            pos_mask = (vi_prob > 0.7)
+            neg_mask = (vi_prob < 0.3)
             
             weight[pos_mask] = vi_prob[pos_mask].detach()
             weight[neg_mask] = (1.0 - vi_prob[neg_mask]).detach()
@@ -364,6 +398,7 @@ class CPMVIHead(CPMHead):
             loss_centerness=zero,
             loss_vi=loss_vi,
             vi_loss=vi_losses['loss_vi'].detach(),
+            vi_kl_loss=vi_losses['loss_vi_kl'].detach(),
             vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
             temperature=torch.tensor(temperature, device=loss_cls.device) # 用于日志监控
         )

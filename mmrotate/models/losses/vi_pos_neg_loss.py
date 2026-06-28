@@ -1,232 +1,180 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-"""VI Pos/Neg Loss: Variational distribution matching for sample assignment.
-
-Models P(positive) at each location as a Beta distribution, matched to a
-distance-based soft-label target distribution via Jensen-Shannon divergence.
-
-Key components:
-- Soft label: Gaussian decay from GT center, normalized by assignment threshold
-- Predicted distribution: Beta(alpha, beta) discretized onto [0, 1] support bins
-- Matching loss: JS divergence between target and predicted binned distributions
-"""
-
 import torch
 import torch.nn as nn
-from torch.distributions import Beta
+import torch.nn.functional as F
+import os
 from ..builder import ROTATED_LOSSES
-
 
 @ROTATED_LOSSES.register_module()
 class VIPosNegLoss(nn.Module):
-    """Variational Inference Loss for positive/negative sample probability.
-
-    Instead of hard binary label assignment, this loss trains a Beta
-    distribution over P(positive) at each location, capturing assignment
-    uncertainty near the decision boundary.
-
-    Args:
-        lambda_vi (float): Weight for VI matching loss. Default: 1.0.
-        lambda_kl (float): Weight for KL-to-prior regularization. Default: 0.01.
-        project_min (float): Minimum support value (always 0.0). Default: 0.0.
-        project_max (float): Maximum support value (always 1.0). Default: 1.0.
-        num_bins (int): Number of support bins for distribution discretization.
-        eps (float): Numerical stability epsilon.
-        soft_label_sigma (float): Controls soft-label sharpness. Smaller =
-            sharper (closer to hard labels). Default: 0.4.
-        kappa_min (float): Minimum concentration for numerical stability.
-        kappa_max (float): Maximum concentration.
-    """
-
-    def __init__(self, lambda_vi=1.0, project_min=0.0, project_max=1.0,
-                 num_bins=21, eps=1e-6, soft_label_sigma=0.4,
-                 kappa_min=1e-3, kappa_max=1e3, **kwargs):
+    def __init__(self, lambda_vi=1.0, base_sigma=0.05, max_sigma=0.5, eps=1e-6, **kwargs):
+        """
+        Args:
+            lambda_vi (float): Loss weight.
+            base_sigma (float): Minimum target sigma for confident regions (center/bg).
+            max_sigma (float): Maximum target sigma for uncertain regions (edge).
+            eps (float): Numerical stability term.
+        """
         super(VIPosNegLoss, self).__init__()
         self.lambda_vi = lambda_vi
-        self.project_min = float(project_min)
-        self.project_max = float(project_max)
-        self.num_bins = int(num_bins)
-        self.eps = float(eps)
-        self.soft_label_sigma = float(soft_label_sigma)
-        self.kappa_min = float(kappa_min)
-        self.kappa_max = float(kappa_max)
+        self.eps = eps
+        self.base_sigma = base_sigma
+        self.max_sigma = max_sigma
 
-        if self.num_bins < 2:
-            raise ValueError('num_bins must be >= 2 for VI distribution.')
-
-        support = torch.linspace(
-            self.project_min, self.project_max, steps=self.num_bins,
-            dtype=torch.float32)
-        self.register_buffer('support', support)
-        self.bin_width = (self.project_max - self.project_min) / (self.num_bins - 1)
-        
-    def _sanitize_log_kappa(self, log_kappa):
-        """Clamp log_kappa and replace NaN/inf."""
-        log_kappa = log_kappa.clamp(min=-7.0, max=7.0)
-        log_kappa = torch.nan_to_num(
-            log_kappa, nan=0.0, posinf=7.0, neginf=-7.0)
-        return log_kappa
+    def _sanitize_log_sigma(self, log_sigma):
+        # Clamp log_sigma to prevent explosion. 
+        # sigma range approx [0.01, 10] -> log range [-4.6, 2.3]
+        return log_sigma.clamp(min=-5.0, max=3.0)
 
     def _generate_soft_labels(self, dist_to_gt, pos_thresh):
-        """Generate soft labels based on distance to nearest GT center.
-
-        Soft label = exp(-0.5 * (d / (sigma * thresh))^2)
-        - d=0 (at GT center) → soft_label=1.0 (positive)
-        - d=thresh (at boundary) → soft_label=exp(-0.5/sigma^2) ≈ small
-        - d >> thresh → soft_label≈0.0 (negative)
-
-        Args:
-            dist_to_gt (Tensor): (N,) distance to nearest GT center.
-            pos_thresh (Tensor): (N,) positive assignment threshold per point.
-
-        Returns:
-            Tensor: (N,) soft labels in [0, 1].
         """
-        # Avoid division by zero
+        Generate soft labels based on distance to ground truth and positive threshold.
+        Logic:
+        - If distance < pos_thresh: soft_label = 1.0 (positive)
+        - If distance > pos_thresh: soft_label decays to 0.0 (negative)
+            - decay by Gaussian function: exp(-0.5 * (dist/sigma*thresh)^2) with fixed sigma
+        - Use a Gaussian decay for smooth transition.
+        """
+        
+        # Same Gaussian decay as before
         thresh = pos_thresh.clamp(min=1.0)
         normalized_dist = dist_to_gt / thresh
-        soft = torch.exp(-0.5 * (normalized_dist / self.soft_label_sigma) ** 2)
+        # soft = torch.exp(-0.5 * (normalized_dist / 0.4) ** 2) # sigma fixed to 0.4 for label shape
+        soft = torch.exp(-0.5 * (normalized_dist / 0.4) ** 2) # sigma fixed to 0.4 for label shape
         return soft.clamp(min=0.0, max=1.0)
 
-    def _project_target_dist(self, target):
-        """Project scalar target in [0,1] onto linear-interpolated support bins.
+    def _generate_target_gaussian_params(self, soft_labels):
+        """
+        Generate target Mean and Sigma for Gaussian distribution matching.
+        Logic:
+        - Target Mean = soft_labels (0~1)
+        - Target Sigma: 
+          - If soft_label close to 0 or 1 (Confident) -> sigma = base_sigma (small)
+          - If soft_label close to 0.5 (Uncertain)   -> sigma = max_sigma (large)
+        """
+        mu_target = soft_labels
+        
+        # Calculate distance to decision boundary (0.5)
+        # distance = |mu_t - 0.5|. Range [0, 0.5]
+        dist_to_boundary = torch.abs(mu_target - 0.5)
+        
+        # Normalize to [0, 1] where 0=Edge(Uncertain), 1=Center(Confident)
+        # certainty = 2 * dist_to_boundary
+        certainty = 2.0 * dist_to_boundary
+        
+        # Map certainty to sigma range
+        # High certainty -> Low sigma. Low certainty -> High sigma.
+        # sigma_t = base + (1 - certainty) * (max - base)
+        sigma_target = self.base_sigma + (1.0 - certainty) * (self.max_sigma - self.base_sigma)
+        
+        return mu_target, sigma_target
 
-        Identical interpolation scheme as VPD's _project_target_dist,
-        but support is [0, 1] instead of [-16, 16].
+    def _kl_divergence_gaussian(self, mu_p, sigma_p, mu_q, sigma_q):
+        """
+        Compute KL(p || q) between two Gaussians.
+        KL(p||q) = log(sigma_q/sigma_p) + (sigma_p^2 + (mu_p-mu_q)^2) / (2*sigma_q^2) - 0.5
+        """
+        # Ensure numerical stability
+        sigma_p = sigma_p.clamp(min=self.eps)
+        sigma_q = sigma_q.clamp(min=self.eps)
+        
+        term1 = torch.log(sigma_q / sigma_p)
+        term2 = (sigma_p ** 2 + (mu_p - mu_q) ** 2) / (2 * sigma_q ** 2)
+        kl = term1 + term2 - 0.5
+        
+        # Clamp KL to prevent extreme values
+        return kl.clamp(max=10.0)
+    
+    def _visualize_vi_predictions(self, soft_labels, pos_mask, save_path):
+        """Visualize VI predictions.
 
         Args:
-            target (Tensor): (N,) scalar soft-label target.
-
-        Returns:
-            Tensor: (N, K) projected target distribution.
+            vi_preds (Tensor): VI predictions (2, H_feat, W_feat).
+            save_path (str): Path to save the visualization.
         """
-        target = target.clamp(min=self.project_min, max=self.project_max)
-        pos = (target - self.project_min) / self.bin_width
-        left = torch.floor(pos).long().clamp(min=0, max=self.num_bins - 1)
-        right = (left + 1).clamp(max=self.num_bins - 1)
-        w_right = (pos - left.float()).clamp(min=0.0, max=1.0)
-        w_left = 1.0 - w_right
-
-        same = (left == right)
-        w_left = torch.where(same, torch.ones_like(w_left), w_left)
-        w_right = torch.where(same, torch.zeros_like(w_right), w_right)
-
-        target_dist = target.new_zeros(target.shape[0], self.num_bins)
-        target_dist.scatter_add_(1, left.unsqueeze(1), w_left.unsqueeze(1))
-        target_dist.scatter_add_(1, right.unsqueeze(1), w_right.unsqueeze(1))
-        target_dist = target_dist.clamp(min=self.eps)
-        target_dist = target_dist / target_dist.sum(dim=1, keepdim=True)
-        return target_dist
-
-    def _beta_binned_dist(self, alpha, beta):
-        """Discretize Beta(alpha, beta) into support bins via PDF approximation.
+        from PIL import Image
+        import numpy as np
+        vis_img1 = (soft_labels * 255).cpu().numpy().astype(np.uint8)
+        vis_img2 = (pos_mask.float() * 255).cpu().numpy().astype(np.uint8)
+        vis_img = np.stack([vis_img1, vis_img2, np.zeros_like(vis_img1)], axis=-1)  # RGB
+        print(vis_img.shape)
         
-        PyTorch's Beta distribution does not implement CDF in many versions.
-        We compute the PDF at support points and normalize them as the 
-        discrete probability mass.
-        """
-        k = self.num_bins
-        support = self.support.to(alpha.dtype)  # (K,)
-        
-        # Clamp parameters for numerical stability
-        alpha = alpha.clamp(min=self.kappa_min, max=self.kappa_max)  # (N,)
-        beta = beta.clamp(min=self.kappa_min, max=self.kappa_max)    # (N,)
-        
-        # Support points must be strictly in (0, 1) for Beta PDF log computation
-        x = support.clamp(min=1e-6, max=1.0 - 1e-6)  # (K,)
-        
-        # Calculate log Beta function: log B(alpha, beta)
-        # log B(α, β) = lgamma(α) + lgamma(β) - lgamma(α + β)
-        log_beta_fn = (
-            torch.lgamma(alpha) + torch.lgamma(beta) 
-            - torch.lgamma(alpha + beta)
-        )  # (N,)
-        
-        # Calculate log PDF:
-        # log f(x; α, β) = (α - 1) * log(x) + (β - 1) * log(1 - x) - log B(α, β)
-        # Broadcasting: (N, 1) * (1, K) - (N, 1) -> (N, K)
-        log_pdf = (alpha.unsqueeze(1) - 1.0) * torch.log(x).unsqueeze(0) + \
-                  (beta.unsqueeze(1) - 1.0) * torch.log(1.0 - x).unsqueeze(0) - \
-                  log_beta_fn.unsqueeze(1)
-                  
-        # Convert to PDF and normalize to get discrete probabilities
-        pdf = torch.exp(log_pdf)
-        pred_dist = pdf.clamp(min=self.eps)
-        pred_dist = pred_dist / pred_dist.sum(dim=1, keepdim=True)
-        
-        return pred_dist
+        Image.fromarray(vis_img).save(save_path)
 
-    def _js_divergence(self, p, q):
-        """Jensen-Shannon divergence for row-wise distributions."""
-        m = 0.5 * (p + q)
-        kl_pm = (p * (torch.log(p) - torch.log(m))).sum(dim=1)
-        kl_qm = (q * (torch.log(q) - torch.log(m))).sum(dim=1)
-        return 0.5 * (kl_pm + kl_qm)
 
-    def _kl_to_uniform_prior(self, alpha, beta):
-        """KL(Beta(α,β) || Beta(1,1)) = KL(Beta(α,β) || Uniform).
-
-        This regularizes the distribution toward a uniform prior when
-        no supervision signal is available (e.g., for negative samples
-        far from any GT).
-
-        KL = log B(α,β) - (α-1)ψ(α) - (β-1)ψ(β) + (α+β-2)ψ(α+β)
-
-        where B is the Beta function and ψ is the digamma function.
-        """
-        # Use torch.lgamma for log Beta function
-        log_beta_fn = (
-            torch.lgamma(alpha) + torch.lgamma(beta)
-            - torch.lgamma(alpha + beta))
-        digamma_alpha = torch.digamma(alpha)
-        digamma_beta = torch.digamma(beta)
-        digamma_sum = torch.digamma(alpha + beta)
-
-        kl = (log_beta_fn
-              - (alpha - 1) * digamma_alpha
-              - (beta - 1) * digamma_beta
-              + (alpha + beta - 2) * digamma_sum)
-        return kl
-
-    # 修改 forward，加入 temperature 参数
-    def forward(self, vi_mu_logit, vi_log_kappa, dist_to_gt, pos_thresh,
-                is_ignored=None, temperature=1.0):
-        """Compute VI loss.
-        
-        Args:
-            temperature (float): Temperature to control distribution sharpness.
-                                 Smaller T leads to sharper (more certain) distribution.
-        """
+    def forward(self, vi_mu_logit, vi_log_sigma, dist_to_gt, pos_thresh, is_ignored=None, is_pos=None, temperature=1.0, vi_target=None, iter=-1):
         N = vi_mu_logit.shape[0]
         if N == 0:
             zero = vi_mu_logit.sum() * 0.0
             return dict(loss_vi=zero, loss_total=zero, vi_prob=zero.detach())
 
-        vi_log_kappa = self._sanitize_log_kappa(vi_log_kappa)
-
-        mu = torch.sigmoid(vi_mu_logit)
-        # 引入 Temperature: T 越小，kappa 越大，分布越尖锐
-        kappa = vi_log_kappa.exp() / max(temperature, 1e-6)
+        # 1. Sanitize and get predictions
+        vi_log_sigma = self._sanitize_log_sigma(vi_log_sigma)
+        mu_pred = torch.sigmoid(vi_mu_logit) # Mean in [0, 1]
         
-        alpha = (mu * kappa).clamp(self.kappa_min, self.kappa_max)
-        beta_param = ((1.0 - mu) * kappa).clamp(self.kappa_min, self.kappa_max)
+        # Temperature scaling affects the sharpness
+        # sigma_pred = exp(log_sigma) / temperature
+        sigma_pred = (vi_log_sigma.exp() / max(temperature, 1e-6)).clamp(min=self.eps)
 
-        soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh)
-        target_dist = self._project_target_dist(soft_labels)
-        pred_dist = self._beta_binned_dist(alpha, beta_param)
-
-        js = self._js_divergence(target_dist, pred_dist)
-
-        if is_ignored is not None:
-            valid_mask = (~is_ignored).float()
-            num_valid = valid_mask.sum().clamp(min=1.0)
-            loss_vi = (js * valid_mask).sum() / num_valid
+        # 2. Generate Targets
+        if vi_target is None:
+            soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh)
         else:
-            loss_vi = js.mean()
+            soft_labels = vi_target
+        
+        mu_target, sigma_target = self._generate_target_gaussian_params(soft_labels)
 
-        loss_total = self.lambda_vi * loss_vi
+        # 3. Masking
+        if is_pos is not None:
+            pos_mask = is_pos.float()
+            neg_mask = (1.0 - pos_mask) * (~is_ignored).float() if is_ignored is not None else (1.0 - pos_mask)
+        else:
+            pos_mask = (soft_labels > 0.5).float()
+            neg_mask = (soft_labels <= 0.5).float()
+
+        num_pos = pos_mask.sum().clamp(min=1.0)
+        num_neg = neg_mask.sum().clamp(min=1.0)
+        
+        # if iter >= 0:
+        #     self._visualize_vi_predictions(mu_target.detach().cpu(), sigma_target.detach().cpu(), f"/media/ps/passport2/zlk/results/0627_posnegvi_gaussian_norecon/vpd_cpm_dotav10/soft_labels/soft_labels_iter_{iter}.png")
+
+        # 4. Calculate Loss
+        # A. Reconstruction Loss (Mean L2) - Strong gradient for correct mean
+        loss_mu_l2 = (mu_pred - mu_target) ** 2
+        loss_mu_pos = (loss_mu_l2 * pos_mask).sum() / num_pos
+        loss_mu_neg = (loss_mu_l2 * neg_mask).sum() / num_neg
+        
+        # or use soft_labels to weight the loss after divided
+        # loss_mu_pos = (loss_mu_l2 * pos_mask * soft_labels).sum() / num_pos
+        # loss_mu_neg = (loss_mu_l2 * neg_mask * (1.0 - soft_labels)).sum() / num_neg
+        
+        # loss_recon_mu = 0.5 * loss_mu_pos + 0.5 * loss_mu_neg
+        loss_recon_mu = 0.0 * loss_mu_pos + 0.0 * loss_mu_neg  # disable loss_recon_mu
+
+        # B. Distribution Matching (KL Divergence) - Supervise Sigma/Uncertainty
+        # KL(Pred || Target)
+        kl_val = self._kl_divergence_gaussian(mu_pred, sigma_pred, mu_target, sigma_target)
+        
+        loss_kl_pos = (kl_val * pos_mask).sum() / num_pos
+        loss_kl_neg = (kl_val * neg_mask).sum() / num_neg
+        loss_dist_match = 0.5 * loss_kl_pos + 0.5 * loss_kl_neg
+
+        # C. Regularization (Prevent sigma from becoming too small or too large)
+        # L2 on log_sigma encourages it to stay around 0 (sigma=1), which is moderate.
+        # Or simply penalize very small sigma to prevent numerical issues.
+        loss_reg_sigma = (vi_log_sigma ** 2).mean()
+        
+        # alternatively, use js divergence with a gaussian distribution.
+        # C: Regularization: use js divergence with a gaussian distribution with mean=0.5, sigma=1.0
+
+        # Total Loss
+        # Weight: 1.0 for Mean (accuracy), 1.0 for KL (uncertainty shape), small weight for reg
+        loss_total = self.lambda_vi * (1.0 * loss_recon_mu + 0.01 * loss_dist_match) + 0.01 * loss_reg_sigma
+        
+        loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return dict(
-            loss_vi=loss_vi,
+            loss_vi=loss_recon_mu,       # Monitor mean accuracy
+            loss_vi_kl=0.01*loss_dist_match,  # Monitor uncertainty learning
             loss_total=loss_total,
-            vi_prob=mu.detach(),
+            vi_prob=mu_pred.detach()
         )

@@ -101,14 +101,14 @@ model = dict(
     # training and testing settings
     train_cfg=dict(
         visualize=False,
-        cls_weight=1.0,
+        cls_weight=20.0,
         thresh1=6,
         alpha=1.5,
         # VI分支配置
         vi_weight=1.0,
         vi_kl_weight=0.01,
         vi_num_bins=21,
-        vi_soft_label_sigma=0.4,
+        vi_soft_label_sigma=1.28,
     ),
     test_cfg=dict(
         nms_pre=2000,

@@ -363,11 +363,18 @@ class PseudoLabelHead(RotatedFCOSHead):
 
         return concat_lvl_labels
         
-    def _get_target_single(self, gt_bboxes, gt_labels, cls_scores_all, img_metas, points, regress_ranges, num_points_per_lvl, alpha=1, thresh1=8, thresh2_bg=4, thresh3=0.1, pca_length=28, default_max_length=128, mode='near'):
-        """Compute regression, classification and angle targets for a single image."""
+    def _get_target_single(self, gt_bboxes, gt_labels, cls_scores_all, img_metas, points, regress_ranges,
+                           num_points_per_lvl, alpha=1, thresh1=8, thresh2_bg=4, thresh3=0.1, pca_length=28, default_max_length=128, mode='near'):
+        """Compute regression, classification and angle targets for a single
+        image.
+        
+        Args:
+            cls_scores_all (list[Tensor]): feature map scores on each point for each scale level, 
+                len(cls_scores_all) = num_levels, cls_scores_all[i].size() = (num_classes, w, h)
+        """
         # replace cls_scores_all[0] with the variance of cpm
-        # cls_scores_var_first = torch.var(cls_scores_all[0], dim=0)
-        # cls_scores_all[0] = cls_scores_var_first.unsqueeze(0).repeat(self.num_classes, 1, 1)
+        cls_scores_var_first = torch.var(cls_scores_all[0], dim=0)  # shape [w, h]
+        cls_scores_all[0] = cls_scores_var_first.unsqueeze(0).repeat(self.num_classes, 1, 1)  # shape [num_classes, w, h]
         
         alpha = alpha
         thresh3 = self.thresh3
@@ -376,6 +383,7 @@ class PseudoLabelHead(RotatedFCOSHead):
         num_gts = gt_labels.size(0)
         center_point_gt = gt_bboxes[:, :2]
         
+        # The following code only use the center point of the gt_bboxes, the code include "gt_bboxes" is for the vector shape
         if num_gts == 0:
             filename_raw = img_metas['filename'].split('/')[-1].split('.')[0]
             with open(self.store_ann_dir + filename_raw + '.txt', 'w') as w:
@@ -384,84 +392,85 @@ class PseudoLabelHead(RotatedFCOSHead):
                    gt_bboxes.new_zeros((num_points, 4)), \
                    gt_bboxes.new_zeros((num_points, 1))
 
-        dist_sample_and_gt = torch.cdist(points, center_point_gt)
-        dist_gt_and_gt = torch.cdist(center_point_gt, center_point_gt) + torch.eye(num_gts).to(dist_sample_and_gt.device) * INF
-        
+        dist_sample_and_gt = torch.cdist(points, center_point_gt) # [num_sample, num_gt]
+        dist_gt_and_gt = torch.cdist(center_point_gt, center_point_gt) + torch.eye(num_gts).to(dist_sample_and_gt.device) * INF # [num_gt, num_gt]
         dist_min_gt_and_gt, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
         dist_min_sample_and_gt = dist_sample_and_gt.min(dim=1)[0]
-        
         labels = -1 * torch.ones(num_points, dtype=gt_labels.dtype, device=gt_labels.device)
         
         index_neg = ((alpha * dist_sample_and_gt) > dist_min_gt_and_gt).all(dim=1).nonzero().squeeze(-1)
         if len(index_neg) > 0:
+            # gt_labels = gt_labels.clone()
             labels[index_neg] = self.num_classes
-        
-        # Positive labels -【关键修改】：动态 thresh1
-        gt_wh = gt_bboxes[:, 2:4] # width, height
-        gt_scales = torch.sqrt(gt_wh[:, 0] * gt_wh[:, 1]) 
-        # 基础阈值 thresh1 (如8)，随尺度增长，上限设为 64
-        dynamic_thresh1_vals = torch.clamp(0.1 * gt_scales, min=float(thresh1), max=64.0)
-        thresh1_tensor = dynamic_thresh1_vals.to(dist_min_gt_and_gt.device)
-        
+            
+        # positive labels
+        thresh1_tensor = thresh1 * torch.ones_like(dist_min_gt_and_gt)
         dist_min_thresh1_gt = torch.min(dist_min_gt_and_gt/2, thresh1_tensor)
-        
         index_pos = (dist_sample_and_gt < dist_min_thresh1_gt).nonzero()
         if len(index_pos) > 0:
+            # gt_labels = gt_labels.clone()
             labels[index_pos[:, 0]] = gt_labels[index_pos[:, 1]]
             
         # additional background labels
-        is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels)
+        # gt_labels[dist_min_gt_and_gt_index] is the nearest gt label
+        # center_point_gt[dist_min_gt_and_gt_index] is the nearest gt center point
+        is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels) # [num_gt]
         valid_middle_point = (center_point_gt[is_nearest_same_class] + center_point_gt[dist_min_gt_and_gt_index][is_nearest_same_class]) / 2
-        dist_sample_and_mid = torch.cdist(points, valid_middle_point)
-        index_neg_additional = (dist_sample_and_mid < thresh2_bg).any(dim=1).nonzero().squeeze(-1)
+        dist_sample_and_gt = torch.cdist(points, valid_middle_point)
+        index_neg_additional = (dist_sample_and_gt < thresh2_bg).any(dim=1).nonzero().squeeze(-1)
         if len(index_neg_additional) > 0:
             labels[index_neg_additional] = self.num_classes
-            
+        
+        # extract the rectangle of each gt, and gt_ctr is the center of the gt box
         center_factor = self.get_center_factor(center_point_gt, gt_labels, cls_scores_all[0])
         gt_ctr_rect = self.get_rectangle_cls_prob(cls_scores_all[0].sigmoid(), self.strides[0], center_factor, center_point_gt, pca_length, mode='near')
+        # gt_ctr_rect = self.process_rectangle_decay(gt_ctr_rect.detach().clone())
         
-        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :]
+        # get the PCA of each gt rectangle
+        gt_ctr_rect_label = gt_ctr_rect[torch.arange(num_gts), gt_labels, :, :] # [num_gts, pca_length, pca_length]
         gt_rect_ctr2edge = gt_ctr_rect_label.shape[-1]//2
         points_rect_x = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
         points_rect_y = torch.arange(-gt_rect_ctr2edge, gt_rect_ctr2edge + 1, 1).to(gt_ctr_rect.device)
-        points_rect_xy = torch.stack(torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2)
-        
-        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1)
-        points_rect_xy_adapt = points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1) * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1)
-        points_cov_matrix = torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt) / (gt_ctr_rect_label.shape[-1] ** 2 - 1)
+        points_rect_xy = torch.stack(torch.meshgrid(points_rect_x, points_rect_y), -1).reshape(-1, 2) # [pca_length^2, 2]
+        gt_ctr_rect_label = gt_ctr_rect_label.transpose(1, 2).contiguous().view(num_gts, -1) # [num_gts, pca_length^2]
+        points_rect_xy_adapt = points_rect_xy.unsqueeze(0).repeat(num_gts, 1, 1) * torch.sqrt(gt_ctr_rect_label).unsqueeze(-1) # [num_gts, pca_length^2, 2] 
+        points_cov_matrix = torch.matmul(points_rect_xy_adapt.transpose(1, 2), points_rect_xy_adapt) / (gt_ctr_rect_label.shape[-1] ** 2 - 1) # [num_gts, 2, 2]
         eigvals, eigvecs = torch.symeig(points_cov_matrix, eigenvectors=True)
         
+        # get the largest eigval and the corresponding eigvec
         larger_eigvals_index = (eigvals[:, 1] > eigvals[:, 0]).int()
         eigval_first = eigvals[:, 0] * (1 - larger_eigvals_index) + eigvals[:, 1] * larger_eigvals_index
         eigvec_first = eigvecs[:, 0, :] * (1 - larger_eigvals_index).unsqueeze(1).repeat(1, 2) + eigvecs[:, 1, :] * larger_eigvals_index.unsqueeze(1).repeat(1, 2)
-        
+        # eigvec_first = eigvec_first + 1e-6 # [num_gts, 2]
         mask_eigvec = (eigvec_first[:, 1] > 0).int()
         epsilon = mask_eigvec * 1e-6 + (1 - mask_eigvec) * -1e-6
+        
+        # get the angle target (only for le90)
         angle_targets = -torch.atan(eigvec_first[:, 0] / (eigvec_first[:, 1] + epsilon)).unsqueeze(-1)
         
+        # get the second axis direction
         eigvec_second = torch.stack([-eigvec_first[:, 1], eigvec_first[:, 0]], -1)
+        
         first_axis_range = self.get_closest_gt_first_axis(gt_labels, eigvec_first, center_point_gt, angle_threshold=0.866)
         
-        top_simple, bottom_simple = self.get_edge_boundary_simple(gt_labels, eigvec_first, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple', is_secondary=False, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index], first_axis_range=first_axis_range)
-        left_simple, right_simple = self.get_edge_boundary_simple(gt_labels, eigvec_second, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple', is_secondary=True, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index])
-        
+        top_simple, bottom_simple = self.get_edge_boundary_simple(gt_labels, eigvec_first, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple',
+                                                                  is_secondary=False, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index], first_axis_range=first_axis_range) 
+        left_simple, right_simple = self.get_edge_boundary_simple(gt_labels, eigvec_second, center_point_gt, cls_scores_all, thresh3, default_max_length, mode='simple', 
+                                                                  is_secondary=True, is_nearest_same_class=is_nearest_same_class, nearest_gt_point=center_point_gt[dist_min_gt_and_gt_index]) 
         top_simple, bottom_simple = top_simple * self.strides[0] + 1, bottom_simple * self.strides[0] + 1
         left_simple, right_simple = left_simple * self.strides[0] + 1, right_simple * self.strides[0] + 1
-        
         pseudo_gt_bboxes = torch.cat([center_point_gt, (left_simple+right_simple).unsqueeze(-1), (top_simple+bottom_simple).unsqueeze(-1), angle_targets], -1)
         pseudo_gt_bboxes = pseudo_gt_bboxes.detach()
         
         self.generate_labels(gt_labels, pseudo_gt_bboxes, angle_targets, img_metas)
         
         if num_gts == 1:
-            # 【修复】：此处也应使用动态阈值，而不是硬编码的 8
-            current_thresh1 = dynamic_thresh1_vals[0]
-            index_pos = (dist_sample_and_gt < current_thresh1).nonzero().reshape(-1)
+            index_pos = (dist_sample_and_gt < 8).nonzero().reshape(-1)
             index_neg = (dist_sample_and_gt > 128).nonzero().reshape(-1)
             labels[index_pos] = gt_labels[0]
             labels[index_neg] = self.num_classes
             return labels, gt_bboxes.new_zeros((num_points, 4)), gt_bboxes.new_zeros((num_points, 1))
-            
+
         return labels, None, None
     
     def get_rectangle_cls_prob(self, cls_score, stride, center_factor, gt_ctr, pca_length, mode='near'):
@@ -789,91 +798,75 @@ class PseudoLabelHead(RotatedFCOSHead):
             # ToDo
             pass
         
-    def get_edge_boundary_simple(self, gt_labels, eigvec, center_point_gt, cls_scores_all, thresh3=0.1, default_max_length=128, mode='near', is_secondary=False, is_nearest_same_class=None, nearest_gt_point=None, first_axis_range=None):
-        """ Get the edge boundary of the long edge of each gt box. """
+    def get_edge_boundary_simple(self, gt_labels, eigvec, center_point_gt, cls_scores_all, thresh3=0.1, default_max_length=128, mode='near', 
+                                 is_secondary=False, is_nearest_same_class=None, nearest_gt_point=None, first_axis_range=None):
+        """ Get the edge boundary of the long edge of each gt box.
+        
+        Args:
+            gt_labels (Tensor): labels of each gt box, shape (num_gts,)
+            eigvec (Tensor): the first eigenvector of the PCA of each gt box, shape (num_gts, 2)
+            center_point_gt (Tensor): center of each gt box, shape (num_gts, 2)
+            cls_scores_all (list[Tensor]): feature map scores on each point for each scale level, 
+                len(cls_scores_all) = num_levels, cls_scores_all[i].size() = (num_classes, H, W)
+            is_secondary (bool): whether the eigvec is the secondary eigvec
+            is_nearest_same_class (Tensor): whether the nearest gt box is the same class as the current gt box, shape (num_gts,)
+            nearest_gt_point (Tensor): the nearest gt point of the current gt box, shape (num_gts, 2)
+        """
         num_gts = center_point_gt.shape[0]
         center_point_gt = center_point_gt / self.strides[0]
+        
+        # get the rectangle boundary of long edge
         eigvec_norm = eigvec / torch.norm(eigvec, dim=1, keepdim=True)
         top_bottom = torch.zeros(num_gts, 2).to(center_point_gt.device)
         cls_scores_sigmoid = cls_scores_all[0].sigmoid()
-        
         if first_axis_range is not None:
             first_axis_range = first_axis_range / self.strides[0]
-            
         for i in range(num_gts):
             ctr = center_point_gt[i]
             eigvec_i = eigvec_norm[i]
+            # if is_secondary:
+            is_same_class = is_nearest_same_class[i]
+            nearest_gt_point_i = nearest_gt_point[i] / self.strides[0]
+            direction = nearest_gt_point_i - ctr
+            direction_norm = direction / torch.norm(direction)
+            distance = torch.abs((direction * eigvec_i).sum())
+            if not is_secondary:
+                valid_secondary_duplicate_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.866
+            else:
+                valid_secondary_duplicate_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.5
             
-            # --- 补充缺失的初始化代码 ---
-            is_same_class = False
-            valid_secondary_duplicate_remove = False
-            distance = 0.0
-            
-            if is_nearest_same_class is not None and nearest_gt_point is not None:
-                is_same_class = is_nearest_same_class[i]
-                nearest_gt_point_i = nearest_gt_point[i] / self.strides[0]
-                direction = nearest_gt_point_i - ctr
-                if torch.norm(direction) > 1e-6:
-                    direction_norm = direction / torch.norm(direction)
-                    distance = torch.abs((direction * eigvec_i).sum())
-                    
-                    if not is_secondary:
-                        valid_secondary_duplicate_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.866
-                    else:
-                        valid_secondary_duplicate_remove = torch.abs((direction_norm * eigvec_i).sum()) > 0.5
-            
-            # --- 搜索正向 (+) ---
-            found_boundary = False
             for j in range(default_max_length):
                 point = (ctr + j * eigvec_i).round().long()
                 if point[0] < 0 or point[0] >= cls_scores_all[0].shape[2] or point[1] < 0 or point[1] >= cls_scores_all[0].shape[1]:
                     top_bottom[i, 0] = j
-                    found_boundary = True
                     break
                 if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < self.thresh3[gt_labels[i]]:
                     top_bottom[i, 0] = j
-                    found_boundary = True
                     break
                 if valid_secondary_duplicate_remove:
                     if is_same_class and j > 0.5 * distance:
                         top_bottom[i, 0] = j
-                        found_boundary = True
                         break
                 if first_axis_range is not None:
                     if j > 0.6 * first_axis_range[i]:
                         top_bottom[i, 0] = j
-                        found_boundary = True
                         break
-            
-            if not found_boundary:
-                top_bottom[i, 0] = default_max_length
-            
-            # --- 搜索反向 ---
-            found_boundary = False
             for j in range(default_max_length):
                 point = (ctr - j * eigvec_i).round().long()
                 if point[0] < 0 or point[0] >= cls_scores_all[0].shape[2] or point[1] < 0 or point[1] >= cls_scores_all[0].shape[1]:
-                    top_bottom[i, 1] = j  # 【修正】：索引改为 1
-                    found_boundary = True
+                    top_bottom[i, 1] = j
                     break
                 if cls_scores_sigmoid[gt_labels[i], point[1], point[0]] < self.thresh3[gt_labels[i]]:
-                    top_bottom[i, 1] = j  # 【修正】：索引改为 1
-                    found_boundary = True
+                    top_bottom[i, 1] = j
                     break
-                if valid_secondary_duplicate_remove:
+                if is_secondary and valid_secondary_duplicate_remove:
                     if is_same_class and j > 0.5 * distance:
-                        top_bottom[i, 1] = j - 1 # 【修正】：索引改为 1，逻辑保留 j-1
-                        found_boundary = True
+                        top_bottom[i, 0] = j - 1
                         break
                 if first_axis_range is not None:
                     if j > 0.6 * first_axis_range[i]:
-                        top_bottom[i, 1] = j    # 【修正】：索引改为 1
-                        found_boundary = True
+                        top_bottom[i, 0] = j
                         break
-            
-            if not found_boundary:
-                top_bottom[i, 1] = default_max_length
-                
         return top_bottom[:, 0], top_bottom[:, 1]
                 
         

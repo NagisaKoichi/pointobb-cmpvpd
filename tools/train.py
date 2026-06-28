@@ -168,16 +168,16 @@ def main():
     model.init_weights()
     
     # ------------ freeze fpn ------------
-    if hasattr(model, 'neck') and model.neck is not None:
-        for param in model.neck.parameters():
-            param.requires_grad = False
-        print('FPN parameters have been frozen.')
+    # if hasattr(model, 'neck') and model.neck is not None:
+    #     for param in model.neck.parameters():
+    #         param.requires_grad = False
+    #     print('FPN parameters have been frozen.')
         
-        # chance the BN layer in FPN to eval mode
-        for m in model.neck.modules():
-            if isinstance(m, torch.nn.BatchNorm2d):
-                m.eval()
-                print('FPN BatchNorm layers have been set to eval mode.')
+    #     # chance the BN layer in FPN to eval mode
+    #     for m in model.neck.modules():
+    #         if isinstance(m, torch.nn.BatchNorm2d):
+    #             m.eval()
+    #             print('FPN BatchNorm layers have been set to eval mode.')
                 
     # -----------------------------------
 
