@@ -113,10 +113,11 @@ class CPMVIHead(CPMHead):
             angle_pred = self.conv_angle(reg_feat).float()
         else:
             # 兼容性处理：如果没有分离角度分支
-            angle_pred = None
+            angle_pred = torch.zeros_like(bbox_pred[:, :1])
             
         # 4. 计算 VI 分支预测
-        vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
+        # vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
+        vi_pred = self.conv_vi(cls_feat).float()  # (N, 2, H, W)
         
         return cls_score, bbox_pred, angle_pred, centerness, vi_pred
 
@@ -292,8 +293,16 @@ class CPMVIHead(CPMHead):
         # vis_img[..., 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
         # vis_img[..., 2] = 0  # Blue channel unused
 
-        vis_img[..., :W, 0] = (mu * 255).astype(np.uint8)  # Red channel: P(positive)
-        vis_img[..., W:, 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
+        # vis_img[..., :W, 0] = (mu * 255).astype(np.uint8)  # Red channel: P(positive)
+        # vis_img[..., W:, 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
+        
+        # or use the colormap jet to visualize mu and kappa
+        import matplotlib.pyplot as plt
+        import matplotlib.cm as cm
+        mu_colormap = cm.jet(mu)[:, :, :3]  # (H, W, 3)
+        kappa_colormap = cm.jet(kappa / (kappa.max() + 1e-6))[:, :, :3]
+        vis_img[..., :W, :] = (mu_colormap * 255).astype(np.uint8)
+        vis_img[..., W:, :] = (kappa_colormap * 255).astype(np.uint8)
 
         Image.fromarray(vis_img).save(save_path)
 
@@ -307,7 +316,7 @@ class CPMVIHead(CPMHead):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses) == len(vi_preds)
         
         # visualize vi_preds
-        # self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
+        self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
         
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
@@ -397,9 +406,11 @@ class CPMVIHead(CPMHead):
             loss_bbox=zero,
             loss_centerness=zero,
             loss_vi=loss_vi,
-            vi_loss=vi_losses['loss_vi'].detach(),
-            vi_kl_loss=vi_losses['loss_vi_kl'].detach(),
+            loss_vi_dist_match=vi_losses['loss_vi_dist_match'].detach(),
+            loss_vi_sampled=vi_losses['loss_vi_sampled'].detach(),
+            loss_vi_reg=vi_losses['loss_vi_reg'].detach(),
             vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
+            vi_sigma_mean=vi_losses['vi_sigma'].mean().detach(),
             temperature=torch.tensor(temperature, device=loss_cls.device) # 用于日志监控
         )
         

@@ -2,12 +2,12 @@ GPU_NUM=4 GPU_IDS=0,1,2,3 START_STAGE=1 END_STAGE=3 \
 CFG_STAGE1=/media/ps/passport2/zlk/PointOBB-v2-vpd/configs/pointobbv2/train_cpm_vi_point_dotav10.py \
 CFG_STAGE2=/media/ps/passport2/zlk/PointOBB-v2-vpd/configs/pointobbv2/generate_pseudo_label_dotav10.py \
 CFG_STAGE3=/media/ps/passport2/zlk/PointOBB-v2-vpd/configs/pointobbv2/redet_dotav10.py \
-NAME="0628_posnegvi_gaussian_norecon_weighted" \
+NAME="0701_posnegvi_gaussian_sampled" \
 ENABLE_FROZEN_V3_FINETUNE=False \
 SAVE_VARIANCE_MAP=True \
 RESUME_STAGE3=True \
 DATA_ROOT=/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/ \
-bash ./tools/run_vpd_full_pipeline.sh 
+bash ./tools/run_vpd_full_pipeline.sh
 
 generate_cpmvpd_point_pseudo_dotav10
 

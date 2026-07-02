@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import os
 from ..builder import ROTATED_LOSSES
 
+lambda_dist_match = 0.01
+lambda_sampled = 0.1
+lambda_reg = 0.01
+sigma_scale = 1.0
+
 @ROTATED_LOSSES.register_module()
 class VIPosNegLoss(nn.Module):
     def __init__(self, lambda_vi=1.0, base_sigma=0.05, max_sigma=0.5, eps=1e-6, **kwargs):
@@ -84,6 +89,22 @@ class VIPosNegLoss(nn.Module):
         # Clamp KL to prevent extreme values
         return kl.clamp(max=10.0)
     
+    def _js_divergence_gaussian(self, mu_p, sigma_p, mu_q, sigma_q):
+        """
+        Compute JS divergence between two Gaussians.
+        JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), where M = 0.5*(P+Q)
+        """
+        # Compute M parameters
+        mu_m = 0.5 * (mu_p + mu_q)
+        sigma_m = 0.5 * (sigma_p + sigma_q)
+        
+        kl_pm = self._kl_divergence_gaussian(mu_p, sigma_p, mu_m, sigma_m)
+        kl_qm = self._kl_divergence_gaussian(mu_q, sigma_q, mu_m, sigma_m)
+        
+        js = 0.5 * (kl_pm + kl_qm)
+        
+        return js.clamp(max=10.0)
+    
     def _visualize_vi_predictions(self, soft_labels, pos_mask, save_path):
         """Visualize VI predictions.
 
@@ -109,7 +130,7 @@ class VIPosNegLoss(nn.Module):
 
         # 1. Sanitize and get predictions
         vi_log_sigma = self._sanitize_log_sigma(vi_log_sigma)
-        mu_pred = torch.sigmoid(vi_mu_logit) # Mean in [0, 1]
+        mu_pred = torch.sigmoid(vi_mu_logit) # vi_mu_logit is in range (-inf, +inf), mu_pred in range (0, 1)
         
         # Temperature scaling affects the sharpness
         # sigma_pred = exp(log_sigma) / temperature
@@ -138,43 +159,63 @@ class VIPosNegLoss(nn.Module):
         #     self._visualize_vi_predictions(mu_target.detach().cpu(), sigma_target.detach().cpu(), f"/media/ps/passport2/zlk/results/0627_posnegvi_gaussian_norecon/vpd_cpm_dotav10/soft_labels/soft_labels_iter_{iter}.png")
 
         # 4. Calculate Loss
-        # A. Reconstruction Loss (Mean L2) - Strong gradient for correct mean
-        loss_mu_l2 = (mu_pred - mu_target) ** 2
-        loss_mu_pos = (loss_mu_l2 * pos_mask).sum() / num_pos
-        loss_mu_neg = (loss_mu_l2 * neg_mask).sum() / num_neg
-        
-        # or use soft_labels to weight the loss after divided
-        # loss_mu_pos = (loss_mu_l2 * pos_mask * soft_labels).sum() / num_pos
-        # loss_mu_neg = (loss_mu_l2 * neg_mask * (1.0 - soft_labels)).sum() / num_neg
-        
-        # loss_recon_mu = 0.5 * loss_mu_pos + 0.5 * loss_mu_neg
-        loss_recon_mu = 0.0 * loss_mu_pos + 0.0 * loss_mu_neg  # disable loss_recon_mu
 
         # B. Distribution Matching (KL Divergence) - Supervise Sigma/Uncertainty
         # KL(Pred || Target)
-        kl_val = self._kl_divergence_gaussian(mu_pred, sigma_pred, mu_target, sigma_target)
+        kl_val = self._js_divergence_gaussian(mu_pred, sigma_pred, mu_target, sigma_target)
         
         loss_kl_pos = (kl_val * pos_mask).sum() / num_pos
         loss_kl_neg = (kl_val * neg_mask).sum() / num_neg
-        loss_dist_match = 0.5 * loss_kl_pos + 0.5 * loss_kl_neg
+        loss_dist_match = (0.5 * loss_kl_pos + 0.5 * loss_kl_neg) * lambda_dist_match
+
+        # # B. Sampled Matching - Sample from predicted distribution N(mu_pred, sigma_pred)
+        # #                       calculate loss with mu_target
+        # sample_pred = torch.normal(vi_mu_logit, vi_log_sigma.exp() * sigma_scale).sigmoid()  # Sample from predicted distribution and apply sigmoid to get in range (0, 1)
+        # loss_sampled_pos = ((sample_pred - mu_target) ** 2 * pos_mask).sum() / num_pos
+        # loss_sampled_neg = ((sample_pred - mu_target) ** 2 * neg_mask).sum() / num_neg
+        # loss_sampled = (0.5 * loss_sampled_pos + 0.5 * loss_sampled_neg) * lambda_sampled
+        
+        # 1. 将 Target 映射回 Logit 空间 (Inverse Sigmoid)  [0.268]
+        # 加 eps 防止 log(0)
+        target_logits = torch.log(mu_target / (1.0 - mu_target + 1e-6) + 1e-6)
+
+        # 2. 直接在 Logit 空间计算 L1 Loss (MSE也可以，但L1更鲁棒)
+        # sample_logits 就是 torch.normal(...) 的结果
+        # sample_logits = torch.normal(vi_mu_logit, vi_log_sigma.exp() * sigma_scale)
+        eps = torch.randn_like(vi_mu_logit)
+        sample_logits = vi_mu_logit + vi_log_sigma.exp() * eps   # 梯度同时流向 mu 和 sigma
+
+        loss_sampled_pos = (torch.abs(sample_logits - target_logits) * pos_mask).sum() / num_pos
+        loss_sampled_neg = (torch.abs(sample_logits - target_logits) * neg_mask).sum() / num_neg
+        
+        # or calculate loss in probability space (after sigmoid)
+        # sample_prob = torch.sigmoid(sample_logits)
+        # loss_sampled_pos = ((sample_prob - mu_target) ** 2 * pos_mask).sum() / num_pos
+        # loss_sampled_neg = ((sample_prob - mu_target) ** 2 * neg_mask).sum() / num_neg
+        
+        loss_sampled = (0.5 * loss_sampled_pos + 0.5 * loss_sampled_neg) * lambda_sampled
 
         # C. Regularization (Prevent sigma from becoming too small or too large)
         # L2 on log_sigma encourages it to stay around 0 (sigma=1), which is moderate.
         # Or simply penalize very small sigma to prevent numerical issues.
-        loss_reg_sigma = (vi_log_sigma ** 2).mean()
+        loss_reg_sigma = (vi_log_sigma ** 2).mean() * lambda_reg
         
         # alternatively, use js divergence with a gaussian distribution.
         # C: Regularization: use js divergence with a gaussian distribution with mean=0.5, sigma=1.0
+        # loss_reg_sigma = self._js_divergence_gaussian(mu_pred, sigma_pred, torch.full_like(mu_pred, 0.5), torch.ones_like(sigma_pred)).mean() * lambda_reg
 
         # Total Loss
         # Weight: 1.0 for Mean (accuracy), 1.0 for KL (uncertainty shape), small weight for reg
-        loss_total = self.lambda_vi * (1.0 * loss_recon_mu + 0.01 * loss_dist_match) + 0.01 * loss_reg_sigma
+        # loss_total = self.lambda_vi * (0.5 * loss_sampled + 0.5 * loss_dist_match) + loss_reg_sigma
+        loss_total = self.lambda_vi * (loss_sampled) + loss_reg_sigma
         
         loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=-1e4)
 
         return dict(
-            loss_vi=loss_recon_mu,       # Monitor mean accuracy
-            loss_vi_kl=0.01*loss_dist_match,  # Monitor uncertainty learning
+            loss_vi_dist_match=loss_dist_match,       # Monitor mean accuracy
+            loss_vi_sampled=loss_sampled,  # Monitor uncertainty learning
+            loss_vi_reg=loss_reg_sigma,
             loss_total=loss_total,
-            vi_prob=mu_pred.detach()
+            vi_prob=mu_pred.detach(),
+            vi_sigma=sigma_pred.detach()
         )
