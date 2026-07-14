@@ -44,34 +44,8 @@ class VIPosNegLoss(nn.Module):
         thresh = pos_thresh.clamp(min=1.0)
         normalized_dist = dist_to_gt / thresh
         # soft = torch.exp(-0.5 * (normalized_dist / 0.4) ** 2) # sigma fixed to 0.4 for label shape
-        soft = torch.exp(-0.5 * (normalized_dist / 0.4) ** 2) # sigma fixed to 0.4 for label shape
+        soft = torch.exp(-0.5 * (normalized_dist / 0.8) ** 2) # sigma fixed to 0.4 for label shape
         return soft.clamp(min=0.0, max=1.0)
-
-    def _generate_target_gaussian_params(self, soft_labels):
-        """
-        Generate target Mean and Sigma for Gaussian distribution matching.
-        Logic:
-        - Target Mean = soft_labels (0~1)
-        - Target Sigma: 
-          - If soft_label close to 0 or 1 (Confident) -> sigma = base_sigma (small)
-          - If soft_label close to 0.5 (Uncertain)   -> sigma = max_sigma (large)
-        """
-        mu_target = soft_labels
-        
-        # Calculate distance to decision boundary (0.5)
-        # distance = |mu_t - 0.5|. Range [0, 0.5]
-        dist_to_boundary = torch.abs(mu_target - 0.5)
-        
-        # Normalize to [0, 1] where 0=Edge(Uncertain), 1=Center(Confident)
-        # certainty = 2 * dist_to_boundary
-        certainty = 2.0 * dist_to_boundary
-        
-        # Map certainty to sigma range
-        # High certainty -> Low sigma. Low certainty -> High sigma.
-        # sigma_t = base + (1 - certainty) * (max - base)
-        sigma_target = self.base_sigma + (1.0 - certainty) * (self.max_sigma - self.base_sigma)
-        
-        return mu_target, sigma_target
 
     def _kl_divergence_gaussian(self, mu_p, sigma_p, mu_q, sigma_q):
         """
@@ -121,6 +95,31 @@ class VIPosNegLoss(nn.Module):
         
         Image.fromarray(vis_img).save(save_path)
 
+    def _generate_target_gaussian_params(self, soft_labels):
+        """
+        生成 Logit 空间的目标高斯分布参数。
+        
+        Args:
+            soft_labels (Tensor): [0, 1] 之间的软标签
+            
+        Returns:
+            mu_target (Tensor): 目标均值，范围 
+            sigma_target (Tensor): 目标标准差，范围 [base_sigma, max_sigma]
+        """
+        # 1. 构造 mu_target (Logit 空间)
+        # 将 [0, 1] 的概率映射回 (-inf, +inf) 的 Logit 空间
+        # 这样 vi_mu_logit 就可以直接在 Logit 空间回归这个值
+        soft_labels_clamped = soft_labels.clamp(min=1e-5, max=1.0 - 1e-5)
+        mu_target = torch.log(soft_labels_clamped / (1.0 - soft_labels_clamped))
+        
+        # 2. 构造 sigma_target
+        # 逻辑：距离决策边界(0.5)越远，确定性越高，sigma 越小；反之亦然
+        dist_to_boundary = torch.abs(soft_labels - 0.5) * 2.0  # range: [0, 1], 1=Very Certain, 0=Very Uncertain
+        
+        # 映射：High Certainty -> Low Sigma
+        sigma_target = self.base_sigma + (1.0 - dist_to_boundary) * (self.max_sigma - self.base_sigma)
+        
+        return mu_target, sigma_target
 
     def forward(self, vi_mu_logit, vi_log_sigma, dist_to_gt, pos_thresh, is_ignored=None, is_pos=None, temperature=1.0, vi_target=None, iter=-1):
         N = vi_mu_logit.shape[0]
@@ -128,22 +127,45 @@ class VIPosNegLoss(nn.Module):
             zero = vi_mu_logit.sum() * 0.0
             return dict(loss_vi=zero, loss_total=zero, vi_prob=zero.detach())
 
-        # 1. Sanitize and get predictions
+        # ------------------------------------------------------------------
+        # 1. 预测分布处理 P(Delta)
+        # ------------------------------------------------------------------
         vi_log_sigma = self._sanitize_log_sigma(vi_log_sigma)
-        mu_pred = torch.sigmoid(vi_mu_logit) # vi_mu_logit is in range (-inf, +inf), mu_pred in range (0, 1)
-        
-        # Temperature scaling affects the sharpness
-        # sigma_pred = exp(log_sigma) / temperature
-        sigma_pred = (vi_log_sigma.exp() / max(temperature, 1e-6)).clamp(min=self.eps)
+        # 预测的均值，作为 Logit 距离度量
+        mu_pred = vi_mu_logit 
+        # 预测的方差，考虑温度衰减 (训练初期 T 大，允许探索；后期 T 小，分布变尖锐)
+        # sigma_pred = (vi_log_sigma.exp() / max(temperature, 1e-6)).clamp(min=self.eps)
+        sigma_pred = vi_log_sigma.exp().clamp(min=self.eps)  # 不使用温度衰减，直接使用预测的 sigma
 
-        # 2. Generate Targets
+        # ------------------------------------------------------------------
+        # 2. 构造目标分布 T(Delta)
+        # ------------------------------------------------------------------
         if vi_target is None:
-            soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh)
+            soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh) # thresh内部为1，外部逐渐衰减
         else:
             soft_labels = vi_target
-        
+            
+        # 生成目标分布参数 (Logit 空间)
         mu_target, sigma_target = self._generate_target_gaussian_params(soft_labels)
+        # mu_target 范围为 (-inf, +inf) 太大了，clamp到正负硬分配阈值的范围内
+        mu_target = mu_target.clamp(min=-10.0, max=10.0)
 
+        # ------------------------------------------------------------------
+        # 3. Masking (构建有效监督区域)
+        # ------------------------------------------------------------------        
+        # A. 全局忽略点
+        if is_ignored is not None:
+            valid_global = (is_ignored == 0).float()
+        else:
+            valid_global = torch.ones_like(mu_pred)
+            
+        # B. 几何有效点 (去除过于极端的背景，防止 Logit -> -inf)
+        # 只有 soft_label > 1e-3 的点才参与训练
+        valid_geo = (soft_labels > 1e-3).float()
+        
+        valid_mask = valid_global * valid_geo
+        num_valid = valid_mask.sum().clamp(min=1.0)
+        
         # 3. Masking
         if is_pos is not None:
             pos_mask = is_pos.float()
@@ -154,68 +176,60 @@ class VIPosNegLoss(nn.Module):
 
         num_pos = pos_mask.sum().clamp(min=1.0)
         num_neg = neg_mask.sum().clamp(min=1.0)
+
+        # ------------------------------------------------------------------
+        # 4. 重构项 (Reconstruction Loss) - 仿照 VPD 的采样回归
+        # ------------------------------------------------------------------
+        # 重参数化采样: z = mu + sigma * eps
+        eps = torch.randn_like(mu_pred)
+        sampled_pred = mu_pred + sigma_pred * eps * 10
         
-        # if iter >= 0:
-        #     self._visualize_vi_predictions(mu_target.detach().cpu(), sigma_target.detach().cpu(), f"/media/ps/passport2/zlk/results/0627_posnegvi_gaussian_norecon/vpd_cpm_dotav10/soft_labels/soft_labels_iter_{iter}.png")
+        # 在 Logit 空间计算 L1 Loss (比 MSE 更鲁棒，类似 Smooth L1)
+        # 这迫使预测分布的采样值尽可能靠近目标 Logit
+        # loss_recon = torch.abs(sampled_pred - mu_target)
+        # or smoothl1
+        loss_recon = F.smooth_l1_loss(sampled_pred, mu_target, reduction='none', beta=0.1)
+        # loss_recon = (loss_recon * valid_mask).sum() / num_valid
+        loss_recon_pos = (loss_recon * pos_mask).sum() / num_pos
+        loss_recon_neg = (loss_recon * neg_mask).sum() / num_neg
+        loss_recon = 0.5 * (loss_recon_pos + loss_recon_neg)
 
-        # 4. Calculate Loss
-
-        # B. Distribution Matching (KL Divergence) - Supervise Sigma/Uncertainty
-        # KL(Pred || Target)
+        # ------------------------------------------------------------------
+        # 5. 正则项 (Distribution Matching) - 仿照 VPD 的 JS 散度
+        # ------------------------------------------------------------------
+        # 计算 KL 散度: KL(Pred || Target)
+        # 强制预测分布的形状 (sigma) 去拟合目标分布的形状
         kl_val = self._js_divergence_gaussian(mu_pred, sigma_pred, mu_target, sigma_target)
-        
+        # loss_kl = (kl_val * valid_mask).sum() / num_valid
         loss_kl_pos = (kl_val * pos_mask).sum() / num_pos
         loss_kl_neg = (kl_val * neg_mask).sum() / num_neg
-        loss_dist_match = (0.5 * loss_kl_pos + 0.5 * loss_kl_neg) * lambda_dist_match
+        loss_kl = 0.5 * (loss_kl_pos + loss_kl_neg)
 
-        # # B. Sampled Matching - Sample from predicted distribution N(mu_pred, sigma_pred)
-        # #                       calculate loss with mu_target
-        # sample_pred = torch.normal(vi_mu_logit, vi_log_sigma.exp() * sigma_scale).sigmoid()  # Sample from predicted distribution and apply sigmoid to get in range (0, 1)
-        # loss_sampled_pos = ((sample_pred - mu_target) ** 2 * pos_mask).sum() / num_pos
-        # loss_sampled_neg = ((sample_pred - mu_target) ** 2 * neg_mask).sum() / num_neg
-        # loss_sampled = (0.5 * loss_sampled_pos + 0.5 * loss_sampled_neg) * lambda_sampled
-        
-        # 1. 将 Target 映射回 Logit 空间 (Inverse Sigmoid)  [0.268]
-        # 加 eps 防止 log(0)
-        target_logits = torch.log(mu_target / (1.0 - mu_target + 1e-6) + 1e-6)
+        # ------------------------------------------------------------------
+        # 6. 额外的 L2 正则 (可选，防止 sigma 异常)
+        # ------------------------------------------------------------------
+        loss_reg_sigma = (vi_log_sigma ** 2).mean()
 
-        # 2. 直接在 Logit 空间计算 L1 Loss (MSE也可以，但L1更鲁棒)
-        # sample_logits 就是 torch.normal(...) 的结果
-        # sample_logits = torch.normal(vi_mu_logit, vi_log_sigma.exp() * sigma_scale)
-        eps = torch.randn_like(vi_mu_logit)
-        sample_logits = vi_mu_logit + vi_log_sigma.exp() * eps   # 梯度同时流向 mu 和 sigma
-
-        loss_sampled_pos = (torch.abs(sample_logits - target_logits) * pos_mask).sum() / num_pos
-        loss_sampled_neg = (torch.abs(sample_logits - target_logits) * neg_mask).sum() / num_neg
-        
-        # or calculate loss in probability space (after sigmoid)
-        # sample_prob = torch.sigmoid(sample_logits)
-        # loss_sampled_pos = ((sample_prob - mu_target) ** 2 * pos_mask).sum() / num_pos
-        # loss_sampled_neg = ((sample_prob - mu_target) ** 2 * neg_mask).sum() / num_neg
-        
-        loss_sampled = (0.5 * loss_sampled_pos + 0.5 * loss_sampled_neg) * lambda_sampled
-
-        # C. Regularization (Prevent sigma from becoming too small or too large)
-        # L2 on log_sigma encourages it to stay around 0 (sigma=1), which is moderate.
-        # Or simply penalize very small sigma to prevent numerical issues.
-        loss_reg_sigma = (vi_log_sigma ** 2).mean() * lambda_reg
-        
-        # alternatively, use js divergence with a gaussian distribution.
-        # C: Regularization: use js divergence with a gaussian distribution with mean=0.5, sigma=1.0
-        # loss_reg_sigma = self._js_divergence_gaussian(mu_pred, sigma_pred, torch.full_like(mu_pred, 0.5), torch.ones_like(sigma_pred)).mean() * lambda_reg
-
-        # Total Loss
-        # Weight: 1.0 for Mean (accuracy), 1.0 for KL (uncertainty shape), small weight for reg
-        # loss_total = self.lambda_vi * (0.5 * loss_sampled + 0.5 * loss_dist_match) + loss_reg_sigma
-        loss_total = self.lambda_vi * (loss_sampled) + loss_reg_sigma
+        # ------------------------------------------------------------------
+        # 7. 总 Loss
+        # ------------------------------------------------------------------
+        # VPD 风格通常直接相加或加权
+        # 重构项保证位置准确，散度项保证不确定性合理
+        loss_total = self.lambda_vi * (loss_recon + 0.01 * loss_kl + 0.0 * loss_reg_sigma) * 0.001
         
         loss_total = torch.nan_to_num(loss_total, nan=0.0, posinf=1e4, neginf=-1e4)
 
+        # ------------------------------------------------------------------
+        # 8. 输出推理概率
+        # ------------------------------------------------------------------
+        # 推理时，直接将预测的 Logit 转换为概率
+        vi_prob = torch.sigmoid(mu_pred).detach()
+
         return dict(
-            loss_vi_dist_match=loss_dist_match,       # Monitor mean accuracy
-            loss_vi_sampled=loss_sampled,  # Monitor uncertainty learning
-            loss_vi_reg=loss_reg_sigma,
             loss_total=loss_total,
-            vi_prob=mu_pred.detach(),
+            loss_vi_recon=loss_recon.detach(),
+            loss_vi_kl=loss_kl.detach(),
+            loss_vi_reg=loss_reg_sigma.detach(),
+            vi_prob=vi_prob,  # already detached
             vi_sigma=sigma_pred.detach()
         )

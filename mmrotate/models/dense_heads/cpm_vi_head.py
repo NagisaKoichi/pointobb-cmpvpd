@@ -116,8 +116,8 @@ class CPMVIHead(CPMHead):
             angle_pred = torch.zeros_like(bbox_pred[:, :1])
             
         # 4. 计算 VI 分支预测
-        # vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
-        vi_pred = self.conv_vi(cls_feat).float()  # (N, 2, H, W)
+        vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
+        # vi_pred = self.conv_vi(cls_feat).float()  # (N, 2, H, W)
         
         return cls_score, bbox_pred, angle_pred, centerness, vi_pred
 
@@ -311,49 +311,46 @@ class CPMVIHead(CPMHead):
     # Loss
     # ------------------------------------------------------------------
     @force_fp32(apply_to=('cls_scores', 'bbox_preds', 'angle_preds', 'centernesses', 'vi_preds'))
-    def loss(self, cls_scores, bbox_preds, angle_preds, centernesses, vi_preds,
-             gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
+    def loss(self, cls_scores, bbox_preds, angle_preds, centernesses, vi_preds, gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses) == len(vi_preds)
         
-        # visualize vi_preds
-        self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
+        # ... (visualize code omitted for brevity) ...
+        # self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
         
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
             featmap_sizes, dtype=bbox_preds[0].dtype, device=bbox_preds[0].device)
-
-        labels, dists, threshs = self.get_targets_vi(all_level_points, gt_bboxes, gt_labels)
         
-        if self.visualize and self.store_dir and self.iter % self.train_duration == 0:
-            self.draw_image(img_metas[0]['filename'], img_metas[0].get('flip_direction'), cls_scores[0][0].sigmoid())
+        # 获取几何信息（距离和阈值）
+        labels, dists, threshs = self.get_targets_vi(all_level_points, gt_bboxes, gt_labels)
         
         cur_iter = self.iter
         self.iter += 1
         num_imgs = cls_scores[0].size(0)
-
+        
         flatten_cls_scores = torch.cat([cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cs in cls_scores])
         flatten_vi_preds = torch.cat([vp.permute(0, 2, 3, 1).reshape(-1, 2) for vp in vi_preds])
         flatten_labels = torch.cat(labels)
         flatten_dists = torch.cat(dists)
         flatten_threshs = torch.cat(threshs)
-
+        
         bg_class_ind = self.num_classes
         avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
         
-        # 1. Get current Temperature
+        # 1. Get current Temperature (for VI Loss sampling)
         temperature = self._get_current_temperature(cur_iter)
-
+        
         # 2. Compute VI Loss
         is_ignored = (flatten_labels < 0)
         flatten_dists = torch.where(torch.isinf(flatten_dists), torch.full_like(flatten_dists, 1e4), flatten_dists)
         
-        vi_mu_logit = flatten_vi_preds[:, 0]
-        vi_log_sigma = flatten_vi_preds[:, 1]  # Changed variable name for clarity
-                
-        # Pass parameters to VIPosNegLoss
+        vi_mu_logit = flatten_vi_preds[:, 0] # 预测的 mu_logit (Logit 空间的 Gap)
+        vi_log_sigma = flatten_vi_preds[:, 1]
+        
+        # 计算变分推断 Loss
         vi_losses = self.loss_vi(
             vi_mu_logit=vi_mu_logit,
-            vi_log_sigma=vi_log_sigma,       # Pass log_sigma instead of log_kappa
+            vi_log_sigma=vi_log_sigma,
             dist_to_gt=flatten_dists,
             pos_thresh=flatten_threshs.clamp(min=1.0),
             is_ignored=is_ignored,
@@ -362,35 +359,49 @@ class CPMVIHead(CPMHead):
         )
         
         loss_vi = torch.nan_to_num(vi_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
-
-        # 3. 动态计算分类 Loss
+        
+        # 3. 动态计算分类 Loss (Dynamic Assignment)
         num_avail = max(reduce_mean(torch.tensor(len(avail_inds), dtype=torch.float, device=bbox_preds[0].device)), 1.0)
         
         if cur_iter < self.warmup_iters:
-            # 前期：标准硬标签分配，无软加权
+            # 前期 Warmup：使用标准硬标签
             loss_cls = self.loss_cls(
-                flatten_cls_scores[avail_inds],
-                flatten_labels[avail_inds],
-                avg_factor=num_avail)
+                flatten_cls_scores[avail_inds], 
+                flatten_labels[avail_inds], 
+                avg_factor=num_avail
+            )
         else:
-            # 后期：使用 VI 预测的 P(positive) 作为软权重指导 CPM
-            vi_prob = vi_losses['vi_prob']  # (P,), detached in loss function, need grad here
-            # 重新获取带梯度的 mu
-            vi_prob = torch.sigmoid(vi_mu_logit[avail_inds]) 
+            # 后期：基于物理距离的动态分配
             
-            # 构造软权重：正样本权重为 P(positive)，负样本权重为 1 - P(positive)
-            weight = torch.ones(len(avail_inds), device=bbox_preds[0].device)
-            # pos_mask = (flatten_labels[avail_inds] < bg_class_ind)
-            # neg_mask = (flatten_labels[avail_inds] == bg_class_ind)
+            # 获取有效区域的预测和几何信息
+            vi_mu = vi_mu_logit[avail_inds] # 预测的距离差值 Delta
+            dists_geo = flatten_dists[avail_inds] # 实际距离 d
+            threshs_geo = flatten_threshs[avail_inds].clamp(min=1.0) # 硬阈值 T_hard
             
-            # 或者正负样本通过 VI 概率进行分配：
-            pos_mask = (vi_prob > 0.7)
-            neg_mask = (vi_prob < 0.3)
+            # --- 核心修正：使用修正后的分配距离进行比较 ---
             
-            weight[pos_mask] = vi_prob[pos_mask].detach()
-            weight[neg_mask] = (1.0 - vi_prob[neg_mask]).detach()
+            # 1. 计算动态分配距离: T_dynamic = T_hard + mu_pred
+            # vi_mu 已经是距离单位（由 VIPosNegLoss 的回归目标决定）
+            dynamic_thresh = threshs_geo + vi_mu
             
-            # 由于温度衰减，权重在后期会自然逼近 0 或 1，防止震荡
+            # 2. 比较 T_dynamic 与实际距离 d_actual
+            # Margin > 0 意味着 动态阈值 覆盖了 实际距离 -> 正样本
+            margin = dynamic_thresh - dists_geo
+            
+            # 3. 定义正负样本 Mask
+            pos_mask = (margin > 0)
+            neg_mask = (margin <= 0)
+            
+            # 4. 计算软权重
+            # 将 Margin 映射到 [0, 1] 概率空间
+            # Margin 越大（点越深），权重趋近 1
+            # Margin 越小（点越浅），权重趋近 0
+            dynamic_prob = torch.sigmoid(margin)
+            
+            weight = torch.ones_like(dynamic_prob)
+            weight[pos_mask] = dynamic_prob[pos_mask]
+            weight[neg_mask] = (1.0 - dynamic_prob[neg_mask])
+            
             loss_cls = self.loss_cls(
                 flatten_cls_scores[avail_inds],
                 flatten_labels[avail_inds],
@@ -400,20 +411,20 @@ class CPMVIHead(CPMHead):
             
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
         zero = loss_cls.sum() * 0.0
-
+                
         return dict(
             loss_cls=self.cls_weight * loss_cls,
             loss_bbox=zero,
             loss_centerness=zero,
             loss_vi=loss_vi,
-            loss_vi_dist_match=vi_losses['loss_vi_dist_match'].detach(),
-            loss_vi_sampled=vi_losses['loss_vi_sampled'].detach(),
+            loss_vi_recon=vi_losses['loss_vi_recon'].detach(),
+            loss_vi_kl=vi_losses['loss_vi_kl'].detach(),
             loss_vi_reg=vi_losses['loss_vi_reg'].detach(),
+            # 修改日志：分别监控正样本概率和全局概率
             vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
             vi_sigma_mean=vi_losses['vi_sigma'].mean().detach(),
-            temperature=torch.tensor(temperature, device=loss_cls.device) # 用于日志监控
+            temperature=torch.tensor(temperature, device=loss_cls.device)
         )
-        
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
