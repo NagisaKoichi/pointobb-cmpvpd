@@ -95,32 +95,38 @@ class VIPosNegLoss(nn.Module):
         
         Image.fromarray(vis_img).save(save_path)
 
-    def _generate_target_gaussian_params(self, soft_labels):
-        """
-        生成 Logit 空间的目标高斯分布参数。
-        
+    def _generate_target_gaussian_params(self, soft_labels, pos_thresh=None):
+        """ 
+        生成目标高斯分布参数。
         Args:
             soft_labels (Tensor): [0, 1] 之间的软标签
-            
+            pos_thresh (Tensor): 临界距离阈值 T
         Returns:
-            mu_target (Tensor): 目标均值，范围 
-            sigma_target (Tensor): 目标标准差，范围 [base_sigma, max_sigma]
+            mu_target (Tensor): 目标均值，物理意义为 log(D_critical)
+            sigma_target (Tensor): 目标标准差
         """
-        # 1. 构造 mu_target (Logit 空间)
-        # 将 [0, 1] 的概率映射回 (-inf, +inf) 的 Logit 空间
-        # 这样 vi_mu_logit 就可以直接在 Logit 空间回归这个值
+        # 1. 基础 Logit 计算
         soft_labels_clamped = soft_labels.clamp(min=1e-5, max=1.0 - 1e-5)
-        mu_target = torch.log(soft_labels_clamped / (1.0 - soft_labels_clamped))
+        # logit 范围 (-inf, +inf)，在 d=T 处约为 0
+        logit_val = torch.log(soft_labels_clamped / (1.0 - soft_labels_clamped))
         
-        # 2. 构造 sigma_target
-        # 逻辑：距离决策边界(0.5)越远，确定性越高，sigma 越小；反之亦然
-        dist_to_boundary = torch.abs(soft_labels - 0.5) * 2.0  # range: [0, 1], 1=Very Certain, 0=Very Uncertain
-        
-        # 映射：High Certainty -> Low Sigma
-        sigma_target = self.base_sigma + (1.0 - dist_to_boundary) * (self.max_sigma - self.base_sigma)
+        # 2. 物理意义转换：Logit -> Log-Distance
+        # 我们希望 mu 代表 log(D_critical)。
+        # 在决策边界 d=T 处，我们希望 mu = log(T)，这样 margin = mu - log(d) = log(T) - log(T) = 0。
+        # 因此，需要给 logit_val 加上 log(T) 的偏移量。
+        if pos_thresh is not None:
+            # 确保 pos_thresh 为正且非零
+            pos_thresh_safe = pos_thresh.clamp(min=1.0)
+            mu_target = logit_val + torch.log(pos_thresh_safe)
+        else:
+            mu_target = logit_val
+
+        # 3. 构造 sigma_target (保持不变)
+        dist_to_boundary = torch.abs(soft_labels - 0.5) * 2.0 
+        sigma_target = self.base_sigma + (1.0 - dist_to_boundary) * (self.max_sigma - self.base_sigma)  # 范围： [base_sigma, max_sigma]
         
         return mu_target, sigma_target
-
+    
     def forward(self, vi_mu_logit, vi_log_sigma, dist_to_gt, pos_thresh, is_ignored=None, is_pos=None, temperature=1.0, vi_target=None, iter=-1):
         N = vi_mu_logit.shape[0]
         if N == 0:
@@ -133,6 +139,7 @@ class VIPosNegLoss(nn.Module):
         vi_log_sigma = self._sanitize_log_sigma(vi_log_sigma)
         # 预测的均值，作为 Logit 距离度量
         mu_pred = vi_mu_logit 
+        
         # 预测的方差，考虑温度衰减 (训练初期 T 大，允许探索；后期 T 小，分布变尖锐)
         # sigma_pred = (vi_log_sigma.exp() / max(temperature, 1e-6)).clamp(min=self.eps)
         sigma_pred = vi_log_sigma.exp().clamp(min=self.eps)  # 不使用温度衰减，直接使用预测的 sigma
@@ -141,14 +148,15 @@ class VIPosNegLoss(nn.Module):
         # 2. 构造目标分布 T(Delta)
         # ------------------------------------------------------------------
         if vi_target is None:
-            soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh) # thresh内部为1，外部逐渐衰减
+            soft_labels = self._generate_soft_labels(dist_to_gt, pos_thresh)
         else:
             soft_labels = vi_target
             
-        # 生成目标分布参数 (Logit 空间)
-        mu_target, sigma_target = self._generate_target_gaussian_params(soft_labels)
-        # mu_target 范围为 (-inf, +inf) 太大了，clamp到正负硬分配阈值的范围内
-        mu_target = mu_target.clamp(min=-10.0, max=10.0)
+        # 传入 pos_thresh 进行物理意义转换
+        mu_target, sigma_target = self._generate_target_gaussian_params(soft_labels, pos_thresh)
+        
+        # Clamp 可以适当放宽，因为 log(T) 可能会大一些 (例如 log(128) ~= 4.8)
+        mu_target = mu_target.clamp(min=-20.0, max=20.0)
 
         # ------------------------------------------------------------------
         # 3. Masking (构建有效监督区域)

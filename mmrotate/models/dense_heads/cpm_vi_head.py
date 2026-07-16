@@ -52,9 +52,9 @@ class CPMVIHead(CPMHead):
     """
 
     def __init__(self, *args, vi_weight=1.0, vi_num_bins=21,
-                 vi_soft_label_sigma=1.28, use_vi_score=False,
+                 vi_soft_label_sigma=1.28, use_vi_score=False, vi_thresh_scale=1.0,
                  vi_score_mode='multiply', vi_thr=0.5,
-                 warmup_iters=2000, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
+                 warmup_iters=200, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
                  **kwargs):
         super(CPMVIHead, self).__init__(*args, **kwargs)
         train_cfg = kwargs.get('train_cfg') or {}
@@ -73,6 +73,8 @@ class CPMVIHead(CPMHead):
         self.use_vi_score = bool(test_cfg.get('use_vi_score', use_vi_score))
         self.vi_score_mode = test_cfg.get('vi_score_mode', vi_score_mode)
         self.vi_thr = float(test_cfg.get('vi_thr', vi_thr))
+        
+        self.vi_thresh_scale = float(train_cfg.get('vi_thresh_scale', vi_thresh_scale))
 
         self.loss_vi = build_loss(dict(
             type='VIPosNegLoss',
@@ -90,7 +92,8 @@ class CPMVIHead(CPMHead):
         """
         super()._init_predictor()
         # VI branch: 2 channels = [mu_logit, log_kappa]
-        self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=1)
+        # self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=1)
+        self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=2, dilation=2)
 
     def forward_single(self, x, scale, stride):
         """Forward for a single FPN level.
@@ -129,6 +132,20 @@ class CPMVIHead(CPMHead):
         """
         return multi_apply(self.forward_single, feats, self.scales,
                            self.strides)
+        
+    # ------------------------------------------------------------------
+    # VI prior generation: use the gt_centers to assign a prior mu
+    # ------------------------------------------------------------------
+    def _get_vi_prior_single(self, gt_bboxes, points):
+        """Generate VI prior for a single image.
+
+        Args:
+            gt_bboxes (Tensor): (G, 5) GT boxes in (x, y, w, h, a).
+            points (Tensor): (P, 2) feature points.
+        Returns:
+            vi_prior (Tensor): (P,) prior for each point: [mu]
+        """
+        # 
 
     # ------------------------------------------------------------------
     # Label assignment: extend to return distance and threshold info
@@ -264,6 +281,159 @@ class CPMVIHead(CPMHead):
 
         return concat_lvl_labels, concat_lvl_dist, concat_lvl_thresh
     
+    # def _get_target_single_vi_dynamic(self, gt_bboxes, gt_labels, points, vi_mu_logit, regress_ranges, num_points_per_lvl):
+    def _get_target_single_vi_dynamic(self, gt_bboxes, gt_labels, vi_mu_logit, points, regress_ranges, num_points_per_lvl):
+        """
+        基于 VI 分支结果的动态样本分配 (单张图片)。
+        
+        Args:
+            gt_bboxes (Tensor): (G, 5) 当前图片的 GT Boxes
+            gt_labels (Tensor): (G,) 当前图片的 GT Labels
+            points (Tensor): (Total_Points, 2) 当前图片的所有特征点 (按 Level 拼接)
+            vi_mu_logit (Tensor): (Total_Points,) 当前图片的 VI 预测 (mu_logit)
+            regress_ranges: (保持接口一致性，未使用)
+            num_points_per_lvl: List[int], 每个 Level 的点数，用于拆分结果
+            
+        Returns:
+            labels (Tensor): (Total_Points, ) -1=Ignore, [0, num_classes-1]=Pos, num_classes=Neg
+            dist_to_gt (Tensor): (Total_Points, )
+            pos_thresh (Tensor): (Total_Points, ) 保持接口一致
+        """
+        thresh1 = self.thresh1
+        num_points = points.size(0)
+        num_gts = gt_labels.size(0)
+        center_point_gt = gt_bboxes[:, :2]
+
+        # 初始化
+        labels = -1 * torch.ones(num_points, dtype=gt_labels.dtype, device=points.device)
+        dist_to_gt = torch.full((num_points,), INF, dtype=torch.float32, device=points.device)
+        pos_thresh = torch.zeros(num_points, dtype=torch.float32, device=points.device)
+
+        if num_gts == 0:
+            # 没有 GT，全图背景
+            labels[:] = self.num_classes
+            return labels, dist_to_gt, pos_thresh
+
+        # 1. 几何信息计算 (用于获取最近 GT 的类别和距离)
+        dist_sample_and_gt = torch.cdist(points, center_point_gt) # (Total_Points, G)
+        
+        # 找到每个点最近的 GT
+        dist_min_sample_and_gt, min_gt_idx = dist_sample_and_gt.min(dim=1)
+        dist_to_gt = dist_min_sample_and_gt.float()
+
+        # 2. 计算 pos_thresh (保留输出接口)
+        # 这里的逻辑与原始 CPM 保持一致，虽然分配逻辑变了，但这个阈值仍可能被外部或其他逻辑使用
+        dist_gt_and_gt = (
+            torch.cdist(center_point_gt, center_point_gt) + 
+            torch.eye(num_gts, device=points.device) * INF
+        )
+        dist_min_gt_and_gt, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
+        thresh1_tensor = thresh1 * torch.ones_like(dist_min_gt_and_gt)
+        dist_min_thresh1_gt = torch.min(dist_min_gt_and_gt / 2, thresh1_tensor)
+        # 每个点取其最近 GT 的阈值
+        pos_thresh = dist_min_thresh1_gt[min_gt_idx]
+
+        # 3. VI 动态分配逻辑
+        # Weight > 0.7 -> 正样本
+        # Weight < 0.3 -> 负样本
+        # 其他 -> Ignore (-1)
+        log_actual_dist = torch.log(dist_min_sample_and_gt + 1.0)
+        margin = vi_mu_logit - log_actual_dist
+        weight = torch.sigmoid(margin)
+
+        mask_pos = (weight > 0.6)
+        mask_neg = (weight < 0.4)
+
+        if mask_pos.any():
+            labels[mask_pos] = gt_labels[min_gt_idx[mask_pos]]
+        
+        if mask_neg.any():
+            labels[mask_neg] = self.num_classes
+
+        # 4. 硬约束：相邻同类型样本之间的额外负样本
+        # 只有当 GT 数量大于 1 时才有“邻居”的概念
+        if num_gts > 1:
+            is_nearest_same_class = (gt_labels[dist_min_gt_and_gt_index] == gt_labels)
+            if is_nearest_same_class.any():
+                # 计算中点
+                valid_middle_point = (
+                    center_point_gt[is_nearest_same_class] + 
+                    center_point_gt[dist_min_gt_and_gt_index][is_nearest_same_class]
+                ) / 2
+                
+                # 计算点到中点的距离
+                dist_sample_and_mid = torch.cdist(points, valid_middle_point)
+                
+                # 距离小于 4 的点强制设为负样本
+                index_neg_additional = (dist_sample_and_mid < 4).any(dim=1).nonzero().squeeze(-1)
+                if len(index_neg_additional) > 0:
+                    labels[index_neg_additional] = self.num_classes
+
+        return labels, dist_to_gt, pos_thresh
+
+    def get_targets_vi_dynamic(self, points, gt_bboxes_list, gt_labels_list, vi_mu_logit_list):
+        """
+        Wrapper for dynamic assignment.
+        
+        Args:
+            points: List[Tensor], points per level (单张图的全集, shape: (P_level, 2))
+            gt_bboxes_list: List[Tensor], GT boxes per image (Batch size N)
+            gt_labels_list: List[Tensor], GT labels per image
+            vi_mu_logit_list: List[Tensor], vi_mu_logit per image (Batch size N), 
+                              每个元素形状为 (Total_Points,)
+        
+        Returns: Same format as get_targets_vi (List of Tensors per level, concatenated over batch)
+        """
+        assert len(points) == len(self.regress_ranges)
+        assert len(vi_mu_logit_list) == len(gt_bboxes_list)
+
+        num_levels = len(points)
+        
+        # 拼接 Points，得到 (Total_Points_Single_Image, 2)
+        # 注意：points 列表中的每个元素是对应的 Level，它们加起来是单张图的所有点
+        concat_points = torch.cat(points, dim=0)
+        
+        expanded_regress_ranges = [
+            points[i].new_tensor(self.regress_ranges[i])[None].expand_as(points[i]) 
+            for i in range(num_levels)
+        ]
+        concat_regress_ranges = torch.cat(expanded_regress_ranges, dim=0)
+        num_points_per_lvl = [center.size(0) for center in points]
+
+        # 调用 multi_apply
+        # multi_apply 会遍历 gt_bboxes_list 和 vi_mu_logit_list
+        # concat_points 会被复用传给每一张图片的处理函数
+        labels_list, dist_list, thresh_list = multi_apply(
+            self._get_target_single_vi_dynamic,
+            gt_bboxes_list,     # Arg 0
+            gt_labels_list,     # Arg 1
+            vi_mu_logit_list,   # Arg 2 (位置参数，会被自动拆分)
+            points=concat_points,         # Kwarg
+            regress_ranges=concat_regress_ranges, # Kwarg
+            num_points_per_lvl=num_points_per_lvl # Kwarg
+        )
+
+        # 还原结果结构 (按 Level 拆分)
+        # labels_list 是 List[Single_Image_Labels]
+        # Single_Image_Labels 需要按 num_points_per_lvl 切分回各个 Level
+        labels_list = [labels.split(num_points_per_lvl, 0) for labels in labels_list]
+        dist_list = [dist.split(num_points_per_lvl, 0) for dist in dist_list]
+        thresh_list = [thresh.split(num_points_per_lvl, 0) for thresh in thresh_list]
+
+        # 重新组合成 Level 优先的格式，用于后续计算 Loss
+        concat_lvl_labels = []
+        concat_lvl_dist = []
+        concat_lvl_thresh = []
+        
+        for i in range(num_levels):
+            # 取出所有图片的第 i 层 Label 并拼接
+            concat_lvl_labels.append(torch.cat([labels[i] for labels in labels_list]))
+            concat_lvl_dist.append(torch.cat([dist[i] for dist in dist_list]))
+            concat_lvl_thresh.append(torch.cat([thresh[i] for thresh in thresh_list]))
+
+        return concat_lvl_labels, concat_lvl_dist, concat_lvl_thresh
+
+    
     def _get_current_temperature(self, cur_iter):
         if cur_iter < self.warmup_iters:
             return self.temp_start
@@ -314,7 +484,6 @@ class CPMVIHead(CPMHead):
     def loss(self, cls_scores, bbox_preds, angle_preds, centernesses, vi_preds, gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses) == len(vi_preds)
         
-        # ... (visualize code omitted for brevity) ...
         # self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
         
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
@@ -332,81 +501,102 @@ class CPMVIHead(CPMHead):
         flatten_vi_preds = torch.cat([vp.permute(0, 2, 3, 1).reshape(-1, 2) for vp in vi_preds])
         flatten_labels = torch.cat(labels)
         flatten_dists = torch.cat(dists)
-        flatten_threshs = torch.cat(threshs)
+        flatten_threshs = torch.cat(threshs)  # = min(dist_to_nearest_gt / 2, thresh1) for each point
         
         bg_class_ind = self.num_classes
         avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
         
-        # 1. Get current Temperature (for VI Loss sampling)
+        # 1. Get current Temperature
         temperature = self._get_current_temperature(cur_iter)
-        
-        # 2. Compute VI Loss
+
+        # --- 关键修改：扩大 VI 分支的有效阈值 ---
+        # 原始的 flatten_threshs 是 CPM 的几何阈值（通常限制在 8 左右）
+        # 我们将其扩大 scale 倍，用于生成 VI 的 Soft Label
+        vi_threshs = flatten_threshs.clamp(min=1.0) * self.vi_thresh_scale
+
+        # 2. Compute VI Loss (传入放大后的阈值)
         is_ignored = (flatten_labels < 0)
         flatten_dists = torch.where(torch.isinf(flatten_dists), torch.full_like(flatten_dists, 1e4), flatten_dists)
-        
-        vi_mu_logit = flatten_vi_preds[:, 0] # 预测的 mu_logit (Logit 空间的 Gap)
+        vi_mu_logit = flatten_vi_preds[:, 0]
         vi_log_sigma = flatten_vi_preds[:, 1]
-        
-        # 计算变分推断 Loss
+
         vi_losses = self.loss_vi(
             vi_mu_logit=vi_mu_logit,
             vi_log_sigma=vi_log_sigma,
             dist_to_gt=flatten_dists,
-            pos_thresh=flatten_threshs.clamp(min=1.0),
+            pos_thresh=vi_threshs,  # 使用放大后的阈值
             is_ignored=is_ignored,
             temperature=temperature,
             iter=self.iter
         )
         
         loss_vi = torch.nan_to_num(vi_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
-        
-        # 3. 动态计算分类 Loss (Dynamic Assignment)
+
+        # 3. 动态计算分类 Loss (保持不变，使用 Log-Distance 逻辑)
         num_avail = max(reduce_mean(torch.tensor(len(avail_inds), dtype=torch.float, device=bbox_preds[0].device)), 1.0)
         
+        # vi_mu = vi_mu_logit[avail_inds]
+        # dists_geo = flatten_dists[avail_inds]
+        vi_mu = vi_mu_logit
+        dists_geo = flatten_dists
+        log_actual_dist = torch.log(dists_geo + 1.0)
+        
+        margin = vi_mu - log_actual_dist
+        dynamic_prob = torch.sigmoid(margin)
+        
         if cur_iter < self.warmup_iters:
-            # 前期 Warmup：使用标准硬标签
             loss_cls = self.loss_cls(
                 flatten_cls_scores[avail_inds], 
                 flatten_labels[avail_inds], 
                 avg_factor=num_avail
             )
         else:
-            # 后期：基于物理距离的动态分配
             
-            # 获取有效区域的预测和几何信息
-            vi_mu = vi_mu_logit[avail_inds] # 预测的距离差值 Delta
-            dists_geo = flatten_dists[avail_inds] # 实际距离 d
-            threshs_geo = flatten_threshs[avail_inds].clamp(min=1.0) # 硬阈值 T_hard
+            num_imgs = cls_scores[0].size(0)
             
-            # --- 核心修正：使用修正后的分配距离进行比较 ---
+            # 1. 构建 vi_mu_logit_list
+            # 必须确保输出顺序与 all_level_points 的拼接顺序一致 (Level 优先)
+            vi_mu_logit_list = []
+            for img_id in range(num_imgs):
+                logits_per_img = []
+                # 遍历所有 Level
+                for pred in vi_preds:
+                    # pred: (B, 2, H, W) -> 取出 img_id -> (2, H, W) -> Flatten -> (H*W, 2)
+                    logits_per_img.append(pred[img_id].view(-1, 2))
+                
+                # 拼接所有 Level -> (Total_Points, 2)
+                single_img_preds = torch.cat(logits_per_img, dim=0)
+                # 提取 mu_logit (通道 0)
+                vi_mu_logit_list.append(single_img_preds[:, 0])
+
+            # 2. 调用新的分配函数
+            labels, dists, threshs = self.get_targets_vi_dynamic(
+                all_level_points, 
+                gt_bboxes, 
+                gt_labels, 
+                vi_mu_logit_list
+            )
+
+            # 3. Flatten 结果
+            flatten_labels = torch.cat(labels)
+            flatten_dists = torch.cat(dists)
+            flatten_threshs = torch.cat(threshs)
             
-            # 1. 计算动态分配距离: T_dynamic = T_hard + mu_pred
-            # vi_mu 已经是距离单位（由 VIPosNegLoss 的回归目标决定）
-            dynamic_thresh = threshs_geo + vi_mu
+            avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
             
-            # 2. 比较 T_dynamic 与实际距离 d_actual
-            # Margin > 0 意味着 动态阈值 覆盖了 实际距离 -> 正样本
-            margin = dynamic_thresh - dists_geo
-            
-            # 3. 定义正负样本 Mask
             pos_mask = (margin > 0)
             neg_mask = (margin <= 0)
-            
-            # 4. 计算软权重
-            # 将 Margin 映射到 [0, 1] 概率空间
-            # Margin 越大（点越深），权重趋近 1
-            # Margin 越小（点越浅），权重趋近 0
-            dynamic_prob = torch.sigmoid(margin)
             
             weight = torch.ones_like(dynamic_prob)
             weight[pos_mask] = dynamic_prob[pos_mask]
             weight[neg_mask] = (1.0 - dynamic_prob[neg_mask])
             
+            # 替换avail_inds为vi分支计算的正负样本
+            
             loss_cls = self.loss_cls(
-                flatten_cls_scores[avail_inds],
-                flatten_labels[avail_inds],
-                weight=weight,
-                avg_factor=max(weight.sum(), 1.0)
+                flatten_cls_scores[avail_inds], 
+                flatten_labels[avail_inds], 
+                avg_factor=num_avail
             )
             
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -420,8 +610,8 @@ class CPMVIHead(CPMHead):
             loss_vi_recon=vi_losses['loss_vi_recon'].detach(),
             loss_vi_kl=vi_losses['loss_vi_kl'].detach(),
             loss_vi_reg=vi_losses['loss_vi_reg'].detach(),
-            # 修改日志：分别监控正样本概率和全局概率
-            vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
+            vi_prob_mean=dynamic_prob.mean().detach(),
+            # vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
             vi_sigma_mean=vi_losses['vi_sigma'].mean().detach(),
             temperature=torch.tensor(temperature, device=loss_cls.device)
         )
