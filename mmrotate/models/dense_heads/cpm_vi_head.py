@@ -30,6 +30,10 @@ from ..builder import ROTATED_HEADS, build_loss
 from .cpm_head import CPMHead
 from .rotated_anchor_free_head import RotatedAnchorFreeHead
 
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
+
 INF = 1e8
 
 
@@ -54,7 +58,7 @@ class CPMVIHead(CPMHead):
     def __init__(self, *args, vi_weight=1.0, vi_num_bins=21,
                  vi_soft_label_sigma=1.28, use_vi_score=False, vi_thresh_scale=1.0,
                  vi_score_mode='multiply', vi_thr=0.5,
-                 warmup_iters=200, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
+                 warmup_iters=2400, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
                  **kwargs):
         super(CPMVIHead, self).__init__(*args, **kwargs)
         train_cfg = kwargs.get('train_cfg') or {}
@@ -93,6 +97,21 @@ class CPMVIHead(CPMHead):
         super()._init_predictor()
         # VI branch: 2 channels = [mu_logit, log_kappa]
         # self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=1)
+        # --- 新增：为 VI 分支建立独立的特征提取层 ---
+        # 这样 VI 分支就不受 loss_bbox 和 loss_cls 的梯度影响了
+        self.vi_convs = nn.ModuleList()
+        for i in range(2): # 堆叠两层卷积，增加表达能力
+            self.vi_convs.append(
+                # nn.Conv2d(self.feat_channels, self.feat_channels, 3, padding=1, dilation=1)
+                # or dilated
+                nn.Conv2d(self.feat_channels, self.feat_channels, 3, padding=2, dilation=2)
+            )
+            self.vi_convs.append(
+                nn.GroupNorm(32, self.feat_channels) # 或 BN
+            )
+            self.vi_convs.append(nn.ReLU(inplace=True))
+
+        
         self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=2, dilation=2)
 
     def forward_single(self, x, scale, stride):
@@ -119,8 +138,17 @@ class CPMVIHead(CPMHead):
             angle_pred = torch.zeros_like(bbox_pred[:, :1])
             
         # 4. 计算 VI 分支预测
-        vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
+        # vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
         # vi_pred = self.conv_vi(cls_feat).float()  # (N, 2, H, W)
+        
+        vi_feat = x
+        for i in range(0, len(self.vi_convs), 3): # Conv -> Norm -> ReLU
+            vi_feat = self.vi_convs[i](vi_feat)
+            vi_feat = self.vi_convs[i+1](vi_feat)
+            vi_feat = self.vi_convs[i+2](vi_feat)
+        
+        vi_pred = self.conv_vi(vi_feat).float()
+
         
         return cls_score, bbox_pred, angle_pred, centerness, vi_pred
 
@@ -299,6 +327,7 @@ class CPMVIHead(CPMHead):
             dist_to_gt (Tensor): (Total_Points, )
             pos_thresh (Tensor): (Total_Points, ) 保持接口一致
         """
+        assert points.size(0) == vi_mu_logit.size(0), "Points and VI predictions must have the same number of points."
         thresh1 = self.thresh1
         num_points = points.size(0)
         num_gts = gt_labels.size(0)
@@ -330,19 +359,26 @@ class CPMVIHead(CPMHead):
         dist_min_gt_and_gt, dist_min_gt_and_gt_index = dist_gt_and_gt.min(dim=1)
         thresh1_tensor = thresh1 * torch.ones_like(dist_min_gt_and_gt)
         dist_min_thresh1_gt = torch.min(dist_min_gt_and_gt / 2, thresh1_tensor)
-        # 每个点取其最近 GT 的阈值
+        # 每个 GT 取其最近 GT 的阈值
         pos_thresh = dist_min_thresh1_gt[min_gt_idx]
 
         # 3. VI 动态分配逻辑
         # Weight > 0.7 -> 正样本
         # Weight < 0.3 -> 负样本
         # 其他 -> Ignore (-1)
-        log_actual_dist = torch.log(dist_min_sample_and_gt + 1.0)
-        margin = vi_mu_logit - log_actual_dist
-        weight = torch.sigmoid(margin)
+        # log_actual_dist = torch.log(dist_min_sample_and_gt + 1.0)
+        # margin = vi_mu_logit - log_actual_dist
+        # weight = torch.sigmoid(margin)
+        
+        weight = torch.sigmoid(vi_mu_logit)  # 适用于vi_mu_logit直接预测logit空间的分数的情况
 
-        mask_pos = (weight > 0.6)
-        mask_neg = (weight < 0.4)
+        mask_pos = (weight > 0.5)
+        # geo_in_range = (dist_min_sample_and_gt < 2.0 * dist_min_thresh1_gt[min_gt_idx])
+        # mask_pos = mask_pos & geo_in_range  # 同时满足 VI 正样本条件和几何正样本条件
+        # 同时满足 VI 负样本条件和几何负样本条件的点才被标记为负样本
+        # 几何负样本条件沿用原来的逻辑：alpha * dist_sample_and_gt > dist_min_gt_and_gt
+        # mask_neg = (weight < 0.3) & (self.alpha * dist_min_sample_and_gt > dist_min_gt_and_gt[min_gt_idx])
+        mask_neg = self.alpha * dist_min_sample_and_gt > dist_min_gt_and_gt[min_gt_idx]
 
         if mask_pos.any():
             labels[mask_pos] = gt_labels[min_gt_idx[mask_pos]]
@@ -467,12 +503,59 @@ class CPMVIHead(CPMHead):
         # vis_img[..., W:, 1] = (kappa / (kappa.max() + 1e-6) * 255).astype(np.uint8)  # Green: uncertainty
         
         # or use the colormap jet to visualize mu and kappa
-        import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
         mu_colormap = cm.jet(mu)[:, :, :3]  # (H, W, 3)
         kappa_colormap = cm.jet(kappa / (kappa.max() + 1e-6))[:, :, :3]
         vis_img[..., :W, :] = (mu_colormap * 255).astype(np.uint8)
         vis_img[..., W:, :] = (kappa_colormap * 255).astype(np.uint8)
+
+        Image.fromarray(vis_img).save(save_path)
+        
+    def _visualize_labels_cat(self, orig_labels, vi_labels, save_path):
+        """Visualize concatenated labels (original vs VI-assigned).
+        Args:
+            orig_labels (Tensor): (N,) Original labels.
+            vi_labels (Tensor): (N,) VI-assigned labels.
+            save_path (str): Path to save the visualization.
+        """
+        orig_labels_np = orig_labels.cpu().numpy()
+        vi_labels_np = vi_labels.cpu().numpy()
+        
+        # 修复：检查维度，如果是 1D 则重塑为 2D 网格以便可视化
+        if orig_labels_np.ndim == 1:
+            # 计算近似正方形的尺寸
+            n_points = orig_labels_np.shape[0]
+            h = int(np.sqrt(n_points))
+            w = h
+            if h * w == 0:
+                return # 点数太少无法可视化
+            
+            # 截取前 h*w 个点进行可视化
+            orig_labels_np = orig_labels_np[:h*w].reshape(h, w)
+            vi_labels_np = vi_labels_np[:h*w].reshape(h, w)
+
+        # Create a color map for visualization
+        num_classes = self.num_classes
+        # 使用 jet colormap，并将数值归一化到 0-1
+        # 注意：-1 (Ignore) 会被映射到特定颜色，这里简单处理
+        
+        # 将标签归一化：-1 -> 0, 0 -> 0, num_classes -> 1 (示例映射)
+        # 更好的做法是使用离散 colormap
+        cmap = plt.get_cmap('jet')
+        
+        # 映射标签到 0-1 范围以便着色
+        # -1 (Ignore) -> 0.0
+        # 0..C-1 (FG) -> 0.2..0.8
+        # C (BG) -> 1.0
+        # 这里简单处理：直接除以 (num_classes + 1)
+        norm_orig = (orig_labels_np + 1) / (num_classes + 2)
+        norm_vi = (vi_labels_np + 1) / (num_classes + 2)
+
+        H, W = orig_labels_np.shape
+        vis_img = np.zeros((H, W*2, 3), dtype=np.uint8)
+        
+        # 应用 colormap 并转换为 uint8
+        vis_img[:, :W, :] = (cmap(norm_orig)[:, :, :3] * 255).astype(np.uint8)
+        vis_img[:, W:, :] = (cmap(norm_vi)[:, :, :3] * 255).astype(np.uint8)
 
         Image.fromarray(vis_img).save(save_path)
 
@@ -484,51 +567,169 @@ class CPMVIHead(CPMHead):
     def loss(self, cls_scores, bbox_preds, angle_preds, centernesses, vi_preds, gt_bboxes, gt_labels, img_metas, gt_bboxes_ignore=None):
         assert len(cls_scores) == len(bbox_preds) == len(centernesses) == len(vi_preds)
         
-        # self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
+        if self.iter % 50 == 0 and self.store_dir is not None:
+            os.makedirs(os.path.join(self.store_dir, "vi_preds"), exist_ok=True)
+            self._visualize_vi_predictions(vi_preds[0][0].detach().cpu(), os.path.join(self.store_dir, f"vi_preds/vi_pred_iter_{self.iter}.png"))
         
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
             featmap_sizes, dtype=bbox_preds[0].dtype, device=bbox_preds[0].device)
-        
-        # 获取几何信息（距离和阈值）
-        labels, dists, threshs = self.get_targets_vi(all_level_points, gt_bboxes, gt_labels)
-        
+
         cur_iter = self.iter
         self.iter += 1
-        num_imgs = cls_scores[0].size(0)
         
+        # === 步骤 1: 先计算所有层的几何分配 (作为基础和 P1+ 的最终结果) ===
+        # 这里的 labels, dists, threshs 是按 Level 组织的 List[Tensor]
+        geo_labels, geo_dists, geo_threshs = self.get_targets_vi(
+            all_level_points, gt_bboxes, gt_labels)
+        
+        # === 步骤 2: 初始化最终结果容器 (深拷贝几何结果) ===
+        # 这样 P1-P3 默认就是几何分配的结果
+        final_labels = [label.clone() for label in geo_labels]
+        final_dists = [dist.clone() for dist in geo_dists]
+        final_threshs = [thresh.clone() for thresh in geo_threshs]
+
+        # === 步骤 3: 针对 Level 0 进行 VI 动态分配 (仅在 Warmup 后) ===
+        if cur_iter >= self.warmup_iters:
+            
+            # 3.1 准备 Level 0 的数据
+            # vi_preds[0]: (B, 2, H, W) -> 取出 Level 0
+            # all_level_points[0]: (P0, 2) -> Level 0 的坐标点
+            
+            lvl = 0
+            vi_pred_lvl0 = vi_preds[lvl]  # (B, 2, H, W)
+            points_lvl0 = all_level_points[lvl] # (P0, 2)
+            
+            B, _, H, W = vi_pred_lvl0.shape
+            num_points_lvl0 = points_lvl0.size(0)
+            
+            # 3.2 提取 VI 预测的 mu_logit 并展平
+            # (B, 2, H, W) -> (B, H, W) -> (B, P0)
+            vi_mu_logit_lvl0 = vi_pred_lvl0[:, 0, :, :].view(B, -1)
+            
+            # 转换为 List 以便 multi_apply 处理
+            vi_logit_list = [vi_mu_logit_lvl0[i] for i in range(B)]
+            
+            # 准备 regress_ranges (Level 0 的范围)
+            # 扩展为 (P0, 2) 格式以匹配函数签名
+            regress_range_lvl0 = points_lvl0.new_tensor(self.regress_ranges[lvl])[None].expand_as(points_lvl0)
+            
+            # 3.3 调用动态分配函数 (仅针对 Level 0)
+            # 这里的逻辑与之前类似，但输入限定为 Level 0 的点
+            lvl0_labels_list, lvl0_dists_list, lvl0_threshs_list = multi_apply(
+                self._get_target_single_vi_dynamic,
+                gt_bboxes,          # Batch 遍历
+                gt_labels,          # Batch 遍历
+                vi_logit_list,      # Batch 遍历
+                points=points_lvl0, # 固定 Level 0 的点
+                regress_ranges=regress_range_lvl0, # 固定 Level 0 的范围
+                num_points_per_lvl=[num_points_lvl0] # 单层
+            )
+            
+            # 3.4 更新 final_labels 中的 Level 0 部分
+            # multi_apply 返回的是 List[Tensor]，每个 Tensor 是 (P0,)
+            # 我们需要 stack 成 batch 然后替换原来的 Level 0
+            # 注意：final_labels[0] 原本是 (B*P0,) 的形状吗？
+            # 不，get_targets_vi 返回的是 concat_lvl_labels，是按 Level concat batch 的。
+            # 即 final_labels[0] 的形状是 (B*P0,)
+            
+            # 重新拼接 dynamic 分配的结果
+            dynamic_labels_lvl0 = torch.cat(lvl0_labels_list)  # (B*P0,)
+            dynamic_dists_lvl0 = torch.cat(lvl0_dists_list)    # (B*P0,)
+            dynamic_threshs_lvl0 = torch.cat(lvl0_threshs_list)# (B*P0,)
+            
+            # 替换 Level 0 的结果
+            final_labels[lvl] = dynamic_labels_lvl0
+            final_dists[lvl] = dynamic_dists_lvl0
+            final_threshs[lvl] = dynamic_threshs_lvl0
+
+            # === 可视化对比 (可选) ===
+            if self.iter % 50 == 0 and self.store_dir is not None:
+                os.makedirs(os.path.join(self.store_dir, "vi_labels"), exist_ok=True)
+                # 对比 Level 0 的几何分配 vs 动态分配
+                self._visualize_labels_cat(
+                    geo_labels[0].detach(), # 几何分配
+                    final_labels[0].detach(), # 动态分配
+                    os.path.join(self.store_dir, f"vi_labels/lvl0_cmp_iter_{self.iter}.png")
+                )
+
+        # === 步骤 4: 后续 Loss 计算 (使用 final_labels) ===
+        # 将 List 展平
+        flatten_labels = torch.cat(final_labels)
+        flatten_dists = torch.cat(final_dists)
+        flatten_threshs = torch.cat(final_threshs)        
         flatten_cls_scores = torch.cat([cs.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels) for cs in cls_scores])
         flatten_vi_preds = torch.cat([vp.permute(0, 2, 3, 1).reshape(-1, 2) for vp in vi_preds])
-        flatten_labels = torch.cat(labels)
-        flatten_dists = torch.cat(dists)
-        flatten_threshs = torch.cat(threshs)  # = min(dist_to_nearest_gt / 2, thresh1) for each point
+        # flatten_labels = torch.cat(labels)
+        # flatten_dists = torch.cat(dists)
+        # flatten_threshs = torch.cat(threshs)
         
         bg_class_ind = self.num_classes
         avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
         
-        # 1. Get current Temperature
+        # # 安全检查
+        # if len(avail_inds) == 0:
+        #     zero = flatten_cls_scores.sum() * 0.0
+        #     return dict(loss_cls=zero, loss_bbox=zero, loss_centerness=zero, loss_vi=zero) # 简略返回
+
+        
+        # 1. Get current Temperature (for VI Loss sampling)
         temperature = self._get_current_temperature(cur_iter)
-
-        # --- 关键修改：扩大 VI 分支的有效阈值 ---
-        # 原始的 flatten_threshs 是 CPM 的几何阈值（通常限制在 8 左右）
-        # 我们将其扩大 scale 倍，用于生成 VI 的 Soft Label
-        vi_threshs = flatten_threshs.clamp(min=1.0) * self.vi_thresh_scale
-
-        # 2. Compute VI Loss (传入放大后的阈值)
+        
+        # 2. Compute VI Loss
         is_ignored = (flatten_labels < 0)
         flatten_dists = torch.where(torch.isinf(flatten_dists), torch.full_like(flatten_dists, 1e4), flatten_dists)
-        vi_mu_logit = flatten_vi_preds[:, 0]
+        
+        vi_mu_logit = flatten_vi_preds[:, 0] # 预测的 mu_logit (Logit 空间的 Gap)
         vi_log_sigma = flatten_vi_preds[:, 1]
-
-        vi_losses = self.loss_vi(
-            vi_mu_logit=vi_mu_logit,
-            vi_log_sigma=vi_log_sigma,
-            dist_to_gt=flatten_dists,
-            pos_thresh=vi_threshs,  # 使用放大后的阈值
-            is_ignored=is_ignored,
-            temperature=temperature,
-            iter=self.iter
-        )
+        
+        # === 修改部分：在 Warmup 结束时，冻结整个特征提取网络 ===
+        if cur_iter == self.warmup_iters:
+            # 1. 冻结 VI 分支自身
+            for param in self.conv_vi.parameters():
+                param.requires_grad = False
+            if hasattr(self, 'vi_convs'):
+                for param in self.vi_convs.parameters():
+                    param.requires_grad = False
+                                
+            print(f"Iter {cur_iter}: Freezing VI branch, Backbone, and Neck.")        
+        # 在 warmup 阶段结束后，冻结 vi 分支（不更新 vi 分支的参数，也就是停止训练）
+        
+        # 计算变分推断 Loss
+        # vi_losses = self.loss_vi(
+        #     vi_mu_logit=vi_mu_logit,
+        #     vi_log_sigma=vi_log_sigma,
+        #     dist_to_gt=flatten_dists,
+        #     pos_thresh=flatten_threshs.clamp(min=1.0),
+        #     is_ignored=is_ignored,
+        #     temperature=temperature,
+        #     iter=self.iter
+        # )
+        
+        if cur_iter < self.warmup_iters:
+            # Warmup 阶段，使用原始的 VI Loss 计算
+            vi_losses = self.loss_vi(
+                vi_mu_logit=vi_mu_logit,
+                vi_log_sigma=vi_log_sigma,
+                dist_to_gt=flatten_dists,
+                pos_thresh=flatten_threshs.clamp(min=1.0),
+                is_ignored=is_ignored,
+                temperature=temperature,
+                iter=self.iter
+            )
+        else:
+            # Warmup 阶段结束后，冻结 vi 分支，使用 detach() 避免梯度传播
+            with torch.no_grad():
+                vi_losses = self.loss_vi(
+                    vi_mu_logit=vi_mu_logit.detach(),
+                    vi_log_sigma=vi_log_sigma.detach(),
+                    dist_to_gt=flatten_dists,
+                    pos_thresh=flatten_threshs.clamp(min=1.0),
+                    is_ignored=is_ignored,
+                    temperature=temperature,
+                    iter=self.iter
+                )
+        
         
         loss_vi = torch.nan_to_num(vi_losses['loss_total'], nan=0.0, posinf=1e4, neginf=-1e4)
 
@@ -537,67 +738,88 @@ class CPMVIHead(CPMHead):
         
         # vi_mu = vi_mu_logit[avail_inds]
         # dists_geo = flatten_dists[avail_inds]
-        vi_mu = vi_mu_logit
+        # vi_mu = vi_mu_logit  # probability in logit space
         dists_geo = flatten_dists
         log_actual_dist = torch.log(dists_geo + 1.0)
         
-        margin = vi_mu - log_actual_dist
+        margin = vi_mu_logit - log_actual_dist
         dynamic_prob = torch.sigmoid(margin)
         
-        if cur_iter < self.warmup_iters:
-            loss_cls = self.loss_cls(
-                flatten_cls_scores[avail_inds], 
-                flatten_labels[avail_inds], 
-                avg_factor=num_avail
-            )
-        else:
+        # dynamic_prob = torch.sigmoid(vi_mu)
+        
+        # if cur_iter < self.warmup_iters:
+        #     loss_cls = self.loss_cls(
+        #         flatten_cls_scores[avail_inds], 
+        #         flatten_labels[avail_inds], 
+        #         avg_factor=num_avail
+        #     )
+        # else:
             
-            num_imgs = cls_scores[0].size(0)
+        #     num_imgs = cls_scores[0].size(0)
             
-            # 1. 构建 vi_mu_logit_list
-            # 必须确保输出顺序与 all_level_points 的拼接顺序一致 (Level 优先)
-            vi_mu_logit_list = []
-            for img_id in range(num_imgs):
-                logits_per_img = []
-                # 遍历所有 Level
-                for pred in vi_preds:
-                    # pred: (B, 2, H, W) -> 取出 img_id -> (2, H, W) -> Flatten -> (H*W, 2)
-                    logits_per_img.append(pred[img_id].view(-1, 2))
+        #     # 1. 构建 vi_mu_logit_list
+        #     # 必须确保输出顺序与 all_level_points 的拼接顺序一致 (Level 优先)
+        #     vi_mu_logit_list = []
+        #     for img_id in range(num_imgs):
+        #         logits_per_img = []
+        #         # 遍历所有 Level
+        #         for pred in vi_preds:
+        #             # pred: (B, 2, H, W) -> 取出 img_id -> (2, H, W) -> Flatten -> (H*W, 2)
+        #             logits_per_img.append(pred[img_id].view(-1, 2))
                 
-                # 拼接所有 Level -> (Total_Points, 2)
-                single_img_preds = torch.cat(logits_per_img, dim=0)
-                # 提取 mu_logit (通道 0)
-                vi_mu_logit_list.append(single_img_preds[:, 0])
+        #         # 拼接所有 Level -> (Total_Points, 2)
+        #         single_img_preds = torch.cat(logits_per_img, dim=0)
+        #         # 提取 mu_logit (通道 0)
+        #         vi_mu_logit_list.append(single_img_preds[:, 0].detach())  # Can this detach avoid loss_cls affecting vi branch gradients? Yes, we only use it for assignment.
 
-            # 2. 调用新的分配函数
-            labels, dists, threshs = self.get_targets_vi_dynamic(
-                all_level_points, 
-                gt_bboxes, 
-                gt_labels, 
-                vi_mu_logit_list
-            )
-
-            # 3. Flatten 结果
-            flatten_labels = torch.cat(labels)
-            flatten_dists = torch.cat(dists)
-            flatten_threshs = torch.cat(threshs)
+        #     # 2. 调用新的分配函数
+        #     labels, dists, threshs = self.get_targets_vi_dynamic(
+        #         all_level_points, 
+        #         gt_bboxes, 
+        #         gt_labels, 
+        #         vi_mu_logit_list
+        #     )
             
-            avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
+        #     if self.iter % 50 == 0 and self.store_dir is not None:
+        #         os.makedirs(os.path.join(self.store_dir, "vi_labels"), exist_ok=True)
+                
+        #         # 建议：对比 "几何分配标签" 与 "VI动态分配标签"
+        #         # 我们可以重新计算一份几何标签用于对比
+        #         geo_labels, _, _ = self.get_targets_vi(all_level_points, gt_bboxes, gt_labels)
+        #         geo_labels_flat = torch.cat(geo_labels)
+                
+        #         self._visualize_labels_cat(
+        #             geo_labels_flat,            # 几何分配 (左)
+        #             torch.cat(labels),          # VI动态分配 (右)
+        #             os.path.join(self.store_dir, f"vi_labels/vi_labels_iter_{self.iter}.png")
+        #         )
             
-            pos_mask = (margin > 0)
-            neg_mask = (margin <= 0)
+        #     # 3. Flatten 结果
+        #     flatten_labels = torch.cat(labels)
+        #     flatten_dists = torch.cat(dists)
+        #     flatten_threshs = torch.cat(threshs)
             
-            weight = torch.ones_like(dynamic_prob)
-            weight[pos_mask] = dynamic_prob[pos_mask]
-            weight[neg_mask] = (1.0 - dynamic_prob[neg_mask])
+        #     avail_inds = (flatten_labels >= 0).nonzero().reshape(-1)
             
-            # 替换avail_inds为vi分支计算的正负样本
+        #     pos_mask = (margin > 0)
+        #     neg_mask = (margin <= 0)
             
-            loss_cls = self.loss_cls(
-                flatten_cls_scores[avail_inds], 
-                flatten_labels[avail_inds], 
-                avg_factor=num_avail
-            )
+        #     weight = torch.ones_like(dynamic_prob)
+        #     weight[pos_mask] = dynamic_prob[pos_mask]
+        #     weight[neg_mask] = (1.0 - dynamic_prob[neg_mask])
+            
+        #     # 替换avail_inds为vi分支计算的正负样本
+            
+        #     loss_cls = self.loss_cls(
+        #         flatten_cls_scores[avail_inds], 
+        #         flatten_labels[avail_inds], 
+        #         avg_factor=num_avail
+        #     )
+        loss_cls = self.loss_cls(
+            flatten_cls_scores[avail_inds], 
+            flatten_labels[avail_inds], 
+            avg_factor=num_avail
+        )
             
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
         zero = loss_cls.sum() * 0.0
@@ -607,12 +829,16 @@ class CPMVIHead(CPMHead):
             loss_bbox=zero,
             loss_centerness=zero,
             loss_vi=loss_vi,
-            loss_vi_recon=vi_losses['loss_vi_recon'].detach(),
-            loss_vi_kl=vi_losses['loss_vi_kl'].detach(),
+            loss_vi_dist_match=vi_losses['loss_vi_dist_match'].detach(),
+            loss_vi_sampled=vi_losses['loss_vi_sampled'].detach(),
+            # loss_vi_recon=vi_losses['loss_vi_recon'].detach(),
+            # loss_vi_kl=vi_losses['loss_vi_kl'].detach(),
             loss_vi_reg=vi_losses['loss_vi_reg'].detach(),
-            vi_prob_mean=dynamic_prob.mean().detach(),
-            # vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
+            # vi_prob_mean=dynamic_prob.mean().detach(),
+            vi_prob_mean=vi_losses['vi_prob'].mean().detach(),
             vi_sigma_mean=vi_losses['vi_sigma'].mean().detach(),
+            vi_prob_max=vi_losses['vi_prob'].max().detach(),
+            vi_prob_min=vi_losses['vi_prob'].min().detach(),
             temperature=torch.tensor(temperature, device=loss_cls.device)
         )
     # ------------------------------------------------------------------
@@ -735,6 +961,16 @@ class CPMVIHead(CPMHead):
     def forward_train(self, x, img_metas, gt_bboxes, gt_labels=None,
                       gt_bboxes_ignore=None, proposal_cfg=None, **kwargs):
         """Train forward, returning losses."""
+        # === 新增逻辑：在 Warmup 结束后，阻断 Backbone/Neck 的梯度 ===
+        if self.iter >= self.warmup_iters:
+            # 阻断输入特征 x 的梯度，使其不回传到 Backbone 和 Neck
+            # 这相当于“冻结”了 Backbone 和 Neck 的权重更新
+            if isinstance(x, (list, tuple)):
+                x = [feat.detach() for feat in x]
+            else:
+                x = x.detach()
+        # ==========================================================
+        
         outs = self(x)
         if gt_labels is None:
             loss_inputs = outs + (gt_bboxes, img_metas)

@@ -226,6 +226,12 @@ class PseudoLabelHead(RotatedFCOSHead):
         """
         assert len(cls_scores) == len(bbox_preds) \
                == len(angle_preds) == len(centernesses)
+               
+        # use interpolation to merge the 1st level and 2nd level of cls_scores.
+        # cls_scores_orig = 0.5 * cls_scores[0]
+        # cls_scores_intp = 0.5 * F.interpolate(cls_scores[1], size=cls_scores_orig.shape[-2:], mode='bilinear', align_corners=False)
+        # cls_scores[0] = cls_scores_orig + cls_scores_intp
+               
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         all_level_points = self.prior_generator.grid_priors(
             featmap_sizes,
