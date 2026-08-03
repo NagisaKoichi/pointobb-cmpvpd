@@ -1,0 +1,146 @@
+_base_ = [
+    '../_base_/datasets/dotav1.py', '../_base_/schedules/schedule_1x.py',
+    '../_base_/default_runtime.py'
+]
+
+data_root = '/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/'
+
+store_dir = '/media/ps/passport2/zlk/PointOBB-v2/exps/exp1/cpm_vpd_point_dotav10/'
+
+angle_version = 'le90'
+
+classes = ('plane', 'baseball-diamond', 'bridge', 'ground-track-field',
+           'small-vehicle', 'large-vehicle', 'ship', 'tennis-court',
+           'basketball-court', 'storage-tank', 'soccer-ball-field',
+           'roundabout', 'harbor', 'swimming-pool', 'helicopter')
+
+img_norm_cfg = dict(
+    mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='RResize', img_scale=(1024, 1024)),
+    dict(
+        type='RRandomFlip',
+        flip_ratio=[0.25, 0.25, 0.25],
+        direction=['horizontal', 'vertical', 'diagonal'],
+        version=angle_version),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels'])
+]
+
+data = dict(
+    train=dict(
+        pipeline=train_pipeline,
+        ann_file=data_root + 'trainval/annfiles/',
+        img_prefix=data_root + 'trainval/images/',
+        version=angle_version,
+        classes=classes),
+    val=dict(
+        ann_file=data_root + 'trainval/annfiles/',
+        img_prefix=data_root + 'trainval/images/',
+        version=angle_version,
+        classes=classes),
+    test=dict(
+        ann_file=data_root + 'test/images/',
+        img_prefix=data_root + 'test/images/',
+        version=angle_version,
+        classes=classes,
+        samples_per_gpu=1))
+
+# model settings - CPM with Point-Supervised VPD
+model = dict(
+    type='RotatedFCOS',
+    backbone=dict(
+        type='ResNet',
+        depth=50,
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=1,
+        zero_init_residual=False,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=True,
+        style='pytorch',
+        init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
+    neck=dict(
+        type='FPN',
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,
+        start_level=0,
+        add_extra_convs='on_output',  # use P5
+        num_outs=6,
+        relu_before_extra_convs=True),
+    bbox_head=dict(
+        type='CPMVPDHead',  # CPM with Point-Supervised VPD
+        num_classes=len(classes),
+        in_channels=256,
+        stacked_convs=4,
+        feat_channels=256,
+        regress_ranges=((-1, 32), (32, 64), (64, 128), (128, 256), (256, 512),
+                                 (512, 1e8)),
+        strides=[4, 8, 16, 32, 64, 128],
+        center_sampling=True,
+        center_sample_radius=1.5,
+        norm_on_bbox=True,
+        centerness_on_reg=True,
+        separate_angle=False,
+        scale_angle=True,
+        bbox_coder=dict(
+            type='DistanceAnglePointCoder', angle_version=angle_version),
+        loss_cls=dict(
+            type='FocalLoss',
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=1.0),
+        loss_bbox=dict(type='RotatedIoULoss', loss_weight=1.0),
+        loss_centerness=dict(
+            type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0)),
+    # training and testing settings
+    train_cfg=dict(
+        visualize=False,
+        store_dir=store_dir,
+        cls_weight=1.0,              # Classification loss weight
+        thresh1=6,                  # Positive sample threshold
+        alpha=1.5,                    # Negative sample coefficient
+        use_point_supervised=True,  # Enable point-supervised mode
+        js_weight=0.5,              # VPD JS loss weight on XY
+        js_project_min=-16.0,
+        js_project_max=16.0,
+        js_num_bins=21,
+        num_samples_train=1,
+
+        # sigma_supervision_mode='feature_guided',    # Supervision mode for sigma (uncertainty)
+        # fg_inner_radius=8.0,        # Inner radius for foreground samples
+        # fg_transition=1.5,          # Transition parameter for foreground samples
+        # fg_cls_thr=0.2,             # Classification score threshold for foreground samples
+        # fg_logit_scale=12.0,        # Logit scaling factor for foreground samples in VPD loss
+        # fg_geo_weight=0.2,          # Balance geometry and feature guidance
+        # fg_detach=True,             # Keep cls branch stable while sigma learns
+        # sigma_fg_target=1.0,        # Target sigma value for foreground samples in VPD loss
+        # sigma_bg_target=4.0,        # Target sigma value for background samples in VPD loss
+        ),
+
+    test_cfg=dict(
+        store_dir=store_dir,
+        nms_pre=2000,
+        min_bbox_size=0,
+        score_thr=0.05,
+        nms=dict(iou_thr=0.1),
+        max_per_img=2000))
+
+find_unused_parameters = True
+runner = dict(_delete_=True, type='EpochBasedRunner', max_epochs=6)
+lr_config = dict(
+    _delete_=True,
+    policy='step',
+    warmup='linear',
+    warmup_iters=500,
+    warmup_ratio=1.0 / 3,
+    step=[4])
+evaluation = dict(interval=6, metric='mAP')
+checkpoint_config = dict(interval=1, create_symlink=False)
+# optimizer = dict(lr=0.05, momentum=0.9, type='SGD', weight_decay=0.0001)
+optimizer = dict(lr=0.05)

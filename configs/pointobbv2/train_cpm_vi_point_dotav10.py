@@ -101,7 +101,7 @@ model = dict(
     # training and testing settings
     train_cfg=dict(
         visualize=False,
-        cls_weight=20.0,
+        cls_weight=1.0,
         thresh1=6,
         alpha=1.5,
         # VI分支配置
@@ -132,7 +132,7 @@ lr_config = dict(
     warmup_iters=500,
     warmup_ratio=1.0 / 3,
     step=[4])
-evaluation = dict(interval=6, metric='mAP')
+evaluation = dict(interval=12, metric='mAP')
 checkpoint_config = dict(interval=1, create_symlink=False)
 # optimizer = dict(lr=0.05, momentum=0.9, type='SGD', weight_decay=0.0001)
-optimizer = dict(lr=0.05)
+optimizer = dict(lr=0.1)

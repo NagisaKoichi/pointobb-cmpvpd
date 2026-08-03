@@ -8,7 +8,7 @@ from mmrotate.datasets.dota import DOTADataset
 def main():
     gt_dir = "/media/ps/passport2/zlk/datasets/DOTAv10_split_ss/trainval/annfiles"
     # gt_dir = "/media/ps/passport2/zlk/results/0601_xy_vpdstyle_clsw1_l5e-2_lkl0p5_onlylr/vpd_cpm_dotav10/pseudo_labels_seg"
-    pseudo_dir = "/media/ps/passport2/zlk/results/0719_gaussian_sampled_tower_layered_dilated/vpd_cpm_dotav10/pseudo_labels"
+    pseudo_dir = "/media/ps/passport2/zlk/results/0803_score_pred_js_discret_lrzero_hard_eps/vpd_cpm_dotav10/pseudo_labels"
     # pseudo_dir = "/media/ps/passport2/zlk/results/0511_obboriginal/vpd_cpm_dotav10/pseudo_labels"
     # pseudo_dir = "/media/ps/passport2/zlk/results/0529_xy_vpdstyle_cpmoriginal_clsw1_l5e-2_lkl0p5/vpd_cpm_dotav10/pseudo_labels_legacy"
     # pseudo_dir = "/media/ps/passport2/zlk/results/0607_xy_vpdstyle_clsw1_l5e-2_lkl2_fpnfreeze/vpd_cpm_dotav10/pseudo_labels_seg"

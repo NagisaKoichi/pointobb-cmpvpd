@@ -58,7 +58,7 @@ class CPMVIHead(CPMHead):
     def __init__(self, *args, vi_weight=1.0, vi_num_bins=21,
                  vi_soft_label_sigma=1.28, use_vi_score=False, vi_thresh_scale=1.0,
                  vi_score_mode='multiply', vi_thr=0.5,
-                 warmup_iters=2400, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
+                 warmup_iters=3600, temp_start=1.0, temp_end=0.1, temp_decay_iters=5000,
                  **kwargs):
         super(CPMVIHead, self).__init__(*args, **kwargs)
         train_cfg = kwargs.get('train_cfg') or {}
@@ -112,30 +112,34 @@ class CPMVIHead(CPMHead):
             self.vi_convs.append(nn.ReLU(inplace=True))
 
         
-        self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=2, dilation=2)
+        # self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=2, dilation=2)
+        self.conv_vi = nn.Conv2d(self.feat_channels, 2, 3, padding=1, dilation=1)
 
     def forward_single(self, x, scale, stride):
         """Forward for a single FPN level.
         
         跳级调用 RotatedAnchorFreeHead.forward_single 以获取 reg_feat 和 cls_feat。
         """
-        # 1. 获取基础特征，此时返回 4 个值
-        cls_score, _, cls_feat, reg_feat = \
-            super(RotatedAnchorFreeHead, self).forward_single(x)
+        # # 1. 获取基础特征，此时返回 4 个值
+        # cls_score, _, cls_feat, reg_feat = \
+        #     super(RotatedAnchorFreeHead, self).forward_single(x)
             
-        # 2. 计算 centerness
-        if self.centerness_on_reg:
-            centerness = self.conv_centerness(reg_feat)
-        else:
-            centerness = self.conv_centerness(cls_feat)
+        # # 2. 计算 centerness
+        # if self.centerness_on_reg:
+        #     centerness = self.conv_centerness(reg_feat)
+        # else:
+        #     centerness = self.conv_centerness(cls_feat)
             
-        # 3. 计算 bbox_pred 和 angle_pred (保持与 CPMHead / RotatedFCOSHead 一致)
-        bbox_pred = scale(self.conv_reg(reg_feat)).float()
-        if hasattr(self, 'conv_angle'):
-            angle_pred = self.conv_angle(reg_feat).float()
-        else:
-            # 兼容性处理：如果没有分离角度分支
-            angle_pred = torch.zeros_like(bbox_pred[:, :1])
+        # # 3. 计算 bbox_pred 和 angle_pred (保持与 CPMHead / RotatedFCOSHead 一致)
+        # bbox_pred = scale(self.conv_reg(reg_feat)).float()
+        # if hasattr(self, 'conv_angle'):
+        #     angle_pred = self.conv_angle(reg_feat).float()
+        # else:
+        #     # 兼容性处理：如果没有分离角度分支
+        #     angle_pred = torch.zeros_like(bbox_pred[:, :1])
+        
+        # 或者直接继承自CPMHead
+        cls_score, bbox_pred, angle_pred, centerness = super().forward_single(x, scale, stride)
             
         # 4. 计算 VI 分支预测
         # vi_pred = self.conv_vi(reg_feat).float()  # (N, 2, H, W)
@@ -378,7 +382,8 @@ class CPMVIHead(CPMHead):
         # 同时满足 VI 负样本条件和几何负样本条件的点才被标记为负样本
         # 几何负样本条件沿用原来的逻辑：alpha * dist_sample_and_gt > dist_min_gt_and_gt
         # mask_neg = (weight < 0.3) & (self.alpha * dist_min_sample_and_gt > dist_min_gt_and_gt[min_gt_idx])
-        mask_neg = self.alpha * dist_min_sample_and_gt > dist_min_gt_and_gt[min_gt_idx]
+        # mask_neg = self.alpha * dist_min_sample_and_gt > dist_min_gt_and_gt[min_gt_idx]
+        mask_neg = (weight < 0.5)
 
         if mask_pos.any():
             labels[mask_pos] = gt_labels[min_gt_idx[mask_pos]]
@@ -559,6 +564,37 @@ class CPMVIHead(CPMHead):
 
         Image.fromarray(vis_img).save(save_path)
 
+    def _freeze_backbone_bn_stats(self):
+        """
+        通过 GC 反向查找到持有本 Head 的模型实例，
+        并将 Backbone 和 Neck 中的 BN 层设为 eval 模式以冻结统计量。
+        """
+        import gc
+        # 1. 查找引用本 Head 的对象
+        referrers = gc.get_referrers(self)
+        
+        for ref in referrers:
+            # 2. 处理 DistributedDataParallel 包装情况
+            model = ref
+            if hasattr(ref, 'module'):
+                model = ref.module
+            
+            # 3. 检查是否是包含 backbone 和 neck 的检测器
+            if hasattr(model, 'backbone') and hasattr(model, 'neck'):
+                print("Freezing Backbone and Neck BN stats via GC hack...")
+                
+                # 冻结 Backbone BN
+                for m in model.backbone.modules():
+                    if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                        m.eval()
+                
+                # 冻结 Neck (FPN) BN
+                for m in model.neck.modules():
+                    if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                        m.eval()
+                
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Loss
@@ -590,6 +626,7 @@ class CPMVIHead(CPMHead):
         final_threshs = [thresh.clone() for thresh in geo_threshs]
 
         # === 步骤 3: 针对 Level 0 进行 VI 动态分配 (仅在 Warmup 后) ===
+        # if cur_iter >= self.warmup_iters:
         if cur_iter >= self.warmup_iters:
             
             # 3.1 准备 Level 0 的数据
@@ -640,8 +677,8 @@ class CPMVIHead(CPMHead):
             
             # 替换 Level 0 的结果
             final_labels[lvl] = dynamic_labels_lvl0
-            final_dists[lvl] = dynamic_dists_lvl0
-            final_threshs[lvl] = dynamic_threshs_lvl0
+            # final_dists[lvl] = dynamic_dists_lvl0
+            # final_threshs[lvl] = dynamic_threshs_lvl0
 
             # === 可视化对比 (可选) ===
             if self.iter % 50 == 0 and self.store_dir is not None:
@@ -678,23 +715,31 @@ class CPMVIHead(CPMHead):
         
         # 2. Compute VI Loss
         is_ignored = (flatten_labels < 0)
+        # 3. Handle Inf distances (replace with large finite value)
         flatten_dists = torch.where(torch.isinf(flatten_dists), torch.full_like(flatten_dists, 1e4), flatten_dists)
         
         vi_mu_logit = flatten_vi_preds[:, 0] # 预测的 mu_logit (Logit 空间的 Gap)
         vi_log_sigma = flatten_vi_preds[:, 1]
         
-        # === 修改部分：在 Warmup 结束时，冻结整个特征提取网络 ===
         if cur_iter == self.warmup_iters:
-            # 1. 冻结 VI 分支自身
-            for param in self.conv_vi.parameters():
-                param.requires_grad = False
-            if hasattr(self, 'vi_convs'):
-                for param in self.vi_convs.parameters():
-                    param.requires_grad = False
-                                
-            print(f"Iter {cur_iter}: Freezing VI branch, Backbone, and Neck.")        
-        # 在 warmup 阶段结束后，冻结 vi 分支（不更新 vi 分支的参数，也就是停止训练）
-        
+            # 1. 冻结 VI 分支自身权重
+            # for name, param in self.named_parameters():
+            #     if 'conv_vi' in name or 'vi_convs' in name:
+            #         param.requires_grad = False
+            
+            # # 2. 冻结 VI 分支内部的 GroupNorm (已有代码保留)
+            # for module in self.vi_convs.modules():
+            #     if isinstance(module, (nn.GroupNorm, nn.BatchNorm2d)):
+            #         module.eval()
+            
+            # 3. 【新增】冻结 Backbone 和 Neck 的 BN 统计量
+            # 这一步将强制 Backbone/Neck 进入 eval 模式，停止 running_mean/var 的更新
+            # 但不影响权重的梯度计算和更新
+            # self._freeze_backbone_bn_stats()
+            
+            print(f"Iter {cur_iter}: Freezing VI branch and stabilizing input features.")
+            
+            
         # 计算变分推断 Loss
         # vi_losses = self.loss_vi(
         #     vi_mu_logit=vi_mu_logit,
@@ -815,21 +860,49 @@ class CPMVIHead(CPMHead):
         #         flatten_labels[avail_inds], 
         #         avg_factor=num_avail
         #     )
+        
+        # === 新增步骤：基于 VI 方差计算 cls_loss 权重 ===
+        # 只有 Level 0 使用 VI 分支的 variance 计算权重，其他层为 0
+        
+        # 1. 获取 Level 0 的点数
+        # all_level_points[0] 对应 Level 0
+        num_points_lvl0 = all_level_points[0].size(0)
+        
+        # 2. 提取 Level 0 的 log_kappa (通道 1)
+        # flatten_vi_preds 的顺序是按 level 拼接的，前 num_points_lvl0 个点属于 Level 0
+        vi_log_kappa_lvl0 = flatten_vi_preds[:num_points_lvl0, 1]
+        
+        # 3. 计算权重
+        # variance_weight_lvl0 = torch.exp(vi_log_kappa_lvl0)
+        variance_weight_lvl0 = torch.sigmoid(-vi_log_kappa_lvl0)  # 低方差 -> 高权重, 高方差 -> 低权重
+        
+        # 4. 构建全权重向量 (初始化为 0)
+        # 形状与 flatten_labels 一致
+        cls_weights = torch.ones(flatten_labels.shape[0], dtype=torch.float32, device=flatten_labels.device)
+        
+        # 5. 填入 Level 0 的权重
+        cls_weights[:num_points_lvl0] = variance_weight_lvl0
+        
         loss_cls = self.loss_cls(
             flatten_cls_scores[avail_inds], 
             flatten_labels[avail_inds], 
+            # weight=cls_weights[avail_inds],
             avg_factor=num_avail
         )
             
         loss_cls = torch.nan_to_num(loss_cls, nan=0.0, posinf=1e4, neginf=-1e4)
         zero = loss_cls.sum() * 0.0
+        
+        if cur_iter >= self.warmup_iters:
+            loss_vi=zero
                 
         return dict(
             loss_cls=self.cls_weight * loss_cls,
             loss_bbox=zero,
             loss_centerness=zero,
             loss_vi=loss_vi,
-            loss_vi_dist_match=vi_losses['loss_vi_dist_match'].detach(),
+            # loss_vi=zero,
+            # loss_vi_dist_match=vi_losses['loss_vi_dist_match'].detach(),
             loss_vi_sampled=vi_losses['loss_vi_sampled'].detach(),
             # loss_vi_recon=vi_losses['loss_vi_recon'].detach(),
             # loss_vi_kl=vi_losses['loss_vi_kl'].detach(),
@@ -962,13 +1035,13 @@ class CPMVIHead(CPMHead):
                       gt_bboxes_ignore=None, proposal_cfg=None, **kwargs):
         """Train forward, returning losses."""
         # === 新增逻辑：在 Warmup 结束后，阻断 Backbone/Neck 的梯度 ===
-        if self.iter >= self.warmup_iters:
-            # 阻断输入特征 x 的梯度，使其不回传到 Backbone 和 Neck
-            # 这相当于“冻结”了 Backbone 和 Neck 的权重更新
-            if isinstance(x, (list, tuple)):
-                x = [feat.detach() for feat in x]
-            else:
-                x = x.detach()
+        # 在 Warmup 结束后，使用 no_grad 阻断梯度
+        # if self.iter >= self.warmup_iters:
+        #     with torch.no_grad():
+        #         if isinstance(x, (list, tuple)):
+        #             x = [feat for feat in x]  # 不需要 detach，no_grad 已经处理
+        #         else:
+        #             x = x
         # ==========================================================
         
         outs = self(x)
